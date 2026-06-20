@@ -7,13 +7,7 @@
 //!   - KEK: 16 bytes (AES Key Wrap key for GTK delivery)
 //!   - TK: 16 bytes (CCMP-128 temporal key)
 
-use aes::{Aes128, cipher::consts::U16};
-use aes_kw::Kek;
-use cmac::{
-    Cmac,
-    digest::{KeyInit, Mac},
-};
-use elliptic_curve::generic_array::GenericArray;
+use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
 
 use crate::{ShuliResult, crypto::kdf, ieee80211::eapol};
 
@@ -48,7 +42,9 @@ impl FourWayState {
         rsne: Vec<u8>,
     ) -> Self {
         let mut snonce = [0u8; 32];
-        getrandom::fill(&mut snonce).expect("RNG");
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut snonce)
+            .expect("RNG");
         Self {
             pmk: *pmk,
             mac_sta,
@@ -269,24 +265,18 @@ impl FourWayState {
     }
 }
 
-type Aes128Key = GenericArray<u8, U16>;
-
-fn new_cmac(key: &[u8; KCK_LEN]) -> Result<Cmac<Aes128>, crate::ShuliError> {
-    KeyInit::new_from_slice(key)
-        .map_err(|e| crate::ShuliError::HandshakeFailed(e.to_string()))
-}
-
 /// Compute AES-128-CMAC over arbitrary bytes (the EAPOL-Key MIC for the SAE
 /// AKM with CCMP-128).
 fn aes_cmac(
     kck: &[u8; KCK_LEN],
     data: &[u8],
 ) -> ShuliResult<[u8; EAPOL_MIC_LEN]> {
-    let mut mac = new_cmac(kck)?;
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
+    let key = cmac::Key::new(cmac::AES_128, kck)
+        .map_err(|e| crate::ShuliError::HandshakeFailed(e.to_string()))?;
+    let tag = cmac::sign(&key, data)
+        .map_err(|e| crate::ShuliError::HandshakeFailed(e.to_string()))?;
     let mut mic = [0u8; EAPOL_MIC_LEN];
-    mic.copy_from_slice(&result);
+    mic.copy_from_slice(tag.as_ref());
     Ok(mic)
 }
 
@@ -323,8 +313,11 @@ fn parse_gtk_kde(key_data: &[u8]) -> Option<(u8, Vec<u8>)> {
     None
 }
 
-/// AES Key Unwrap (RFC 3394) for GTK extraction.
-fn aes_key_unwrap(kek: &[u8; KEK_LEN], wrapped: &[u8]) -> ShuliResult<Vec<u8>> {
+/// AES Key Unwrap (RFC 3394 / NIST SP 800-38F) for GTK extraction.
+fn aes_key_unwrap(
+    kek_bytes: &[u8; KEK_LEN],
+    wrapped: &[u8],
+) -> ShuliResult<Vec<u8>> {
     if wrapped.len() < 16 || !wrapped.len().is_multiple_of(8) {
         return Err(crate::ShuliError::HandshakeFailed(
             "invalid wrapped key length".into(),
@@ -332,8 +325,10 @@ fn aes_key_unwrap(kek: &[u8; KEK_LEN], wrapped: &[u8]) -> ShuliResult<Vec<u8>> {
     }
     let out_len = wrapped.len() - 8;
     let mut out = vec![0u8; out_len];
-    let key = Aes128Key::from_slice(kek);
-    let kek = Kek::<Aes128>::new(key);
+    let kek =
+        key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
+            crate::ShuliError::HandshakeFailed(format!("key unwrap: {e}"))
+        })?;
     kek.unwrap(wrapped, &mut out).map_err(|e| {
         crate::ShuliError::HandshakeFailed(format!("key unwrap: {e}"))
     })?;
@@ -341,11 +336,16 @@ fn aes_key_unwrap(kek: &[u8; KEK_LEN], wrapped: &[u8]) -> ShuliResult<Vec<u8>> {
 }
 
 #[cfg(test)]
-fn aes_key_wrap(kek: &[u8; KEK_LEN], plaintext: &[u8]) -> ShuliResult<Vec<u8>> {
+fn aes_key_wrap(
+    kek_bytes: &[u8; KEK_LEN],
+    plaintext: &[u8],
+) -> ShuliResult<Vec<u8>> {
     let out_len = plaintext.len() + 8;
     let mut out = vec![0u8; out_len];
-    let key = Aes128Key::from_slice(kek);
-    let kek = Kek::<Aes128>::new(key);
+    let kek =
+        key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
+            crate::ShuliError::HandshakeFailed(format!("key wrap: {e}"))
+        })?;
     kek.wrap(plaintext, &mut out).map_err(|e| {
         crate::ShuliError::HandshakeFailed(format!("key wrap: {e}"))
     })?;

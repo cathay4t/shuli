@@ -8,24 +8,23 @@
 
 use core::ops::Neg;
 
-use elliptic_curve::{
-    Curve, Field, Group, PrimeField,
-    bigint::{Encoding, NonZero, U256},
-    generic_array::GenericArray,
-    hash2curve::{FromOkm, MapToCurve},
-    point::AffineCoordinates,
-    rand_core::CryptoRngCore,
-    sec1::{FromEncodedPoint, ToEncodedPoint},
-};
-use hkdf::Hkdf;
 use p256::{
-    AffinePoint, EncodedPoint, FieldElement, NistP256, ProjectivePoint, Scalar,
+    self, AffinePoint, EncodedPoint, FieldElement, NistP256, ProjectivePoint,
+    Scalar,
+    elliptic_curve::{
+        Curve, Field, Group, PrimeField,
+        bigint::{Encoding, NonZero},
+        generic_array::GenericArray,
+        hash2curve::{FromOkm, MapToCurve},
+        point::AffineCoordinates,
+        rand_core::CryptoRngCore,
+        sec1::{FromEncodedPoint, ToEncodedPoint},
+    },
 };
-use sha2::Sha256;
 
 use crate::{
     ShuliResult,
-    crypto::kdf::{hkdf_extract_sha256, kdf, sae_confirm},
+    crypto::kdf::{hkdf_expand, hkdf_extract_sha256, kdf, sae_confirm},
 };
 
 const SAE_GROUP19_ID: u16 = 19;
@@ -269,11 +268,8 @@ fn sswu_from_label(
     label: &[u8],
 ) -> ShuliResult<ProjectivePoint> {
     // pwd-value = HKDF-Expand(pwd-seed, label, len); len = prime+ceil(prime/2)
-    let hk = Hkdf::<Sha256>::from_prk(pwd_seed)
-        .map_err(|e| crate::ShuliError::SaeFailed(e.to_string()))?;
     let mut okm = [0u8; SAE_FIELD_LEN + SAE_FIELD_LEN.div_ceil(2)]; // 48
-    hk.expand(label, &mut okm)
-        .map_err(|e| crate::ShuliError::SaeFailed(e.to_string()))?;
+    hkdf_expand(pwd_seed, label, &mut okm);
 
     // u = OS2IP(pwd-value) mod p ; P = SSWU(u)
     let u = FieldElement::from_okm(GenericArray::from_slice(&okm));
@@ -300,10 +296,10 @@ fn derive_pwe_from_pt(
 
     // val = (OS2IP(val) mod (q - 1)) + 1
     let order = NistP256::ORDER;
-    let order_m1 = order.wrapping_sub(&U256::ONE);
+    let order_m1 = order.wrapping_sub(&p256::U256::ONE);
     let nz = NonZero::new(order_m1).unwrap();
-    let val_int = U256::from_be_slice(&val_hash) % nz;
-    let val_int = val_int.wrapping_add(&U256::ONE);
+    let val_int = p256::U256::from_be_slice(&val_hash) % nz;
+    let val_int = val_int.wrapping_add(&p256::U256::ONE);
     let val_bytes = val_int.to_be_bytes();
     let val_scalar = Scalar::from_repr(val_bytes.into());
     if bool::from(val_scalar.is_none()) {
@@ -380,7 +376,7 @@ fn u64_from_mac(mac: &[u8; 6]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::rand_core::OsRng;
 
     use super::*;
 

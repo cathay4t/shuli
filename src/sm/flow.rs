@@ -67,7 +67,7 @@ pub async fn run_connect_flow(
     // Create SAE state and build commit
     let mut sae = SaeState::new(password, ssid, sta_mac, bssid)?;
     let (scalar, element) =
-        sae.build_commit(&mut elliptic_curve::rand_core::OsRng);
+        sae.build_commit(&mut p256::elliptic_curve::rand_core::OsRng);
 
     // Build SAE commit auth_data for NL80211_ATTR_AUTH_DATA. The kernel reads
     // the first 4 bytes as transaction(2 LE) and status(2 LE); the remaining
