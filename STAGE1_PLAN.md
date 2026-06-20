@@ -87,24 +87,14 @@ userspace (SAE + 4-way handshake KDF/MIC/key-wrap). The kernel does the
 *data-plane* crypto (CCMP/GCMP) once keys are installed. This keeps the
 userspace crypto surface small and avoids reimplementing a cipher datapath.
 
-### Two paths to SAE via nl80211
+### SME-in-userspace / external auth
 
-- **(A) SME-in-userspace / external auth** — driver/mac80211 hands SAE to
-  userspace. shuli registers for mgmt frames, runs SAE, and uses
-  `NL80211_CMD_EXTERNAL_AUTH` + `NL80211_CMD_FRAME`. This is the *general* path
-  and the Stage 1 target (matches what wpa_supplicant does for mac80211).
-- **(B) SAE offload** — driver advertises `SAE_OFFLOAD`; userspace just passes
-  the SAE password to the driver in `NL80211_CMD_CONNECT`
-  (`NL80211_ATTR_SAE_PASSWORD`) and the firmware does SAE. Much simpler but
-  driver-dependent.
-
-`wl-nl80211` already exposes the attributes/commands for **both** paths
-(`ExternalAuth`, `Frame`/`ControlPortFrame`, `Authenticate`, `Associate`,
-`Connect`, `Sae*`, `SaeOffload`, `AkmSuites`, `CipherSuites`, `Pmk`/`Pmksa`,
-`NewKey`). Plan: implement **(B) offload as the fast path** first to validate
-the end-to-end pipeline against real hardware quickly, then implement **(A)
-userspace SAE** as the portable path. Crypto work (§6) is needed regardless for
-(A) and for Stage 3.
+shuli registers for mgmt frames, runs SAE in userspace, and uses
+`NL80211_CMD_EXTERNAL_AUTH` + `NL80211_CMD_FRAME`. This is the *general* path
+and the Stage 1 target (matches what wpa_supplicant does for mac80211).
+`wl-nl80211` exposes the required attributes/commands (`ExternalAuth`,
+`Frame`/`ControlPortFrame`, `Authenticate`, `Associate`, `Connect`,
+`AkmSuites`, `CipherSuites`, `Pmk`/`Pmksa`, `NewKey`).
 
 ---
 
@@ -125,7 +115,7 @@ shuli/
 │   ├── nl80211/               # thin async wrappers over wl-nl80211
 │   │   ├── mod.rs
 │   │   ├── scan.rs            # trigger + dump + BSS/RSNE parse
-│   │   ├── connect.rs         # offload connect (path B)
+│   │   ├── connect.rs         # external-auth connect (path A)
 │   │   ├── mgmt.rs            # frame registration, TX/RX (path A)
 │   │   ├── ctrl_port.rs       # EAPOL over nl80211
 │   │   └── keys.rs            # NEW_KEY install (PTK/GTK)
@@ -190,12 +180,12 @@ with nipart-compatible toolchain (nipart MSRV is 1.88; shuli currently declares
   detect SAE support + H2E requirement.
 - **Exit:** `shulid` prints the matching BSS + its security capabilities.
 
-### M3 — End-to-end via SAE offload (path B)
-- `NL80211_CMD_CONNECT` with SSID/BSSID, AKM=SAE, CCMP, and SAE password.
-- Subscribe to connect/disconnect events; surface success/failure.
-- **Exit:** on SAE-offload-capable hardware, `wlan0` authenticates to the WPA3
-  test AP and reaches `Connected`; `iw`/`ip` confirm association; an external
-  `dhclient` obtains a lease.
+### M3 — External-auth connect & event loop (path A)
+- `NL80211_CMD_CONNECT` with external-auth support, control-port-over-nl80211.
+- Subscribe to connect/disconnect/external-auth events on the nl80211 multicast
+  socket; drive the event loop.
+- **Exit:** `shulid` sends the `CONNECT` command, receives `EXTERNAL_AUTH`
+  events from the kernel, and surfaces auth-request details.
 
 ### M4 — Userspace SAE crypto (path A core) — *PoC first (§6)*
 - Implement `crypto::sae` for group 19 + H2E: PWE, commit, confirm, PMK/PMKID.
@@ -215,8 +205,7 @@ with nipart-compatible toolchain (nipart MSRV is 1.88; shuli currently declares
 - EAPOL-Key over control-port-over-nl80211; PTK derivation, MIC verify (AES-CMAC
   / HMAC-SHA-256 for SAE AKM), GTK AES-Key-Unwrap.
 - Install PTK + GTK via `NL80211_CMD_NEW_KEY`.
-- **Exit:** path A reaches `Connected`; data flows; DHCP works (matches M3 but
-  with userspace SAE).
+- **Exit:** reaches `Connected`; data flows; DHCP works.
 
 ### M7 — Daemon loop, robustness, docs
 - Per-interface state machine, retry/backoff, clean teardown on SIGTERM,
@@ -289,8 +278,7 @@ work. Do not take a heavy dependency for the few frames we construct.
   parse/serialize round-trips, YAML config parsing.
 - **Integration (root, CI-able):** `mac80211_hwsim` virtual radios + `hostapd`
   configured for WPA3-SAE; assert shuli reaches `Connected` and a DHCP lease is
-  obtained. Cover both path A (userspace SAE) and path B (offload, where the
-  sim/driver supports it).
+  obtained.
 - **Interop:** test against at least one real WPA3 AP before declaring Stage 1
   done.
 
@@ -298,8 +286,7 @@ work. Do not take a heavy dependency for the few frames we construct.
 
 1. `shulid` reads `/etc/shuli/*.yml` and connects `wlan0` to a WPA3-Personal
    network, with keys installed and data path working (DHCP succeeds).
-2. WPA3-Personal works via **userspace SAE** (path A); offload (path B)
-   supported where available.
+2. WPA3-Personal works via **userspace SAE** (path A).
 3. `crypto.md` records the §6 conclusion, validated by passing SAE/handshake
    KATs.
 4. `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all green;

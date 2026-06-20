@@ -6,3 +6,32 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [dependencies]
+wl-nl80211 = { git = "https://github.com/rust-netlink/wl-nl80211.git", rev = "3a8ff67" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+getrandom = "0.3"
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+genetlink = "0.2"
+netlink-proto = "0.12"
+netlink-sys = "0.8"
+
+# Crypto
+p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field"] }
+elliptic-curve = { version = "0.13", features = ["hash2curve"] }
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+cmac = "0.7"
+aes = "0.8"
+aes-kw = "0.2"
+
+[[bin]]
+name = "shulid"
+path = "src/main.rs"

@@ -1,0 +1,7 @@
+---
+interfaces:
+  - name: wlan0
+    type: wifi-phy
+    wifi:
+      ssid: Test-WIFI
+      password: "12345678"

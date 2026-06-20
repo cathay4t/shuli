@@ -3,9 +3,6 @@
 
 **A pure-Rust Linux WiFi authentication daemon.**
 
-> 书立 / *Book stand* — the name is a pun: a book stand resembles the WiFi
-> signal-bar icon.
-
 `shuli` authenticates a Linux station (client) to modern WiFi networks entirely
 in Rust, talking directly to the kernel's [nl80211] netlink interface via
 [`wl-nl80211`] — no `wpa_supplicant`, no C dependencies. Authentication crypto
