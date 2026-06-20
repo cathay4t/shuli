@@ -6,7 +6,7 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [dependencies]
-wl-nl80211 = { git = "https://github.com/rust-netlink/wl-nl80211.git" }
+wl-nl80211 = { path = "../netlink/wl-nl80211" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

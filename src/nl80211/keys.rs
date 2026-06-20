@@ -1,24 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Key installation via NL80211_CMD_NEW_KEY, using the nested NL80211_ATTR_KEY
-// attribute (the same form wpa_supplicant emits).
+// Key installation via NL80211_CMD_NEW_KEY using the nested NL80211_ATTR_KEY
+// attribute (the same form iwd and wpa_supplicant emit).
+//
+// For station mode, only NL80211_CMD_NEW_KEY is needed. The kernel selects
+// the GTK for RX by the Key ID carried in the CCMP header's Key ID subfield
+// (802.11-2020 §12.5.3.2).  NL80211_KEY_DEFAULT_TYPES is a future-proofing
+// hint that has no effect in the current kernel's NEW_KEY handler.
+//
+// AP/IBSS modes additionally require NL80211_CMD_SET_KEY to mark the key as
+// the default for TX (iwd iwd/src/ap.c:1767, wpa_supplicant
+// driver_nl80211.c:3624).
 
 use futures::TryStreamExt;
 use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
-    Nl80211Attr, Nl80211Command, Nl80211Handle, Nl80211KeyAttr, Nl80211KeyType,
-    Nl80211Message,
+    Nl80211Attr, Nl80211Command, Nl80211Handle, Nl80211KeyAttr,
+    Nl80211KeyDefaultType, Nl80211KeyType, Nl80211Message,
 };
 
 use crate::ShuliResult;
 
-// Kernel-native cipher suite selector (WLAN_CIPHER_SUITE_CCMP), as expected by
-// NL80211_KEY_CIPHER (distinct from the OUI-first wire encoding).
 const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000F_AC04;
 
-/// Install a pairwise key (PTK).
-/// The `key_data` should contain only the temporal key (TK), not the full PTK.
 pub async fn install_ptk(
     handle: &Nl80211Handle,
     if_index: u32,
@@ -39,17 +44,23 @@ pub async fn install_ptk(
     send_new_key(handle, attrs).await
 }
 
-/// Install a group key (GTK).
-/// `key_data` is the raw GTK.
-/// `key_index` is the GTK index from the AP (usually 1-3).
+/// Install a group key (GTK) for station mode.
+///
+/// Sends a single `NL80211_CMD_NEW_KEY` with the key material and a
+/// `NL80211_KEY_DEFAULT_TYPES` nested attribute carrying
+/// `NL80211_KEY_DEFAULT_TYPE_MULTICAST`. This matches iwd
+/// (`iwd/src/nl80211util.c:nl80211_build_new_key_group`, lines 409-440)
+/// and wpa_supplicant (`driver_nl80211.c:3527`).
+///
+/// The kernel's RX path selects the GTK by the Key ID subfield in the CCMP
+/// header (802.11-2020 §12.5.3.2), so a separate `NL80211_CMD_SET_KEY` is not
+/// needed for station mode.
 pub async fn install_gtk(
     handle: &Nl80211Handle,
     if_index: u32,
     key_data: &[u8],
     key_index: u8,
 ) -> ShuliResult<()> {
-    // Group keys must NOT carry a MAC address (cfg80211 rejects a group key
-    // with a peer address as EINVAL).
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Key(vec![
@@ -57,7 +68,9 @@ pub async fn install_gtk(
             Nl80211KeyAttr::Cipher(WLAN_CIPHER_SUITE_CCMP),
             Nl80211KeyAttr::Idx(key_index),
             Nl80211KeyAttr::Type(Nl80211KeyType::Group),
-            Nl80211KeyAttr::Default,
+            Nl80211KeyAttr::DefaultTypes(vec![
+                Nl80211KeyDefaultType::Multicast,
+            ]),
         ]),
     ];
 
