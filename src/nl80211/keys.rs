@@ -1,32 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Key installation via NL80211_CMD_NEW_KEY.
-// Uses raw netlink messages since wl-nl80211 does not yet expose key-related
-// Nl80211Attr variants.
+// Key installation via NL80211_CMD_NEW_KEY, using the nested NL80211_ATTR_KEY
+// attribute (the same form wpa_supplicant emits).
 
 use futures::TryStreamExt;
-use netlink_packet_core::{
-    DefaultNla, NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage,
-};
+use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage};
 use netlink_packet_generic::GenlMessage;
-use wl_nl80211::{Nl80211Attr, Nl80211Command, Nl80211Handle, Nl80211Message};
+use wl_nl80211::{
+    Nl80211Attr, Nl80211Command, Nl80211Handle, Nl80211KeyAttr, Nl80211KeyType,
+    Nl80211Message,
+};
 
 use crate::ShuliResult;
 
-// NL80211 attribute constants not yet modelled in wl-nl80211.
-const NL80211_ATTR_KEY_DATA: u16 = 7;
-const NL80211_ATTR_KEY_IDX: u16 = 8;
-const NL80211_ATTR_KEY_CIPHER: u16 = 9;
-const NL80211_ATTR_KEY_DEFAULT: u16 = 11;
-const NL80211_ATTR_KEY_TYPE: u16 = 55;
-
 // Kernel-native cipher suite selector (WLAN_CIPHER_SUITE_CCMP), as expected by
-// NL80211_ATTR_KEY_CIPHER (distinct from the OUI-first wire encoding).
+// NL80211_KEY_CIPHER (distinct from the OUI-first wire encoding).
 const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000F_AC04;
-
-// Key type values (nl80211_key_type)
-const NL80211_KEYTYPE_GROUP: u32 = 0;
-const NL80211_KEYTYPE_PAIRWISE: u32 = 1;
 
 /// Install a pairwise key (PTK).
 /// The `key_data` should contain only the temporal key (TK), not the full PTK.
@@ -36,27 +25,15 @@ pub async fn install_ptk(
     peer_mac: [u8; 6],
     key_data: &[u8],
 ) -> ShuliResult<()> {
-    let cipher = WLAN_CIPHER_SUITE_CCMP;
-
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Mac(peer_mac),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_DATA,
-            key_data.to_vec(),
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_IDX,
-            vec![0u8], // key index 0
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_CIPHER,
-            cipher.to_le_bytes().to_vec(),
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_TYPE,
-            NL80211_KEYTYPE_PAIRWISE.to_le_bytes().to_vec(),
-        )),
+        Nl80211Attr::Key(vec![
+            Nl80211KeyAttr::Data(key_data.to_vec()),
+            Nl80211KeyAttr::Cipher(WLAN_CIPHER_SUITE_CCMP),
+            Nl80211KeyAttr::Idx(0),
+            Nl80211KeyAttr::Type(Nl80211KeyType::Pairwise),
+        ]),
     ];
 
     send_new_key(handle, attrs).await
@@ -71,29 +48,17 @@ pub async fn install_gtk(
     key_data: &[u8],
     key_index: u8,
 ) -> ShuliResult<()> {
-    let cipher = WLAN_CIPHER_SUITE_CCMP;
-
     // Group keys must NOT carry a MAC address (cfg80211 rejects a group key
     // with a peer address as EINVAL).
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_DATA,
-            key_data.to_vec(),
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_IDX,
-            vec![key_index],
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_CIPHER,
-            cipher.to_le_bytes().to_vec(),
-        )),
-        Nl80211Attr::Other(DefaultNla::new(
-            NL80211_ATTR_KEY_TYPE,
-            NL80211_KEYTYPE_GROUP.to_le_bytes().to_vec(),
-        )),
-        Nl80211Attr::Other(DefaultNla::new(NL80211_ATTR_KEY_DEFAULT, vec![])),
+        Nl80211Attr::Key(vec![
+            Nl80211KeyAttr::Data(key_data.to_vec()),
+            Nl80211KeyAttr::Cipher(WLAN_CIPHER_SUITE_CCMP),
+            Nl80211KeyAttr::Idx(key_index),
+            Nl80211KeyAttr::Type(Nl80211KeyType::Group),
+            Nl80211KeyAttr::Default,
+        ]),
     ];
 
     send_new_key(handle, attrs).await

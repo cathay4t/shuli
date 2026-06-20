@@ -1,49 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/// Minimal IEEE 802.11 element IDs and element builders.
-pub mod element_id {
-    pub const SSID: u8 = 0;
-    pub const RSN: u8 = 48;
-    pub const RSNXE: u8 = 244;
-}
+use netlink_packet_core::Emitable;
+use wl_nl80211::{
+    Nl80211AkmSuite, Nl80211CipherSuite, Nl80211Element, Nl80211ElementRsn,
+    Nl80211ElementRsnExt, Nl80211Elements, Nl80211RsnCapbilities,
+    Nl80211RsnExtCapbilities,
+};
 
-/// Canonical RSNE for WPA3-Personal (SAE / CCMP-128) with management frame
-/// protection required. These exact bytes are used both in the Association
-/// Request and in 4-way handshake Message 2; the AP verifies they match.
-pub fn sae_rsne() -> Vec<u8> {
-    vec![
-        element_id::RSN,
-        0x1a, // length = 26
-        0x01,
-        0x00, // version 1
-        0x00,
-        0x0f,
-        0xac,
-        0x04, // group cipher CCMP-128
-        0x01,
-        0x00, // pairwise count 1
-        0x00,
-        0x0f,
-        0xac,
-        0x04, // pairwise CCMP-128
-        0x01,
-        0x00, // AKM count 1
-        0x00,
-        0x0f,
-        0xac,
-        0x08, // AKM SAE
-        0xc0,
-        0x00, // RSN capabilities: MFPC | MFPR
-        0x00,
-        0x00, // PMKID count 0
-        0x00,
-        0x0f,
-        0xac,
-        0x06, // group mgmt cipher BIP-CMAC-128
-    ]
-}
+/// Build the RSNE + RSNXE for WPA3-Personal (SAE / CCMP-128, management frame
+/// protection required, SAE Hash-to-Element). The exact same bytes are used in
+/// the Association Request and in 4-way handshake Message 2; the AP verifies
+/// they match, so both call sites must use this single builder.
+pub fn sae_ie() -> Vec<u8> {
+    let elements = Nl80211Elements(vec![
+        Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::Sae],
+            rsn_capbilities: Some(
+                Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
+            ),
+            pmkids: vec![],
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+        }),
+        Nl80211Element::RsnExt(Nl80211ElementRsnExt {
+            capabilities: Nl80211RsnExtCapbilities::SaeH2e,
+        }),
+    ]);
 
-/// RSNXE advertising SAE Hash-to-Element support (bit 5).
-pub fn rsnxe_h2e() -> Vec<u8> {
-    vec![element_id::RSNXE, 0x01, 0x20]
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
 }

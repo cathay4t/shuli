@@ -365,8 +365,7 @@ async fn handle_control_port_frame(
             let pmk = state.sae.pmk().expect("PMK must be available");
             let pmkid = state.sae.pmkid().expect("PMKID must be available");
             // The RSNE/RSNXE in Message 2 must match the Association Request.
-            let mut rsne = elements::sae_rsne();
-            rsne.extend_from_slice(&elements::rsnxe_h2e());
+            let rsne = elements::sae_ie();
             state.fourway = Some(FourWayState::new(
                 &pmk,
                 &pmkid,
@@ -466,6 +465,58 @@ async fn handle_control_port_frame(
                 state.sm.transition(ConnectionState::Failed);
             }
         }
+    } else if parsed.has_mic()
+        && parsed.is_secure()
+        && parsed.has_ack()
+        && !parsed.is_pairwise()
+    {
+        // Group Key Handshake Message 1: a GTK rekey from the AP after the
+        // connection is already up. Reuses the PTK (KCK/KEK) from the 4-way.
+        info!("group key handshake: rekey (Message 1)");
+
+        let fw = match state.fourway.as_mut() {
+            Some(f) => f,
+            None => {
+                warn!("group rekey before 4-way handshake; ignoring");
+                return;
+            }
+        };
+
+        match fw.process_group_rekey(&parsed) {
+            Ok(msg2) => {
+                if let Err(e) = send_ctrl_port_frame(
+                    handle,
+                    state.sm.if_index,
+                    state.bssid,
+                    &msg2,
+                )
+                .await
+                {
+                    warn!("send group rekey reply failed: {e}");
+                    return;
+                }
+                info!("group key handshake: Message 2 sent");
+
+                if let Some(gtk_data) = fw.gtk().map(|g| g.to_vec()) {
+                    let gtk_idx = fw.gtk_index();
+                    if let Err(e) = keys::install_gtk(
+                        handle,
+                        state.sm.if_index,
+                        &gtk_data,
+                        gtk_idx,
+                    )
+                    .await
+                    {
+                        warn!("install rekeyed GTK failed: {e}");
+                    } else {
+                        info!("GTK[{}] rekeyed", gtk_idx);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("process_group_rekey failed: {e}");
+            }
+        }
     } else {
         debug!("unhandled EAPOL-Key frame type");
     }
@@ -480,7 +531,6 @@ async fn send_ctrl_port_frame(
     bssid: [u8; 6],
     frame: &[u8],
 ) -> ShuliResult<()> {
-    const NL80211_ATTR_CONTROL_PORT_ETHERTYPE: u16 = 102;
     const ETH_P_PAE: u16 = 0x888E;
 
     let mut nl_msg = netlink_packet_core::NetlinkMessage::from(
@@ -491,10 +541,7 @@ async fn send_ctrl_port_frame(
                     Nl80211Attr::IfIndex(if_index),
                     Nl80211Attr::Mac(bssid),
                     Nl80211Attr::Frame(frame.to_vec()),
-                    Nl80211Attr::Other(netlink_packet_core::DefaultNla::new(
-                        NL80211_ATTR_CONTROL_PORT_ETHERTYPE,
-                        ETH_P_PAE.to_le_bytes().to_vec(),
-                    )),
+                    Nl80211Attr::ControlPortEthertype(ETH_P_PAE),
                 ],
             },
         ),

@@ -220,6 +220,28 @@ pub fn build_message_4(snonce: &[u8; 32], replay_counter: u64) -> Vec<u8> {
     )
 }
 
+/// Build the Group Key Handshake Message 2 (STA -> AP reply to a GTK rekey),
+/// MIC field zeroed. This is a group-type EAPOL-Key frame (the Pairwise bit is
+/// clear) carrying no key data; `key_rsc` echoes the group key RSC from
+/// Message 1.
+pub fn build_group_message_2(
+    replay_counter: u64,
+    key_rsc: &[u8; 8],
+) -> Vec<u8> {
+    let key_info = KEY_INFO_MIC | KEY_INFO_SECURE;
+    build_eapol_key_pdu(
+        key_info,
+        0,
+        replay_counter,
+        &[0u8; 32],
+        &[0u8; 16],
+        key_rsc,
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    )
+}
+
 /// Return a copy of `pdu` with the 16-byte MIC field zeroed (for MIC
 /// computation/verification).
 pub fn pdu_with_zeroed_mic(pdu: &[u8]) -> Vec<u8> {

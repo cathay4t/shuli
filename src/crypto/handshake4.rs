@@ -214,6 +214,59 @@ impl FourWayState {
     pub fn ptk(&self) -> Option<[u8; PTK_LEN]> {
         self.ptk
     }
+
+    /// Process a Group Key Handshake Message 1 (a GTK rekey initiated by the
+    /// AP after the connection is up). Verifies the MIC with the existing KCK,
+    /// unwraps the new GTK with the KEK, updates the stored GTK/index, and
+    /// returns the Group Message 2 PDU to send back.
+    pub fn process_group_rekey(
+        &mut self,
+        frame: &eapol::EapolKeyFrame,
+    ) -> ShuliResult<Vec<u8>> {
+        self.replay_counter = frame.replay_counter;
+
+        let kck = self.kck().ok_or_else(|| {
+            crate::ShuliError::HandshakeFailed("PTK not derived".into())
+        })?;
+
+        // Verify MIC over the received PDU with the MIC field zeroed.
+        let expected = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
+        if expected != frame.key_mic {
+            return Err(crate::ShuliError::HandshakeFailed(
+                "group rekey MIC mismatch".into(),
+            ));
+        }
+
+        // Decrypt/extract the new GTK from the key data KDEs.
+        if frame.key_data.is_empty() {
+            return Err(crate::ShuliError::HandshakeFailed(
+                "group rekey carries no key data".into(),
+            ));
+        }
+        let kek = self.kek().ok_or_else(|| {
+            crate::ShuliError::HandshakeFailed("KEK not derived".into())
+        })?;
+        let plain = if frame.is_encrypted_data() {
+            aes_key_unwrap(&kek, &frame.key_data)?
+        } else {
+            frame.key_data.clone()
+        };
+        let (idx, gtk) = parse_gtk_kde(&plain).ok_or_else(|| {
+            crate::ShuliError::HandshakeFailed(
+                "no GTK KDE in group rekey".into(),
+            )
+        })?;
+        self.gtk_index = idx;
+        self.gtk = Some(gtk);
+
+        // Build Group Message 2 (zeroed MIC) and compute its MIC.
+        let mut msg2 =
+            eapol::build_group_message_2(self.replay_counter, &frame.key_rsc);
+        let mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
+        eapol::set_mic(&mut msg2, &mic);
+
+        Ok(msg2)
+    }
 }
 
 type Aes128Key = GenericArray<u8, U16>;
@@ -366,5 +419,56 @@ mod tests {
         let (idx, parsed) = parse_gtk_kde(&kde).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(parsed, gtk.to_vec());
+    }
+
+    #[test]
+    fn test_group_rekey() {
+        // Establish a PTK so KCK/KEK are available.
+        let pmk = [0x11u8; 32];
+        let pmkid = [0x22u8; 16];
+        let sta = [0x03u8; 6];
+        let ap = [0x04u8; 6];
+        let mut state = FourWayState::new(&pmk, &pmkid, sta, ap, vec![]);
+        state.anonce = Some([0x05u8; 32]);
+        state.ptk = Some(state.derive_ptk());
+        let kck = state.kck().unwrap();
+        let kek = state.kek().unwrap();
+
+        // AP builds a Group Message 1: wrapped GTK KDE, group-type key_info
+        // with MIC/ACK/Secure/Encrypted, zeroed MIC then patched.
+        let new_gtk = [0x99u8; 16];
+        let mut kde = vec![
+            0xDD,
+            (6 + new_gtk.len()) as u8,
+            0x00,
+            0x0F,
+            0xAC,
+            0x01,
+            0x02,
+            0x00,
+        ];
+        kde.extend_from_slice(&new_gtk);
+        let wrapped = aes_key_wrap(&kek, &kde).unwrap();
+        let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000; // mic|ack|secure|enc
+        let mut g1 = eapol::build_eapol_key_pdu(
+            key_info, 16, 5, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
+            &[0u8; 16], &wrapped,
+        );
+        let g1_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&g1)).unwrap();
+        eapol::set_mic(&mut g1, &g1_mic);
+
+        let parsed = eapol::parse_eapol_key_frame(&g1).unwrap();
+        let msg2 = state.process_group_rekey(&parsed).unwrap();
+
+        // The new GTK was extracted and stored at the advertised index.
+        assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
+        assert_eq!(state.gtk_index(), 2);
+
+        // Message 2 is a valid group-type reply with a correct MIC.
+        let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+        assert!(m2.has_mic() && m2.is_secure() && !m2.is_pairwise());
+        let m2_mic =
+            aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2)).unwrap();
+        assert_eq!(m2.key_mic, m2_mic);
     }
 }

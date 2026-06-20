@@ -6,9 +6,7 @@
 
 use futures::TryStreamExt;
 use log;
-use netlink_packet_core::{
-    DefaultNla, NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage,
-};
+use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
     Nl80211Attr, Nl80211AuthType, Nl80211Command, Nl80211Handle,
@@ -38,7 +36,7 @@ pub async fn authenticate_sae_commit(
         Nl80211Attr::Ssid(ssid.to_string()),
         Nl80211Attr::AuthType(Nl80211AuthType::Sae),
         // NL80211_ATTR_AUTH_DATA = 156: SAE commit (trans||status||body)
-        Nl80211Attr::Other(DefaultNla::new(156, auth_data.to_vec())),
+        Nl80211Attr::AuthData(auth_data.to_vec()),
     ];
 
     send_nl80211_cmd(handle, Nl80211Command::Authenticate, attrs).await
@@ -68,7 +66,7 @@ pub async fn authenticate_sae_confirm(
         Nl80211Attr::WiphyFreq(freq_mhz),
         Nl80211Attr::Ssid(ssid.to_string()),
         Nl80211Attr::AuthType(Nl80211AuthType::Sae),
-        Nl80211Attr::Other(DefaultNla::new(156, auth_data)),
+        Nl80211Attr::AuthData(auth_data),
     ];
 
     send_nl80211_cmd(handle, Nl80211Command::Authenticate, attrs).await
@@ -84,8 +82,7 @@ pub async fn associate(
 ) -> ShuliResult<()> {
     // Build the RSNE + RSNXE exactly as they appear in 4-way handshake
     // Message 2 so the AP's consistency check passes.
-    let mut ie_buf = crate::ieee80211::elements::sae_rsne();
-    ie_buf.extend_from_slice(&crate::ieee80211::elements::rsnxe_h2e());
+    let ie_buf = crate::ieee80211::elements::sae_ie();
     log::debug!("associate IE: {ie_buf:02x?}");
 
     let attrs = vec![
