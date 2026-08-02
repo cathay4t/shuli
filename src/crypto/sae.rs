@@ -225,8 +225,7 @@ impl SaeAuth {
         );
 
         if aws_lc_rs::constant_time::verify_slices_are_equal(
-            &expected,
-            peer_hash,
+            &expected, peer_hash,
         )
         .is_err()
         {
@@ -385,10 +384,7 @@ fn scalar_from_bytes(bytes: &[u8]) -> Result<Scalar, WpaError> {
     }
     let scalar = opt.unwrap();
     if bool::from(scalar.is_zero()) {
-        return Err(WpaError::new(
-            ErrorKind::SaeFailed,
-            "peer scalar is zero",
-        ));
+        return Err(WpaError::new(ErrorKind::SaeFailed, "peer scalar is zero"));
     }
     Ok(scalar)
 }

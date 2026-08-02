@@ -19,6 +19,8 @@ pub(crate) struct BssInfo {
     pub(crate) bssid: [u8; ETH_ALEN],
     pub(crate) freq_mhz: u32,
     pub(crate) signal_dbm: i32,
+    /// True when the BSS has no RSNE (open / no encryption).
+    pub(crate) is_open: bool,
 }
 
 // Prefer the strongest signal; break ties by frequency (higher band first),
@@ -87,6 +89,7 @@ impl WpaClient {
                 bssid,
                 freq_mhz,
                 signal_dbm,
+                is_open: !has_rsne(ies),
             });
         }
 
@@ -109,4 +112,21 @@ impl WpaClient {
         );
         Ok(())
     }
+}
+
+const IE_ID_RSN: u8 = 48;
+
+/// Walk an 802.11 IE buffer and return true if an RSNE (element ID 48)
+/// is present.
+fn has_rsne(ies: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + 2 <= ies.len() {
+        let id = ies[pos];
+        let len = ies[pos + 1] as usize;
+        if id == IE_ID_RSN {
+            return true;
+        }
+        pos += 2 + len;
+    }
+    false
 }

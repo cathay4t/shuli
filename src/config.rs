@@ -24,7 +24,8 @@ pub struct InterfaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WifiConfig {
     pub ssid: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Config {

@@ -17,7 +17,22 @@ interfaces:
     assert_eq!(config.interfaces[0].name, "wlan0");
     let wifi = config.interfaces[0].wifi.as_ref().unwrap();
     assert_eq!(wifi.ssid, "Test-WIFI");
-    assert_eq!(wifi.password, "12345678");
+    assert_eq!(wifi.password, Some("12345678".to_string()));
+}
+
+#[test]
+fn parse_open_config() {
+    let yaml = r#"
+---
+interfaces:
+  - name: wlan0
+    wifi:
+      ssid: Test-WIFI-NOPASS
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let wifi = config.interfaces[0].wifi.as_ref().unwrap();
+    assert_eq!(wifi.ssid, "Test-WIFI-NOPASS");
+    assert_eq!(wifi.password, None);
 }
 
 #[test]

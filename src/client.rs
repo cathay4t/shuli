@@ -37,7 +37,7 @@ const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
 pub struct WpaConfig {
     pub ifname: String,
     pub ssid: String,
-    pub password: String,
+    pub password: Option<String>,
 }
 
 impl WpaConfig {
@@ -228,9 +228,33 @@ impl WpaClient {
             }
 
             WifiEvent::Authenticated { status, auth_frame } => {
-                // SAE: the auth frame carries the AP's commit (transaction 1)
-                // or confirm (transaction 2).
-                if let Some(frame) = auth_frame {
+                if self.bss_info.is_open {
+                    // Open-system auth: no frame, just a status.
+                    if status == 0 {
+                        log::info!(
+                            "open-system AUTHENTICATE ok - sending ASSOCIATE"
+                        );
+                        if let Err(e) = auth_assoc::associate_open(
+                            &self.handle,
+                            self.if_index,
+                            &self.config.ssid,
+                            self.bss_info.bssid,
+                            self.bss_info.freq_mhz,
+                        )
+                        .await
+                        {
+                            log::warn!("ASSOCIATE failed: {e}");
+                            self.state = WpaState::Failed;
+                        }
+                    } else {
+                        log::warn!(
+                            "open-system AUTHENTICATE failed: status={status}"
+                        );
+                        self.state = WpaState::Failed;
+                    }
+                } else if let Some(frame) = auth_frame {
+                    // SAE: the auth frame carries the AP's commit
+                    // (transaction 1) or confirm (transaction 2).
                     self.handle_auth_frame(&frame).await;
                 } else if status != 0 {
                     log::warn!("AUTHENTICATE failed: status={status}");
@@ -242,7 +266,14 @@ impl WpaClient {
 
             WifiEvent::Associated { status } => {
                 if status == 0 {
-                    log::info!("ASSOCIATED - waiting for 4-way handshake");
+                    if self.bss_info.is_open {
+                        log::info!(
+                            "ASSOCIATED - open network, connection established"
+                        );
+                        self.state = WpaState::ConnectedWithoutOffloadRekey;
+                    } else {
+                        log::info!("ASSOCIATED - waiting for 4-way handshake");
+                    }
                 } else {
                     log::warn!("ASSOCIATE failed: status={status}");
                     self.state = WpaState::Failed;
@@ -495,42 +526,40 @@ impl WpaClient {
             // Try to offload GTK rekey to the driver/firmware.
             // Falls back to userspace rekey when unsupported
             // (e.g. mac80211_hwsim returns -EOPNOTSUPP).
-            let offloaded =
-                if let (Some(kck), Some(kek), Some(fw)) = (
-                    self.fourway.as_ref().and_then(|f| f.kck()),
-                    self.fourway.as_ref().and_then(|f| f.kek()),
-                    &self.fourway,
-                ) {
-                    let rc = fw.replay_counter_bytes();
-                    match keys::set_rekey_offload(
-                        &self.handle,
-                        self.if_index,
-                        &kek,
-                        &kck,
-                        &rc,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            log::info!("GTK rekey offloaded to driver");
-                            true
-                        }
-                        Err(e) => {
-                            log::debug!("rekey offload not available: {e}");
-                            false
-                        }
+            let offloaded = if let (Some(kck), Some(kek), Some(fw)) = (
+                self.fourway.as_ref().and_then(|f| f.kck()),
+                self.fourway.as_ref().and_then(|f| f.kek()),
+                &self.fourway,
+            ) {
+                let rc = fw.replay_counter_bytes();
+                match keys::set_rekey_offload(
+                    &self.handle,
+                    self.if_index,
+                    &kek,
+                    &kck,
+                    &rc,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        log::info!("GTK rekey offloaded to driver");
+                        true
                     }
-                } else {
-                    false
-                };
+                    Err(e) => {
+                        log::debug!("rekey offload not available: {e}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
 
             if offloaded {
                 log::info!("keys installed - connection established");
                 self.state = WpaState::ConnectedWithOffloadRekey;
             } else {
                 log::info!(
-                    "keys installed - connection established \
-                     (userspace rekey)"
+                    "keys installed - connection established (userspace rekey)"
                 );
                 self.state = WpaState::ConnectedWithoutOffloadRekey;
             }

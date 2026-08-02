@@ -72,6 +72,45 @@ pub async fn authenticate_sae_confirm(
     send_nl80211_cmd(handle, Nl80211Command::Authenticate, attrs).await
 }
 
+/// Send NL80211_CMD_AUTHENTICATE with open-system auth type (no
+/// encryption).  Used for open / no-password networks.
+pub async fn authenticate_open(
+    handle: &Nl80211Handle,
+    if_index: u32,
+    ssid: &str,
+    bssid: [u8; 6],
+    freq_mhz: u32,
+) -> Result<(), WpaError> {
+    let attrs = vec![
+        Nl80211Attr::IfIndex(if_index),
+        Nl80211Attr::Mac(bssid),
+        Nl80211Attr::WiphyFreq(freq_mhz),
+        Nl80211Attr::Ssid(ssid.to_string()),
+        Nl80211Attr::AuthType(Nl80211AuthType::OpenSystem),
+    ];
+
+    send_nl80211_cmd(handle, Nl80211Command::Authenticate, attrs).await
+}
+
+/// Send NL80211_CMD_ASSOCIATE for an open network (no RSNE, no MFP,
+/// no control port).
+pub async fn associate_open(
+    handle: &Nl80211Handle,
+    if_index: u32,
+    ssid: &str,
+    bssid: [u8; 6],
+    freq_mhz: u32,
+) -> Result<(), WpaError> {
+    let attrs = vec![
+        Nl80211Attr::IfIndex(if_index),
+        Nl80211Attr::Mac(bssid),
+        Nl80211Attr::WiphyFreq(freq_mhz),
+        Nl80211Attr::Ssid(ssid.to_string()),
+    ];
+
+    send_nl80211_cmd(handle, Nl80211Command::Associate, attrs).await
+}
+
 /// Send NL80211_CMD_ASSOCIATE with RSNE for SAE.
 pub async fn associate(
     handle: &Nl80211Handle,

@@ -131,19 +131,42 @@ fn process_sae_frame(
 }
 
 impl WpaClient {
-    /// Start authentication with the selected BSS:
-    /// 1. Create a fresh auth method for this attempt (new nonces/scalars).
-    /// 2. Send the initial AUTHENTICATE command carrying the SAE commit.
+    /// Start authentication with the selected BSS.
+    ///
+    /// Open networks: send open-system AUTHENTICATE (no auth method, no
+    /// SAE).  The `Authenticated` event handler proceeds to associate.
+    ///
+    /// SAE networks: create a fresh SAE auth method and send the commit.
     pub(crate) async fn send_out_auth_request(
         &mut self,
     ) -> Result<(), WpaError> {
+        self.auth = None;
+        self.fourway = None;
+
+        if self.bss_info.is_open {
+            log::info!("open network - sending open-system AUTHENTICATE");
+            return auth_assoc::authenticate_open(
+                &self.handle,
+                self.if_index,
+                &self.config.ssid,
+                self.bss_info.bssid,
+                self.bss_info.freq_mhz,
+            )
+            .await;
+        }
+
+        let password = self.config.password.as_deref().ok_or_else(|| {
+            WpaError::new(
+                ErrorKind::InvalidConfig,
+                "password required for encrypted network",
+            )
+        })?;
         self.auth = Some(AuthMethod::new_sae(
-            &self.config.password,
+            password,
             &self.config.ssid,
             self.mac,
             self.bss_info.bssid,
         )?);
-        self.fourway = None;
 
         let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
         auth_assoc::authenticate_sae_commit(
