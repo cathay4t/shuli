@@ -5,6 +5,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::Parser;
 use shuli::{WpaClient, WpaConfig, WpaState};
 use tokio::signal;
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
 #[derive(Parser)]
 #[command(name = "shulid", about = "WiFi authentication daemon")]
@@ -37,11 +38,23 @@ async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
 
     let mut client = WpaClient::new(&config).await?;
     let mut connected = false;
+    let mut sigterm =
+        unix_signal(SignalKind::terminate()).map_err(|e| {
+            shuli::WpaError::new(
+                shuli::ErrorKind::ConnectFailed,
+                format!("failed to register SIGTERM handler: {e}"),
+            )
+        })?;
 
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
-                log::info!("shutting down");
+                log::info!("received SIGINT, shutting down");
+                client.shutdown().await;
+                break;
+            }
+            _ = sigterm.recv() => {
+                log::info!("received SIGTERM, shutting down");
                 client.shutdown().await;
                 break;
             }

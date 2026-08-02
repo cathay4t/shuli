@@ -1,0 +1,57 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH SHULID 8 "August 2026" "shuli" "System Administration"
+.SH NAME
+shulid \- WiFi authentication daemon
+.SH SYNOPSIS
+.B shulid
+.RB [ \-c
+.IR config ]
+.SH DESCRIPTION
+.B shulid
+is a pure-Rust WiFi authentication daemon implementing
+WPA3-Personal (SAE) authentication.  It performs the full
+authentication flow in userspace: scan, SAE handshake,
+association, 4-way handshake, and key installation via
+nl80211.  Data-frame encryption (CCMP) is handled by the
+kernel once keys are installed.
+.PP
+On successful authentication the link is brought up and
+.B shulid
+holds the connection, handling group rekey (in userspace or
+offloaded to the driver when supported).  An external DHCP
+client can be used to obtain an address.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIfile\fR
+Path to the YAML configuration file.
+Default:
+.IR /etc/shuli/config.yml .
+.SH CONFIGURATION
+The configuration file is YAML:
+.PP
+.RS
+.nf
+interfaces:
+  - name: wlan0
+    type: wifi-phy
+    wifi:
+      ssid: MyNetwork
+      password: "secretpass"
+.fi
+.RE
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+Cleanly disconnect from the AP and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Connection was established and held until a shutdown signal.
+.TP
+.B 1
+Fatal error (configuration, netlink, or shutdown before
+connection was established).
+.SH SEE ALSO
+.BR hostapd (8),
+.BR wpa_supplicant (8),
+.BR iwd (8)
