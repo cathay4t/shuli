@@ -153,6 +153,16 @@ impl FourWayState {
         &mut self,
         frame: &eapol::EapolKeyFrame,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), WpaError> {
+        // 802.11-2020 §12.7.6.4: replay counter must be >= Message 1's.
+        if frame.replay_counter < self.replay_counter {
+            return Err(WpaError::new(
+                ErrorKind::HandshakeFailed,
+                format!(
+                    "Message 3 replay counter {} < Message 1 counter {}",
+                    frame.replay_counter, self.replay_counter
+                ),
+            ));
+        }
         self.replay_counter = frame.replay_counter;
 
         let kck = self.kck().ok_or_else(|| {
@@ -206,6 +216,17 @@ impl FourWayState {
         &mut self,
         frame: &eapol::EapolKeyFrame,
     ) -> Result<Vec<u8>, WpaError> {
+        // 802.11-2020 §12.7.7.1: replay counter must be strictly greater
+        // than the last accepted value.
+        if frame.replay_counter <= self.replay_counter {
+            return Err(WpaError::new(
+                ErrorKind::HandshakeFailed,
+                format!(
+                    "group rekey replay counter {} <= last accepted {}",
+                    frame.replay_counter, self.replay_counter
+                ),
+            ));
+        }
         self.replay_counter = frame.replay_counter;
 
         let kck = self.kck().ok_or_else(|| {
