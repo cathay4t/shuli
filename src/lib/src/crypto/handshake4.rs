@@ -27,8 +27,20 @@ pub(crate) const EAPOL_MIC_LEN: usize = 16;
 pub(crate) enum MicAlg {
     /// SAE (00-0F-AC:8): AES-CMAC MIC, KDF-Hash-Length PTK.
     AesCmac,
-    /// OWE (00-0F-AC:18): HMAC-SHA256 MIC, PRF PTK (RFC 8110).
+    /// OWE (00-0F-AC:18): HMAC-SHA256 MIC, KDF-Hash-Length PTK.
     HmacSha256,
+    /// WPA2-PSK (00-0F-AC:2): HMAC-SHA1 MIC, PRF-SHA1 PTK.
+    HmacSha1,
+}
+
+impl MicAlg {
+    /// EAPOL-Key descriptor version (key_info bits 0-2).
+    pub(crate) fn descriptor_version(self) -> u16 {
+        match self {
+            MicAlg::AesCmac | MicAlg::HmacSha256 => 0,
+            MicAlg::HmacSha1 => 2,
+        }
+    }
 }
 
 /// 4-Way Handshake state (supplicant side).
@@ -97,8 +109,17 @@ impl FourWayState {
         context.extend_from_slice(&nonce1);
         context.extend_from_slice(&nonce2);
 
-        let result =
-            kdf::kdf(&self.pmk, "Pairwise key expansion", &context, PTK_LEN);
+        let result = match self.mic_alg {
+            MicAlg::HmacSha1 => kdf::prf_sha1(
+                &self.pmk,
+                "Pairwise key expansion",
+                &context,
+                PTK_LEN,
+            ),
+            _ => {
+                kdf::kdf(&self.pmk, "Pairwise key expansion", &context, PTK_LEN)
+            }
+        };
         let mut ptk = [0u8; PTK_LEN];
         ptk.copy_from_slice(&result);
         ptk
@@ -113,6 +134,7 @@ impl FourWayState {
         match self.mic_alg {
             MicAlg::AesCmac => aes_cmac(kck, data),
             MicAlg::HmacSha256 => Ok(kdf::hmac_sha256_mic(kck, data)),
+            MicAlg::HmacSha1 => Ok(kdf::hmac_sha1_mic(kck, data)),
         }
     }
 
@@ -172,6 +194,7 @@ impl FourWayState {
             &self.snonce,
             self.replay_counter,
             &self.rsne,
+            self.mic_alg.descriptor_version(),
         );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);
@@ -233,8 +256,11 @@ impl FourWayState {
         }
 
         // Build Message 4 (zeroed MIC) and compute its MIC.
-        let mut msg4 =
-            eapol::build_message_4(&self.snonce, self.replay_counter);
+        let mut msg4 = eapol::build_message_4(
+            &self.snonce,
+            self.replay_counter,
+            self.mic_alg.descriptor_version(),
+        );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg4))?;
         eapol::set_mic(&mut msg4, &mic);
 
@@ -301,8 +327,11 @@ impl FourWayState {
         self.gtk = Some(gtk);
 
         // Build Group Message 2 (zeroed MIC) and compute its MIC.
-        let mut msg2 =
-            eapol::build_group_message_2(self.replay_counter, &frame.key_rsc);
+        let mut msg2 = eapol::build_group_message_2(
+            self.replay_counter,
+            &frame.key_rsc,
+            self.mic_alg.descriptor_version(),
+        );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);
 

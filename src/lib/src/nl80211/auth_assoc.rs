@@ -139,6 +139,30 @@ pub async fn associate_owe(
     send_nl80211_cmd(handle, Nl80211Command::Associate, attrs).await
 }
 
+/// Send NL80211_CMD_ASSOCIATE for WPA2-PSK (RSNE with AKM PSK,
+/// control port, no MFP requirement).
+pub async fn associate_wpa2_psk(
+    handle: &Nl80211Handle,
+    if_index: u32,
+    ssid: &str,
+    bssid: [u8; 6],
+    freq_mhz: u32,
+) -> Result<(), WifiError> {
+    let ie_buf = crate::ieee80211::elements::wpa2_psk_ie();
+
+    let attrs = vec![
+        Nl80211Attr::IfIndex(if_index),
+        Nl80211Attr::Mac(bssid),
+        Nl80211Attr::WiphyFreq(freq_mhz),
+        Nl80211Attr::Ssid(ssid.to_string()),
+        Nl80211Attr::Ie(ie_buf),
+        Nl80211Attr::ControlPortOverNl80211,
+        Nl80211Attr::SocketOwner,
+    ];
+
+    send_nl80211_cmd(handle, Nl80211Command::Associate, attrs).await
+}
+
 /// Send NL80211_CMD_ASSOCIATE with RSNE for SAE.
 pub async fn associate(
     handle: &Nl80211Handle,

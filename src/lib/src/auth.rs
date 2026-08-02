@@ -142,11 +142,26 @@ impl WifiClient {
     ) -> Result<(), WifiError> {
         self.auth = None;
         self.fourway = None;
+        self.psk_pmk = None;
 
         if self.bss_info.security != SecurityType::Sae {
-            // Open and OWE both use open-system authentication.
-            // OWE's DH exchange happens in the association
-            // request/response, not in the auth frame.
+            // Open, OWE, and WPA2-PSK all use open-system
+            // authentication.  OWE's DH exchange happens in the
+            // association request/response; WPA2-PSK derives the
+            // PMK from the passphrase via PBKDF2.
+            if self.bss_info.security == SecurityType::Wpa2Psk {
+                let password =
+                    self.config.password.as_deref().ok_or_else(|| {
+                        WifiError::new(
+                            ErrorKind::InvalidConfig,
+                            "password required for WPA2-PSK",
+                        )
+                    })?;
+                self.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
+                    password,
+                    &self.config.ssid,
+                ));
+            }
             log::info!(
                 "open-system AUTHENTICATE ({:?} network)",
                 self.bss_info.security

@@ -54,3 +54,21 @@ pub fn owe_ie() -> Vec<u8> {
     elements.emit(&mut buf);
     buf
 }
+
+/// Build the RSNE for WPA2-PSK (AKM 00-0F-AC:2, CCMP-128, no MFP).
+pub fn wpa2_psk_ie() -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::Psk],
+            rsn_capbilities: None,
+            pmkids: vec![],
+            group_mgmt_cipher: None,
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}

@@ -73,6 +73,8 @@ pub struct WifiClient {
     pub(crate) auth: Option<AuthMethod>,
     /// OWE DH exchange state (only for OWE networks).
     pub(crate) owe: Option<OweAuth>,
+    /// WPA2-PSK PMK derived via PBKDF2 (only for WPA2-PSK networks).
+    pub(crate) psk_pmk: Option<[u8; 32]>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
 }
@@ -114,6 +116,7 @@ impl WifiClient {
             bss_info: BssInfo::default(),
             auth: None,
             owe: None,
+            psk_pmk: None,
             fourway: None,
         })
     }
@@ -234,6 +237,26 @@ impl WifiClient {
                             .await
                             {
                                 log::warn!("OWE ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                            }
+                        } else if self.bss_info.security
+                            == SecurityType::Wpa2Psk
+                        {
+                            // WPA2-PSK: associate with PSK RSNE.
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending \
+                                 WPA2-PSK ASSOCIATE"
+                            );
+                            if let Err(e) = auth_assoc::associate_wpa2_psk(
+                                &self.handle,
+                                self.if_index,
+                                &self.config.ssid,
+                                self.bss_info.bssid,
+                                self.bss_info.freq_mhz,
+                            )
+                            .await
+                            {
+                                log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
                             }
                         } else {
@@ -439,7 +462,21 @@ impl WifiClient {
                             MicAlg::HmacSha256,
                         )
                     }
+                    SecurityType::Wpa2Psk => {
+                        let Some(pmk) = self.psk_pmk else {
+                            log::warn!("no PSK PMK for 4-way handshake");
+                            self.state = WifiState::Failed;
+                            return;
+                        };
+                        (
+                            pmk,
+                            [0u8; 16],
+                            elements::wpa2_psk_ie(),
+                            MicAlg::HmacSha1,
+                        )
+                    }
                     _ => {
+                        // SAE
                         let Some(pmk) =
                             self.auth.as_ref().and_then(|a| a.pmk())
                         else {

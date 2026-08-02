@@ -158,10 +158,9 @@ pub fn build_message_2(
     snonce: &[u8; 32],
     replay_counter: u64,
     rsne: &[u8],
+    desc_version: u16,
 ) -> Vec<u8> {
-    // Key descriptor version 0 (AES-CMAC MIC + NIST AES key wrap) is used by
-    // the SAE AKM.
-    let key_info = KEY_INFO_PAIRWISE | KEY_INFO_MIC;
+    let key_info = KEY_INFO_PAIRWISE | KEY_INFO_MIC | desc_version;
     build_eapol_key_pdu(
         key_info,
         0,
@@ -176,8 +175,13 @@ pub fn build_message_2(
 }
 
 /// Build 4-way handshake Message 4 (final ACK), MIC field zeroed.
-pub fn build_message_4(snonce: &[u8; 32], replay_counter: u64) -> Vec<u8> {
-    let key_info = KEY_INFO_PAIRWISE | KEY_INFO_MIC | KEY_INFO_SECURE;
+pub fn build_message_4(
+    snonce: &[u8; 32],
+    replay_counter: u64,
+    desc_version: u16,
+) -> Vec<u8> {
+    let key_info =
+        KEY_INFO_PAIRWISE | KEY_INFO_MIC | KEY_INFO_SECURE | desc_version;
     build_eapol_key_pdu(
         key_info,
         0,
@@ -198,8 +202,9 @@ pub fn build_message_4(snonce: &[u8; 32], replay_counter: u64) -> Vec<u8> {
 pub fn build_group_message_2(
     replay_counter: u64,
     key_rsc: &[u8; 8],
+    desc_version: u16,
 ) -> Vec<u8> {
-    let key_info = KEY_INFO_MIC | KEY_INFO_SECURE;
+    let key_info = KEY_INFO_MIC | KEY_INFO_SECURE | desc_version;
     build_eapol_key_pdu(
         key_info,
         0,

@@ -19,6 +19,8 @@ pub(crate) enum SecurityType {
     /// No RSNE — open / no encryption.
     #[default]
     Open,
+    /// RSNE with AKM 00-0F-AC:2 — WPA2-PSK.
+    Wpa2Psk,
     /// RSNE with AKM 00-0F-AC:18 — OWE (opportunistic encryption).
     Owe,
     /// RSNE with AKM 00-0F-AC:8 — WPA3-SAE.
@@ -126,6 +128,7 @@ impl WifiClient {
 }
 
 const IE_ID_RSN: u8 = 48;
+const AKM_PSK: u8 = 2;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
 
@@ -170,6 +173,7 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
             match body[off + 3] {
                 AKM_SAE => return SecurityType::Sae,
                 AKM_OWE => return SecurityType::Owe,
+                AKM_PSK => return SecurityType::Wpa2Psk,
                 _ => {}
             }
         }

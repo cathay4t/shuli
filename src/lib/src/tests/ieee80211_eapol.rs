@@ -9,7 +9,7 @@ use crate::ieee80211::eapol::{
 fn roundtrip_msg2() {
     let snonce = [0xABu8; 32];
     let rsne = vec![0x30, 0x14, 0x01, 0x00];
-    let pdu = build_message_2(&snonce, 1, &rsne);
+    let pdu = build_message_2(&snonce, 1, &rsne, 0);
     let parsed = parse_eapol_key_frame(&pdu).unwrap();
     assert!(parsed.has_mic());
     assert!(parsed.is_pairwise());
@@ -21,7 +21,7 @@ fn roundtrip_msg2() {
 #[test]
 fn mic_offset_is_correct() {
     assert_eq!(OFF_MIC, 81);
-    let pdu = build_message_4(&[0u8; 32], 2);
+    let pdu = build_message_4(&[0u8; 32], 2, 0);
     let zeroed = pdu_with_zeroed_mic(&pdu);
     assert_eq!(&zeroed[OFF_MIC..OFF_MIC + 16], &[0u8; 16]);
 }

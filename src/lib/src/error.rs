@@ -18,6 +18,7 @@ pub enum ErrorKind {
     ConfigNotFound,
     InvalidConfig,
     NetlinkDecode,
+    Deprecated,
 }
 
 impl fmt::Display for ErrorKind {
@@ -37,6 +38,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::ConfigNotFound => "config-not-found",
             ErrorKind::InvalidConfig => "invalid-config",
             ErrorKind::NetlinkDecode => "netlink-decode",
+            ErrorKind::Deprecated => "deprecated",
         };
         write!(f, "{s}")
     }
