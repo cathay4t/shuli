@@ -42,6 +42,7 @@ async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
         tokio::select! {
             _ = signal::ctrl_c() => {
                 log::info!("shutting down");
+                client.shutdown().await;
                 break;
             }
             result = client.process() => {

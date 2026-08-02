@@ -558,12 +558,37 @@ impl WpaClient {
     }
 }
 
+impl WpaClient {
+    /// Cleanly disconnect from the AP.  Call this before dropping the
+    /// client so the AP receives a proper deauthentication.
+    pub async fn shutdown(&mut self) {
+        if let Err(e) =
+            connect::disconnect(&mut self.conn_handle, self.if_index).await
+        {
+            log::debug!("disconnect on shutdown: {e}");
+        }
+    }
+}
+
 impl Drop for WpaClient {
     fn drop(&mut self) {
         let mut conn_handle = self.conn_handle.clone();
         let if_index = self.if_index;
-        tokio::spawn(async move {
-            let _ = connect::disconnect(&mut conn_handle, if_index).await;
+        // Best-effort: run the disconnect on a dedicated thread with its
+        // own runtime so we never panic outside a tokio context.  The
+        // thread is detached; if the process exits first the disconnect
+        // is simply lost (same as the old tokio::spawn approach, but
+        // without the panic risk).
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                rt.block_on(async {
+                    let _ =
+                        connect::disconnect(&mut conn_handle, if_index).await;
+                });
+            }
         });
     }
 }
