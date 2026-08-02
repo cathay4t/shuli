@@ -84,3 +84,13 @@ pub fn hkdf_expand(prk: &[u8], info: &[u8], okm: &mut [u8]) {
         i += 1;
     }
 }
+
+/// HMAC-SHA256 MIC for OWE / WPA2 4-way handshake:
+/// `Truncate-128(HMAC-SHA256(KCK, data))`.
+pub fn hmac_sha256_mic(kck: &[u8], data: &[u8]) -> [u8; 16] {
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, kck);
+    let tag = hmac::sign(&hmac_key, data);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&tag.as_ref()[..16]);
+    out
+}

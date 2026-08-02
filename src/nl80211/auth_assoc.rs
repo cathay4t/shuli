@@ -111,6 +111,34 @@ pub async fn associate_open(
     send_nl80211_cmd(handle, Nl80211Command::Associate, attrs).await
 }
 
+/// Send NL80211_CMD_ASSOCIATE for an OWE network.  The IE buffer
+/// carries the OWE RSNE + OWE DH Parameter Element (RFC 8110 §4.3).
+pub async fn associate_owe(
+    handle: &Nl80211Handle,
+    if_index: u32,
+    ssid: &str,
+    bssid: [u8; 6],
+    freq_mhz: u32,
+    owe_dh_element: &[u8],
+) -> Result<(), WpaError> {
+    let mut ie_buf = crate::ieee80211::elements::owe_ie();
+    ie_buf.extend_from_slice(owe_dh_element);
+    log::debug!("associate OWE IE: {ie_buf:02x?}");
+
+    let attrs = vec![
+        Nl80211Attr::IfIndex(if_index),
+        Nl80211Attr::Mac(bssid),
+        Nl80211Attr::WiphyFreq(freq_mhz),
+        Nl80211Attr::Ssid(ssid.to_string()),
+        Nl80211Attr::Ie(ie_buf),
+        Nl80211Attr::UseMfp(Nl80211UseMfp::Required),
+        Nl80211Attr::ControlPortOverNl80211,
+        Nl80211Attr::SocketOwner,
+    ];
+
+    send_nl80211_cmd(handle, Nl80211Command::Associate, attrs).await
+}
+
 /// Send NL80211_CMD_ASSOCIATE with RSNE for SAE.
 pub async fn associate(
     handle: &Nl80211Handle,

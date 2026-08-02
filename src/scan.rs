@@ -13,14 +13,25 @@ use crate::{
 
 const SCAN_SLEEP_SECS: u64 = 3;
 
+/// Security type detected from the BSS's RSNE in scan results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SecurityType {
+    /// No RSNE — open / no encryption.
+    #[default]
+    Open,
+    /// RSNE with AKM 00-0F-AC:18 — OWE (opportunistic encryption).
+    Owe,
+    /// RSNE with AKM 00-0F-AC:8 — WPA3-SAE.
+    Sae,
+}
+
 /// The best BSS candidate for the configured SSID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct BssInfo {
     pub(crate) bssid: [u8; ETH_ALEN],
     pub(crate) freq_mhz: u32,
     pub(crate) signal_dbm: i32,
-    /// True when the BSS has no RSNE (open / no encryption).
-    pub(crate) is_open: bool,
+    pub(crate) security: SecurityType,
 }
 
 // Prefer the strongest signal; break ties by frequency (higher band first),
@@ -89,7 +100,7 @@ impl WpaClient {
                 bssid,
                 freq_mhz,
                 signal_dbm,
-                is_open: !has_rsne(ies),
+                security: detect_security(ies),
             });
         }
 
@@ -115,18 +126,56 @@ impl WpaClient {
 }
 
 const IE_ID_RSN: u8 = 48;
+const AKM_OWE: u8 = 18;
+const AKM_SAE: u8 = 8;
 
-/// Walk an 802.11 IE buffer and return true if an RSNE (element ID 48)
-/// is present.
-fn has_rsne(ies: &[u8]) -> bool {
+/// Walk an 802.11 IE buffer and determine the security type from the
+/// RSNE's AKM suites.
+fn detect_security(ies: &[u8]) -> SecurityType {
     let mut pos = 0;
     while pos + 2 <= ies.len() {
         let id = ies[pos];
         let len = ies[pos + 1] as usize;
-        if id == IE_ID_RSN {
-            return true;
+        if id == IE_ID_RSN && pos + 2 + len <= ies.len() {
+            return security_from_rsne(&ies[pos + 2..pos + 2 + len]);
         }
         pos += 2 + len;
     }
-    false
+    SecurityType::Open
+}
+
+/// Parse the RSNE body (after element ID + length) and check AKM suites.
+/// RSNE layout: version(2) | group(4) | pcount(2) | pciphers(4*n) |
+///              acount(2) | akms(4*m) | ...
+fn security_from_rsne(body: &[u8]) -> SecurityType {
+    // Minimum: version(2) + group(4) + pcount(2) = 8 bytes before
+    // pairwise ciphers.
+    if body.len() < 8 {
+        return SecurityType::Open;
+    }
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_offset = 8 + pcount * 4;
+    if body.len() < akm_offset + 2 {
+        return SecurityType::Open;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
+    let mut off = akm_offset + 2;
+    for _ in 0..acount {
+        if body.len() < off + 4 {
+            break;
+        }
+        // AKM suite: OUI(3) + type(1).  We only care about 00-0F-AC.
+        if body[off] == 0x00 && body[off + 1] == 0x0F && body[off + 2] == 0xAC {
+            match body[off + 3] {
+                AKM_SAE => return SecurityType::Sae,
+                AKM_OWE => return SecurityType::Owe,
+                _ => {}
+            }
+        }
+        off += 4;
+    }
+    // RSNE present but no SAE/OWE AKM — treat as open for now
+    // (WPA2-PSK etc. will be added later).
+    SecurityType::Open
 }

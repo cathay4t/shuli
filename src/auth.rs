@@ -10,7 +10,7 @@
 
 use crate::{
     ETH_ALEN, ErrorKind, WpaClient, WpaError, crypto::sae::SaeAuth,
-    nl80211::auth_assoc,
+    nl80211::auth_assoc, scan::SecurityType,
 };
 
 /// What the client should do after processing an authentication frame.
@@ -143,8 +143,14 @@ impl WpaClient {
         self.auth = None;
         self.fourway = None;
 
-        if self.bss_info.is_open {
-            log::info!("open network - sending open-system AUTHENTICATE");
+        if self.bss_info.security != SecurityType::Sae {
+            // Open and OWE both use open-system authentication.
+            // OWE's DH exchange happens in the association
+            // request/response, not in the auth frame.
+            log::info!(
+                "open-system AUTHENTICATE ({:?} network)",
+                self.bss_info.security
+            );
             return auth_assoc::authenticate_open(
                 &self.handle,
                 self.if_index,

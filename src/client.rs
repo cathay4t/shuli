@@ -17,14 +17,17 @@ use wl_nl80211::{Nl80211Attr, Nl80211ConnectionHandle, Nl80211Handle};
 use crate::{
     ETH_ALEN, ErrorKind, WpaError,
     auth::{AuthAction, AuthMethod},
-    crypto::handshake4::FourWayState,
+    crypto::{
+        handshake4::{FourWayState, MicAlg},
+        owe::{self, OweAuth},
+    },
     ieee80211::{auth, eapol, elements},
     nl80211::{
         auth_assoc, connect,
         events::{WifiEvent, parse_event},
         keys,
     },
-    scan::BssInfo,
+    scan::{BssInfo, SecurityType},
 };
 
 const RETRY_WAIT_SEC: u64 = 10;
@@ -93,6 +96,8 @@ pub struct WpaClient {
     pub(crate) bss_info: BssInfo,
     /// Active pre-association authentication method.
     pub(crate) auth: Option<AuthMethod>,
+    /// OWE DH exchange state (only for OWE networks).
+    pub(crate) owe: Option<OweAuth>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
 }
@@ -132,6 +137,7 @@ impl WpaClient {
             config: config.clone(),
             bss_info: BssInfo::default(),
             auth: None,
+            owe: None,
             fourway: None,
         })
     }
@@ -228,23 +234,50 @@ impl WpaClient {
             }
 
             WifiEvent::Authenticated { status, auth_frame } => {
-                if self.bss_info.is_open {
-                    // Open-system auth: no frame, just a status.
+                if self.bss_info.security != SecurityType::Sae {
+                    // Open-system auth (open + OWE): no frame, just
+                    // a status.
                     if status == 0 {
-                        log::info!(
-                            "open-system AUTHENTICATE ok - sending ASSOCIATE"
-                        );
-                        if let Err(e) = auth_assoc::associate_open(
-                            &self.handle,
-                            self.if_index,
-                            &self.config.ssid,
-                            self.bss_info.bssid,
-                            self.bss_info.freq_mhz,
-                        )
-                        .await
-                        {
-                            log::warn!("ASSOCIATE failed: {e}");
-                            self.state = WpaState::Failed;
+                        if self.bss_info.security == SecurityType::Owe {
+                            // OWE: associate with DH element.
+                            let owe_auth = OweAuth::new();
+                            let dh_elem = owe_auth.build_dh_element();
+                            self.owe = Some(owe_auth);
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending OWE \
+                                 ASSOCIATE"
+                            );
+                            if let Err(e) = auth_assoc::associate_owe(
+                                &self.handle,
+                                self.if_index,
+                                &self.config.ssid,
+                                self.bss_info.bssid,
+                                self.bss_info.freq_mhz,
+                                &dh_elem,
+                            )
+                            .await
+                            {
+                                log::warn!("OWE ASSOCIATE failed: {e}");
+                                self.state = WpaState::Failed;
+                            }
+                        } else {
+                            // Plain open: associate without DH.
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending \
+                                 ASSOCIATE"
+                            );
+                            if let Err(e) = auth_assoc::associate_open(
+                                &self.handle,
+                                self.if_index,
+                                &self.config.ssid,
+                                self.bss_info.bssid,
+                                self.bss_info.freq_mhz,
+                            )
+                            .await
+                            {
+                                log::warn!("ASSOCIATE failed: {e}");
+                                self.state = WpaState::Failed;
+                            }
                         }
                     } else {
                         log::warn!(
@@ -264,13 +297,22 @@ impl WpaClient {
                 }
             }
 
-            WifiEvent::Associated { status } => {
+            WifiEvent::Associated { status, ies } => {
                 if status == 0 {
-                    if self.bss_info.is_open {
+                    if self.bss_info.security == SecurityType::Open {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
                         );
                         self.state = WpaState::ConnectedWithoutOffloadRekey;
+                    } else if self.bss_info.security == SecurityType::Owe {
+                        if self.process_owe_assoc_response(ies.as_deref()) {
+                            log::info!(
+                                "ASSOCIATED - OWE PMK derived, waiting for \
+                                 4-way handshake"
+                            );
+                        } else {
+                            self.state = WpaState::Failed;
+                        }
                     } else {
                         log::info!("ASSOCIATED - waiting for 4-way handshake");
                     }
@@ -402,23 +444,51 @@ impl WpaClient {
             log::info!("4-way handshake: Message 1 (ANonce)");
 
             if self.fourway.is_none() {
-                let Some(pmk) = self.auth.as_ref().and_then(|a| a.pmk()) else {
-                    log::warn!("no PMK for 4-way handshake");
-                    self.state = WpaState::Failed;
-                    return;
+                let (pmk, pmkid, rsne, mic_alg) = match self.bss_info.security {
+                    SecurityType::Owe => {
+                        let Some(ref owe_auth) = self.owe else {
+                            log::warn!("no OWE state for 4-way handshake");
+                            self.state = WpaState::Failed;
+                            return;
+                        };
+                        let Some(pmk) = owe_auth.pmk() else {
+                            log::warn!("OWE PMK not derived");
+                            self.state = WpaState::Failed;
+                            return;
+                        };
+                        (
+                            pmk,
+                            owe_auth.pmkid().unwrap_or([0u8; 16]),
+                            elements::owe_ie(),
+                            MicAlg::HmacSha256,
+                        )
+                    }
+                    _ => {
+                        let Some(pmk) =
+                            self.auth.as_ref().and_then(|a| a.pmk())
+                        else {
+                            log::warn!("no PMK for 4-way handshake");
+                            self.state = WpaState::Failed;
+                            return;
+                        };
+                        (
+                            pmk,
+                            self.auth
+                                .as_ref()
+                                .and_then(|a| a.pmkid())
+                                .unwrap_or([0u8; 16]),
+                            elements::sae_ie(),
+                            MicAlg::AesCmac,
+                        )
+                    }
                 };
-                let pmkid = self
-                    .auth
-                    .as_ref()
-                    .and_then(|a| a.pmkid())
-                    .unwrap_or([0u8; 16]);
-                let rsne = elements::sae_ie();
                 self.fourway = Some(FourWayState::new(
                     &pmk,
                     &pmkid,
                     self.mac,
                     self.bss_info.bssid,
                     rsne,
+                    mic_alg,
                 ));
             }
 
@@ -624,6 +694,31 @@ impl WpaClient {
         } else {
             log::debug!("unhandled EAPOL-Key frame type");
         }
+    }
+}
+
+impl WpaClient {
+    /// Process the Association Response IEs for OWE: find the AP's
+    /// DH Parameter Element and derive PMK/PMKID (RFC 8110 §4.4).
+    /// Returns true on success.
+    fn process_owe_assoc_response(&mut self, ies: Option<&[u8]>) -> bool {
+        let Some(ies) = ies else {
+            log::warn!("OWE: no IEs in association response");
+            return false;
+        };
+        let Some(dh_data) = owe::find_owe_dh_element(ies) else {
+            log::warn!("OWE: no DH Parameter Element in assoc response");
+            return false;
+        };
+        let Some(ref mut owe_auth) = self.owe else {
+            log::warn!("OWE: no OWE state for assoc response");
+            return false;
+        };
+        if let Err(e) = owe_auth.process_ap_dh_element(dh_data) {
+            log::warn!("OWE DH processing failed: {e}");
+            return false;
+        }
+        true
     }
 }
 

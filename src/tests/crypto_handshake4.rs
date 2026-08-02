@@ -5,7 +5,7 @@ use aws_lc_rs::key_wrap::{self, KeyWrap};
 use crate::{
     ErrorKind, WpaError,
     crypto::handshake4::{
-        FourWayState, KEK_LEN, aes_cmac, aes_key_unwrap, parse_gtk_kde,
+        FourWayState, KEK_LEN, MicAlg, aes_cmac, aes_key_unwrap, parse_gtk_kde,
     },
     ieee80211::eapol,
 };
@@ -32,7 +32,8 @@ fn test_ptk_derivation() {
     let pmkid = [0x02u8; 16];
     let sta = [0x03u8; 6];
     let ap = [0x04u8; 6];
-    let mut state = FourWayState::new(&pmk, &pmkid, sta, ap, vec![]);
+    let mut state =
+        FourWayState::new(&pmk, &pmkid, sta, ap, vec![], MicAlg::AesCmac);
     let anonce = [0x05u8; 32];
 
     state.anonce = Some(anonce);
@@ -90,7 +91,8 @@ fn test_group_rekey() {
     let pmkid = [0x22u8; 16];
     let sta = [0x03u8; 6];
     let ap = [0x04u8; 6];
-    let mut state = FourWayState::new(&pmk, &pmkid, sta, ap, vec![]);
+    let mut state =
+        FourWayState::new(&pmk, &pmkid, sta, ap, vec![], MicAlg::AesCmac);
     state.anonce = Some([0x05u8; 32]);
     state.ptk = Some(state.derive_ptk());
     let kck = state.kck().unwrap();

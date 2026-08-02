@@ -2,4 +2,5 @@
 
 pub mod handshake4;
 pub mod kdf;
+pub mod owe;
 pub mod sae;

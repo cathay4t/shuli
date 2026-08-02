@@ -33,3 +33,24 @@ pub fn sae_ie() -> Vec<u8> {
     elements.emit(&mut buf);
     buf
 }
+
+/// Build the RSNE for OWE (AKM 00-0F-AC:18, CCMP-128, MFP required).
+/// No RSNXE — OWE does not use SAE H2E.
+pub fn owe_ie() -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::Owe],
+            rsn_capbilities: Some(
+                Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
+            ),
+            pmkids: vec![],
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}

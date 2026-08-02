@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! 4-Way Handshake state machine and crypto operations (IEEE 802.11-2020
-//! §12.7). Supports SAE AKM (00-0F-AC:8) with CCMP-128:
+//! §12.7). Supports SAE AKM (00-0F-AC:8) and OWE AKM (00-0F-AC:18)
+//! with CCMP-128:
 //!   - PMK: 32 bytes
-//!   - KCK: 16 bytes (AES-CMAC key for MIC)
-//!   - KEK: 16 bytes (AES Key Wrap key for GTK delivery)
+//!   - KCK: 16 bytes
+//!   - KEK: 16 bytes
 //!   - TK: 16 bytes (CCMP-128 temporal key)
+//!
+//! SAE uses KDF-Hash-Length + AES-CMAC MIC; OWE uses PRF + HMAC-SHA256
+//! MIC (RFC 8110 Table 2).
 
 use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
 
@@ -17,6 +21,15 @@ const TK_LEN: usize = 16;
 const PTK_LEN: usize = KCK_LEN + KEK_LEN + TK_LEN;
 
 pub(crate) const EAPOL_MIC_LEN: usize = 16;
+
+/// MIC / KDF algorithm selection, determined by the AKM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MicAlg {
+    /// SAE (00-0F-AC:8): AES-CMAC MIC, KDF-Hash-Length PTK.
+    AesCmac,
+    /// OWE (00-0F-AC:18): HMAC-SHA256 MIC, PRF PTK (RFC 8110).
+    HmacSha256,
+}
 
 /// 4-Way Handshake state (supplicant side).
 #[derive(Clone, Debug)]
@@ -31,6 +44,7 @@ pub struct FourWayState {
     rsne: Vec<u8>,
     gtk: Option<Vec<u8>>,
     gtk_index: u8,
+    mic_alg: MicAlg,
 }
 
 impl FourWayState {
@@ -40,6 +54,7 @@ impl FourWayState {
         mac_sta: [u8; 6],
         mac_ap: [u8; 6],
         rsne: Vec<u8>,
+        mic_alg: MicAlg,
     ) -> Self {
         let mut snonce = [0u8; 32];
         aws_lc_rs::rand::SystemRandom::new()
@@ -56,6 +71,7 @@ impl FourWayState {
             rsne,
             gtk: None,
             gtk_index: 0,
+            mic_alg,
         }
     }
 
@@ -86,6 +102,18 @@ impl FourWayState {
         let mut ptk = [0u8; PTK_LEN];
         ptk.copy_from_slice(&result);
         ptk
+    }
+
+    /// Compute the EAPOL-Key MIC using the AKM-appropriate algorithm.
+    fn compute_mic(
+        &self,
+        kck: &[u8; KCK_LEN],
+        data: &[u8],
+    ) -> Result<[u8; EAPOL_MIC_LEN], WpaError> {
+        match self.mic_alg {
+            MicAlg::AesCmac => aes_cmac(kck, data),
+            MicAlg::HmacSha256 => Ok(kdf::hmac_sha256_mic(kck, data)),
+        }
     }
 
     pub fn kck(&self) -> Option<[u8; KCK_LEN]> {
@@ -145,7 +173,7 @@ impl FourWayState {
             self.replay_counter,
             &self.rsne,
         );
-        let mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
+        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);
 
         Ok(msg2)
@@ -174,7 +202,8 @@ impl FourWayState {
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
-        let expected = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
+        let expected =
+            self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
         if expected != frame.key_mic {
             return Err(WpaError::new(
                 ErrorKind::HandshakeFailed,
@@ -206,7 +235,7 @@ impl FourWayState {
         // Build Message 4 (zeroed MIC) and compute its MIC.
         let mut msg4 =
             eapol::build_message_4(&self.snonce, self.replay_counter);
-        let mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg4))?;
+        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg4))?;
         eapol::set_mic(&mut msg4, &mic);
 
         Ok((msg4, gtk))
@@ -238,7 +267,8 @@ impl FourWayState {
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
-        let expected = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
+        let expected =
+            self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
         if expected != frame.key_mic {
             return Err(WpaError::new(
                 ErrorKind::HandshakeFailed,
@@ -273,7 +303,7 @@ impl FourWayState {
         // Build Group Message 2 (zeroed MIC) and compute its MIC.
         let mut msg2 =
             eapol::build_group_message_2(self.replay_counter, &frame.key_rsc);
-        let mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
+        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);
 
         Ok(msg2)

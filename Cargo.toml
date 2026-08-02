@@ -21,7 +21,7 @@ netlink-proto = "0.12"
 netlink-sys = "0.8"
 
 # Crypto
-p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field"] }
+p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field", "ecdh"] }
 aws-lc-rs = "1"
 
 [[bin]]

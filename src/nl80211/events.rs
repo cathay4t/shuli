@@ -31,6 +31,9 @@ pub enum WifiEvent {
     },
     Associated {
         status: u16,
+        /// IEs from the Association Response (carries the AP's OWE
+        /// DH Parameter Element for OWE networks).
+        ies: Option<Vec<u8>>,
     },
     Unknown {
         cmd: Nl80211Command,
@@ -132,12 +135,21 @@ fn parse_authenticate(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
 
 fn parse_associate(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
     let mut status = 0u16;
+    let mut ies = None;
     for attr in &msg.attributes {
-        if let Nl80211Attr::StatusCode(code) = attr {
-            status = *code;
+        match attr {
+            Nl80211Attr::StatusCode(code) => status = *code,
+            Nl80211Attr::Ie(data) => ies = Some(data.clone()),
+            // The kernel delivers the full assoc response frame;
+            // IEs start after the 24-byte 802.11 header +
+            // capability(2) + status(2) + AID(2) = offset 30.
+            Nl80211Attr::Frame(frame) if ies.is_none() && frame.len() > 30 => {
+                ies = Some(frame[30..].to_vec());
+            }
+            _ => {}
         }
     }
-    Some(WifiEvent::Associated { status })
+    Some(WifiEvent::Associated { status, ies })
 }
 
 fn parse_frame(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
