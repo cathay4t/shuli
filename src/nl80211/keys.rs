@@ -17,12 +17,14 @@ use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
     Nl80211Attr, Nl80211Command, Nl80211Handle, Nl80211KeyAttr,
-    Nl80211KeyDefaultType, Nl80211KeyType, Nl80211Message,
+    Nl80211KeyDefaultType, Nl80211KeyType, Nl80211Message, Nl80211RekeyData,
 };
 
 use crate::{ErrorKind, WpaError};
 
 const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000F_AC04;
+/// WLAN_AKM_SUITE_SAE (00-0F-AC:8) in kernel-native u32 encoding.
+const WLAN_AKM_SUITE_SAE: u32 = 0x000F_AC08;
 
 pub async fn install_ptk(
     handle: &Nl80211Handle,
@@ -75,6 +77,48 @@ pub async fn install_gtk(
     ];
 
     send_new_key(handle, attrs).await
+}
+
+/// Hand GTK rekey material to the driver/firmware via
+/// `NL80211_CMD_SET_REKEY_OFFLOAD`.  Returns `Err` when the driver
+/// does not support offload (e.g. mac80211_hwsim → `-EOPNOTSUPP`).
+pub async fn set_rekey_offload(
+    handle: &Nl80211Handle,
+    if_index: u32,
+    kek: &[u8],
+    kck: &[u8],
+    replay_ctr: &[u8; 8],
+) -> Result<(), WpaError> {
+    let attrs = vec![
+        Nl80211Attr::IfIndex(if_index),
+        Nl80211Attr::RekeyData(vec![
+            Nl80211RekeyData::Kek(kek.to_vec()),
+            Nl80211RekeyData::Kck(kck.to_vec()),
+            Nl80211RekeyData::ReplayCtr(replay_ctr.to_vec()),
+            Nl80211RekeyData::Akm(WLAN_AKM_SUITE_SAE),
+        ]),
+    ];
+
+    let mut nl_msg =
+        NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
+            cmd: Nl80211Command::SetRekeyOffload,
+            attributes: attrs,
+        }));
+    nl_msg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+
+    let mut handle = handle.clone();
+    let mut stream = handle.request(nl_msg).await?;
+    while let Some(msg) = stream.try_next().await? {
+        if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
+            && let Some(code) = err.code
+        {
+            return Err(WpaError::new(
+                ErrorKind::HandshakeFailed,
+                format!("SET_REKEY_OFFLOAD failed: netlink error {code}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn send_new_key(

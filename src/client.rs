@@ -492,8 +492,48 @@ impl WpaClient {
                 log::info!("GTK[{gtk_idx}] installed");
             }
 
-            log::info!("keys installed - connection established");
-            self.state = WpaState::ConnectedWithoutOffloadRekey;
+            // Try to offload GTK rekey to the driver/firmware.
+            // Falls back to userspace rekey when unsupported
+            // (e.g. mac80211_hwsim returns -EOPNOTSUPP).
+            let offloaded =
+                if let (Some(kck), Some(kek), Some(fw)) = (
+                    self.fourway.as_ref().and_then(|f| f.kck()),
+                    self.fourway.as_ref().and_then(|f| f.kek()),
+                    &self.fourway,
+                ) {
+                    let rc = fw.replay_counter_bytes();
+                    match keys::set_rekey_offload(
+                        &self.handle,
+                        self.if_index,
+                        &kek,
+                        &kck,
+                        &rc,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            log::info!("GTK rekey offloaded to driver");
+                            true
+                        }
+                        Err(e) => {
+                            log::debug!("rekey offload not available: {e}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+            if offloaded {
+                log::info!("keys installed - connection established");
+                self.state = WpaState::ConnectedWithOffloadRekey;
+            } else {
+                log::info!(
+                    "keys installed - connection established \
+                     (userspace rekey)"
+                );
+                self.state = WpaState::ConnectedWithoutOffloadRekey;
+            }
         } else if parsed.has_mic()
             && parsed.is_secure()
             && parsed.has_ack()

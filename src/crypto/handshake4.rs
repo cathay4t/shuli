@@ -104,6 +104,10 @@ impl FourWayState {
         })
     }
 
+    pub fn replay_counter_bytes(&self) -> [u8; 8] {
+        self.replay_counter.to_be_bytes()
+    }
+
     pub fn tk(&self) -> Option<[u8; TK_LEN]> {
         self.ptk.map(|p| {
             let mut k = [0u8; TK_LEN];
