@@ -14,6 +14,7 @@ mod tests;
 
 pub(crate) use self::mac::ETH_ALEN;
 pub use self::{
-    client::{WpaClient, WpaConfig, WpaState},
-    error::{ErrorKind, WpaError},
+    client::{WifiClient, WifiState},
+    config::WifiConfig,
+    error::{ErrorKind, WifiError},
 };

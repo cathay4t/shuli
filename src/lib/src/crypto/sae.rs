@@ -23,7 +23,7 @@ use p256::{
 };
 
 use crate::{
-    ErrorKind, WpaError,
+    ErrorKind, WifiError,
     crypto::kdf::{hkdf_expand, hkdf_extract_sha256, kdf, sae_confirm},
 };
 
@@ -56,7 +56,7 @@ impl SaeAuth {
         ssid: &str,
         mac_sta: [u8; 6],
         mac_ap: [u8; 6],
-    ) -> Result<Self, WpaError> {
+    ) -> Result<Self, WifiError> {
         let pwe = compute_pwe_h2e(password, ssid, &mac_sta, &mac_ap)?;
         Ok(Self {
             pwe,
@@ -117,12 +117,12 @@ impl SaeAuth {
         &mut self,
         peer_scalar_bytes: &[u8],
         peer_elem_bytes: &[u8],
-    ) -> Result<Vec<u8>, WpaError> {
+    ) -> Result<Vec<u8>, WifiError> {
         let peer_scalar = scalar_from_bytes(peer_scalar_bytes)?;
         let peer_elem = projective_from_elem(peer_elem_bytes);
 
         if bool::from(peer_elem.is_identity()) {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::SaeFailed,
                 "failed to reconstruct peer element",
             ));
@@ -131,7 +131,7 @@ impl SaeAuth {
         // K = rand * (peer_scalar * PWE + peer_elem); k = K.x
         let k_point = (self.pwe * peer_scalar + peer_elem) * self.rand;
         if bool::from(k_point.is_identity()) {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::SaeFailed,
                 "shared secret is identity",
             ));
@@ -185,22 +185,22 @@ impl SaeAuth {
     pub(crate) fn process_confirm(
         &mut self,
         peer_confirm_body: &[u8],
-    ) -> Result<[u8; 32], WpaError> {
+    ) -> Result<[u8; 32], WifiError> {
         let kck = self.kck.ok_or_else(|| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::SaeFailed,
                 "no KCK derived - process commit first",
             )
         })?;
         let peer_scalar = self.peer_scalar.ok_or_else(|| {
-            WpaError::new(ErrorKind::SaeFailed, "no peer commit processed")
+            WifiError::new(ErrorKind::SaeFailed, "no peer commit processed")
         })?;
         let peer_elem = self.peer_elem.ok_or_else(|| {
-            WpaError::new(ErrorKind::SaeFailed, "no peer commit processed")
+            WifiError::new(ErrorKind::SaeFailed, "no peer commit processed")
         })?;
 
         if peer_confirm_body.len() < 2 + 32 {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::SaeFailed,
                 "confirm too short",
             ));
@@ -229,14 +229,14 @@ impl SaeAuth {
         )
         .is_err()
         {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::SaeFailed,
                 "confirm mismatch",
             ));
         }
 
         let pmk = self.pmk.ok_or_else(|| {
-            WpaError::new(ErrorKind::SaeFailed, "no PMK derived")
+            WifiError::new(ErrorKind::SaeFailed, "no PMK derived")
         })?;
         self.confirmed = true;
         Ok(pmk)
@@ -284,7 +284,7 @@ pub(crate) fn compute_pwe_h2e(
     ssid: &str,
     mac_sta: &[u8; 6],
     mac_ap: &[u8; 6],
-) -> Result<ProjectivePoint, WpaError> {
+) -> Result<ProjectivePoint, WifiError> {
     let pt = derive_pt_ecc(ssid.as_bytes(), password.as_bytes())?;
     derive_pwe_from_pt(&pt, mac_sta, mac_ap)
 }
@@ -293,7 +293,7 @@ pub(crate) fn compute_pwe_h2e(
 fn derive_pt_ecc(
     ssid: &[u8],
     password: &[u8],
-) -> Result<ProjectivePoint, WpaError> {
+) -> Result<ProjectivePoint, WifiError> {
     // pwd-seed = HKDF-Extract(ssid, password)
     let pwd_seed = hkdf_extract_sha256(ssid, password);
 
@@ -302,7 +302,7 @@ fn derive_pt_ecc(
 
     let pt = p1 + p2;
     if bool::from(pt.is_identity()) {
-        return Err(WpaError::new(ErrorKind::SaeFailed, "PT is identity"));
+        return Err(WifiError::new(ErrorKind::SaeFailed, "PT is identity"));
     }
     Ok(pt)
 }
@@ -310,7 +310,7 @@ fn derive_pt_ecc(
 fn sswu_from_label(
     pwd_seed: &[u8; 32],
     label: &[u8],
-) -> Result<ProjectivePoint, WpaError> {
+) -> Result<ProjectivePoint, WifiError> {
     // pwd-value = HKDF-Expand(pwd-seed, label, len); len = prime+ceil(prime/2)
     let mut okm = [0u8; SAE_FIELD_LEN + SAE_FIELD_LEN.div_ceil(2)]; // 48
     hkdf_expand(pwd_seed, label, &mut okm);
@@ -325,7 +325,7 @@ fn derive_pwe_from_pt(
     pt: &ProjectivePoint,
     mac_sta: &[u8; 6],
     mac_ap: &[u8; 6],
-) -> Result<ProjectivePoint, WpaError> {
+) -> Result<ProjectivePoint, WifiError> {
     let (max_mac, min_mac) = if u64_from_mac(mac_sta) > u64_from_mac(mac_ap) {
         (mac_sta, mac_ap)
     } else {
@@ -347,13 +347,13 @@ fn derive_pwe_from_pt(
     let val_bytes = val_int.to_be_bytes();
     let val_scalar = Scalar::from_repr(val_bytes.into());
     if bool::from(val_scalar.is_none()) {
-        return Err(WpaError::new(ErrorKind::SaeFailed, "val out of range"));
+        return Err(WifiError::new(ErrorKind::SaeFailed, "val out of range"));
     }
     let val_scalar = val_scalar.unwrap();
 
     let pwe = *pt * val_scalar;
     if bool::from(pwe.is_identity()) {
-        return Err(WpaError::new(ErrorKind::SaeFailed, "PWE is identity"));
+        return Err(WifiError::new(ErrorKind::SaeFailed, "PWE is identity"));
     }
     Ok(pwe)
 }
@@ -368,23 +368,26 @@ fn scalar_to_array(s: &Scalar) -> [u8; 32] {
 
 /// Decode a peer scalar, rejecting values outside [1, r-1]
 /// (802.11-2020 §12.4.5.3).
-fn scalar_from_bytes(bytes: &[u8]) -> Result<Scalar, WpaError> {
+fn scalar_from_bytes(bytes: &[u8]) -> Result<Scalar, WifiError> {
     if bytes.len() < 32 {
-        return Err(WpaError::new(
+        return Err(WifiError::new(
             ErrorKind::SaeFailed,
             format!("peer scalar too short: {} bytes", bytes.len()),
         ));
     }
     let opt = Scalar::from_repr(GenericArray::clone_from_slice(&bytes[..32]));
     if bool::from(opt.is_none()) {
-        return Err(WpaError::new(
+        return Err(WifiError::new(
             ErrorKind::SaeFailed,
             "peer scalar out of range",
         ));
     }
     let scalar = opt.unwrap();
     if bool::from(scalar.is_zero()) {
-        return Err(WpaError::new(ErrorKind::SaeFailed, "peer scalar is zero"));
+        return Err(WifiError::new(
+            ErrorKind::SaeFailed,
+            "peer scalar is zero",
+        ));
     }
     Ok(scalar)
 }

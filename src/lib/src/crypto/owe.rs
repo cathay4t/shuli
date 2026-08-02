@@ -14,7 +14,7 @@ use p256::{
     elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
 };
 
-use crate::{ErrorKind, WpaError, crypto::kdf};
+use crate::{ErrorKind, WifiError, crypto::kdf};
 
 const GROUP_19: u16 = 19;
 const P256_COORD_LEN: usize = 32;
@@ -72,16 +72,16 @@ impl OweAuth {
     pub fn process_ap_dh_element(
         &mut self,
         dh_data: &[u8],
-    ) -> Result<(), WpaError> {
+    ) -> Result<(), WifiError> {
         if dh_data.len() < 2 + P256_PUBKEY_LEN {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::AuthFailed,
                 format!("OWE DH element too short: {} bytes", dh_data.len()),
             ));
         }
         let group = u16::from_le_bytes([dh_data[0], dh_data[1]]);
         if group != GROUP_19 {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::AuthFailed,
                 format!("unsupported OWE group {group}"),
             ));
@@ -94,7 +94,7 @@ impl OweAuth {
         let mut sec1 = vec![0x02u8];
         sec1.extend_from_slice(ap_pubkey_raw);
         let ap_pubkey = PublicKey::from_sec1_bytes(&sec1).map_err(|e| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::AuthFailed,
                 format!("invalid OWE AP public key: {e}"),
             )

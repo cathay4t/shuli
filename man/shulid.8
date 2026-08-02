@@ -4,16 +4,16 @@
 shulid \- WiFi authentication daemon
 .SH SYNOPSIS
 .B shulid
-.RB [ \-c
-.IR config ]
+.RI [ config ]
 .SH DESCRIPTION
 .B shulid
 is a pure-Rust WiFi authentication daemon implementing
-WPA3-Personal (SAE) authentication.  It performs the full
-authentication flow in userspace: scan, SAE handshake,
-association, 4-way handshake, and key installation via
-nl80211.  Data-frame encryption (CCMP) is handled by the
-kernel once keys are installed.
+WPA3-Personal (SAE), OWE (RFC 8110), and open
+authentication.  It performs the full authentication flow
+in userspace: scan, authentication, association, 4-way
+handshake, and key installation via nl80211.  Data-frame
+encryption (CCMP) is handled by the kernel once keys are
+installed.
 .PP
 On successful authentication the link is brought up and
 .B shulid
@@ -22,7 +22,7 @@ offloaded to the driver when supported).  An external DHCP
 client can be used to obtain an address.
 .SH OPTIONS
 .TP
-.BR \-c ", " \-\-config " " \fIfile\fR
+.I config
 Path to the YAML configuration file.
 Default:
 .IR /etc/shuli/config.yml .

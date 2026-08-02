@@ -20,7 +20,7 @@ use wl_nl80211::{
     Nl80211KeyDefaultType, Nl80211KeyType, Nl80211Message, Nl80211RekeyData,
 };
 
-use crate::{ErrorKind, WpaError};
+use crate::{ErrorKind, WifiError};
 
 const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000F_AC04;
 /// WLAN_AKM_SUITE_SAE (00-0F-AC:8) in kernel-native u32 encoding.
@@ -31,7 +31,7 @@ pub async fn install_ptk(
     if_index: u32,
     peer_mac: [u8; 6],
     key_data: &[u8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Mac(peer_mac),
@@ -62,7 +62,7 @@ pub async fn install_gtk(
     if_index: u32,
     key_data: &[u8],
     key_index: u8,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Key(vec![
@@ -88,7 +88,7 @@ pub async fn set_rekey_offload(
     kek: &[u8],
     kck: &[u8],
     replay_ctr: &[u8; 8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::RekeyData(vec![
@@ -112,7 +112,7 @@ pub async fn set_rekey_offload(
         if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
             && let Some(code) = err.code
         {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!("SET_REKEY_OFFLOAD failed: netlink error {code}"),
             ));
@@ -124,7 +124,7 @@ pub async fn set_rekey_offload(
 async fn send_new_key(
     handle: &Nl80211Handle,
     attrs: Vec<Nl80211Attr>,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let mut nl_msg =
         NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
             cmd: Nl80211Command::NewKey,
@@ -138,7 +138,7 @@ async fn send_new_key(
         if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
             && let Some(code) = err.code
         {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!("NEW_KEY failed: netlink error {code}"),
             ));

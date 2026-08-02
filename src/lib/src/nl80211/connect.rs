@@ -8,12 +8,12 @@
 use futures::TryStreamExt;
 use wl_nl80211::Nl80211ConnectionHandle;
 
-use crate::WpaError;
+use crate::WifiError;
 
 pub async fn disconnect(
     conn_handle: &mut Nl80211ConnectionHandle,
     if_index: u32,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = wl_nl80211::Nl80211Disconnect::new(if_index).build();
     let mut stream = conn_handle.disconnect(attrs).execute().await;
     while let Some(_msg) = stream.try_next().await? {}

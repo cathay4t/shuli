@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::PathBuf, process::ExitCode};
+mod config;
 
-use clap::Parser;
-use shuli::{WpaClient, WpaConfig, WpaState};
+use std::{path::Path, process::ExitCode};
+
+use config::ShuliConfig;
+use shuli::{WifiClient, WifiState};
 use tokio::{
     signal,
     signal::unix::{SignalKind, signal as unix_signal},
 };
 
-#[derive(Parser)]
-#[command(name = "shulid", about = "WiFi authentication daemon")]
-struct Cli {
-    #[arg(short, long, default_value = "/etc/shuli/config.yml")]
-    config: PathBuf,
-}
+const DEFAULT_CONFIG: &str = "/etc/shuli/config.yml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,9 +20,11 @@ async fn main() -> ExitCode {
     )
     .init();
 
-    let cli = Cli::parse();
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
 
-    match run(cli).await {
+    match run(Path::new(&config_path)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("{e}");
@@ -34,14 +33,19 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
-    let config = WpaConfig::load(&cli.config)?;
-    log::info!("shulid: iface={}, ssid={}", config.ifname, config.ssid);
+async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
+    let shuli_config = ShuliConfig::load(config_path)?;
+    let wifi_config = shuli_config.to_wifi_config()?;
+    log::info!(
+        "shulid: iface={}, ssid={}",
+        wifi_config.iface_name,
+        wifi_config.ssid
+    );
 
-    let mut client = WpaClient::new(&config).await?;
+    let mut client = WifiClient::init(wifi_config).await?;
     let mut connected = false;
     let mut sigterm = unix_signal(SignalKind::terminate()).map_err(|e| {
-        shuli::WpaError::new(
+        shuli::WifiError::new(
             shuli::ErrorKind::ConnectFailed,
             format!("failed to register SIGTERM handler: {e}"),
         )
@@ -59,11 +63,11 @@ async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
                 client.shutdown().await;
                 break;
             }
-            result = client.process() => {
+            result = client.run() => {
                 match result {
                     Ok(state) => match state {
-                        WpaState::ConnectedWithoutOffloadRekey
-                        | WpaState::ConnectedWithOffloadRekey => {
+                        WifiState::ConnectedWithoutOffloadRekey
+                        | WifiState::ConnectedWithOffloadRekey => {
                             if !connected {
                                 connected = true;
                                 log::info!(
@@ -72,10 +76,10 @@ async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
                                 );
                             }
                         }
-                        WpaState::Failed => {
+                        WifiState::Failed => {
                             log::warn!("connection failed - retrying");
                         }
-                        WpaState::FailedAuthentication => {
+                        WifiState::FailedAuthentication => {
                             log::warn!(
                                 "authentication failed - retrying in \
                                  10 minutes"
@@ -95,7 +99,7 @@ async fn run(cli: Cli) -> Result<(), shuli::WpaError> {
         log::info!("connection established");
         Ok(())
     } else {
-        Err(shuli::WpaError::new(
+        Err(shuli::WifiError::new(
             shuli::ErrorKind::ConnectFailed,
             "shutdown before connection established",
         ))

@@ -1,29 +1,29 @@
-[package]
-name = "shuli"
+[workspace]
+resolver = "2"
+members = [
+    "src/lib",
+    "src/daemon",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 
-[dependencies]
-wl-nl80211 = { path = "../netlink/wl-nl80211" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+[workspace.dependencies]
 log = "0.4"
 env_logger = "0.11"
-clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 futures = "0.3"
+wl-nl80211 = { path = "../netlink/wl-nl80211" }
 netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 genetlink = "0.2"
 netlink-proto = "0.12"
 netlink-sys = "0.8"
-
-# Crypto
 p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field", "ecdh"] }
 aws-lc-rs = "1"
-
-[[bin]]
-name = "shulid"
-path = "src/main.rs"

@@ -1,0 +1,19 @@
+[package]
+name = "shulid"
+description = "WiFi authentication daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shulid"
+path = "src/main.rs"
+
+[dependencies]
+shuli = { path = "../lib" }
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true

@@ -6,3 +6,4 @@ mod crypto_kdf;
 mod crypto_sae;
 mod ieee80211_auth;
 mod ieee80211_eapol;
+mod wifi_integration;

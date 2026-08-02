@@ -2,21 +2,20 @@
 
 //! WPA client core: the per-interface connection flow.
 //!
-//! The flow is a simple linear walk over [`WpaState`] - Init -> Scanning ->
+//! The flow is a simple linear walk over [`WifiState`] - Init -> Scanning ->
 //! Authenticating -> Connected - driven by repeated calls to
-//! [`WpaClient::process`]. There is no internal transition table; events (SAE
+//! [`WifiClient::process`]. There is no internal transition table; events (SAE
 //! frames, association results, EAPOL-Key messages) advance the current state
 //! directly. Scan specifics live in `scan.rs`, pre-association authentication
 //! (SAE today, WPA2/EAP later) in `auth.rs`, and nl80211 details in `nl80211/`.
-
-use std::path::Path;
 
 use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{Nl80211Attr, Nl80211ConnectionHandle, Nl80211Handle};
 
 use crate::{
-    ETH_ALEN, ErrorKind, WpaError,
+    ETH_ALEN, ErrorKind, WifiError,
     auth::{AuthAction, AuthMethod},
+    config::WifiConfig,
     crypto::{
         handshake4::{FourWayState, MicAlg},
         owe::{self, OweAuth},
@@ -36,32 +35,8 @@ const RETRY_AUTH_SEC: u64 = 600;
 /// result, 4-way handshake message) before giving up and retrying.
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
 
-#[derive(Debug, Clone)]
-pub struct WpaConfig {
-    pub ifname: String,
-    pub ssid: String,
-    pub password: Option<String>,
-}
-
-impl WpaConfig {
-    pub fn load(path: &Path) -> Result<Self, WpaError> {
-        let cfg = crate::config::Config::load(path)?;
-        let iface = cfg.interfaces.first().ok_or_else(|| {
-            WpaError::new(ErrorKind::InvalidConfig, "no interfaces")
-        })?;
-        let wifi = iface.wifi.as_ref().ok_or_else(|| {
-            WpaError::new(ErrorKind::InvalidConfig, "no wifi config")
-        })?;
-        Ok(WpaConfig {
-            ifname: iface.name.clone(),
-            ssid: wifi.ssid.clone(),
-            password: wifi.password.clone(),
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WpaState {
+pub enum WifiState {
     /// Initial state; the next `process()` call triggers a scan.
     #[default]
     Init,
@@ -81,17 +56,17 @@ pub enum WpaState {
     FailedAuthentication,
 }
 
-pub struct WpaClient {
+pub struct WifiClient {
     pub(crate) handle: Nl80211Handle,
     pub(crate) conn_handle: Nl80211ConnectionHandle,
     pub(crate) event_receiver: futures::channel::mpsc::UnboundedReceiver<(
         netlink_packet_core::NetlinkMessage<genetlink::message::RawGenlMessage>,
         netlink_sys::SocketAddr,
     )>,
-    pub(crate) state: WpaState,
+    pub(crate) state: WifiState,
     pub(crate) if_index: u32,
     pub(crate) mac: [u8; ETH_ALEN],
-    pub(crate) config: WpaConfig,
+    pub(crate) config: WifiConfig,
     /// Best BSS found by the scan phase.
     pub(crate) bss_info: BssInfo,
     /// Active pre-association authentication method.
@@ -102,13 +77,14 @@ pub struct WpaClient {
     pub(crate) fourway: Option<FourWayState>,
 }
 
-impl WpaClient {
+impl WifiClient {
     /// Validate the configuration by checking the WiFi PHY interface exists,
     /// then open the nl80211 connection and join the event multicast groups.
-    pub async fn new(config: &WpaConfig) -> Result<Self, WpaError> {
-        let (mut conn, handle, event_receiver) =
-            wl_nl80211::new_connection()
-                .map_err(|e| WpaError::new(ErrorKind::Config, e.to_string()))?;
+    pub async fn init(config: WifiConfig) -> Result<Self, WifiError> {
+        let (mut conn, handle, event_receiver) = wl_nl80211::new_connection()
+            .map_err(|e| {
+            WifiError::new(ErrorKind::Config, e.to_string())
+        })?;
 
         if let Err(e) = crate::nl80211::mcast::join_multicast_groups(&mut conn)
         {
@@ -117,24 +93,24 @@ impl WpaClient {
         tokio::spawn(conn);
 
         let (if_index, mac) =
-            get_if_index_and_mac(&handle, &config.ifname).await?;
+            get_if_index_and_mac(&handle, &config.iface_name).await?;
 
         log::info!(
             "interface {} if_index={}, mac={mac:02x?}",
-            config.ifname,
+            config.iface_name,
             if_index
         );
 
         let conn_handle = handle.connection();
 
-        Ok(WpaClient {
+        Ok(WifiClient {
             handle,
             conn_handle,
             event_receiver,
-            state: WpaState::Init,
+            state: WifiState::Init,
             if_index,
             mac,
-            config: config.clone(),
+            config,
             bss_info: BssInfo::default(),
             auth: None,
             owe: None,
@@ -145,13 +121,13 @@ impl WpaClient {
     /// Advance the connection flow by one step and return the current state.
     /// The caller (daemon loop) keeps calling this; on transient errors the
     /// client falls back to a retry state instead of failing hard.
-    pub async fn process(&mut self) -> Result<WpaState, WpaError> {
-        if let Err(e) = self._process().await {
+    pub async fn run(&mut self) -> Result<WifiState, WifiError> {
+        if let Err(e) = self._run().await {
             log::warn!("WPA process error: {e}");
-            self.state = if self.state == WpaState::Authenticating {
-                WpaState::FailedAuthentication
+            self.state = if self.state == WifiState::Authenticating {
+                WifiState::FailedAuthentication
             } else {
-                WpaState::Failed
+                WifiState::Failed
             };
             Err(e)
         } else {
@@ -159,19 +135,19 @@ impl WpaClient {
         }
     }
 
-    async fn _process(&mut self) -> Result<(), WpaError> {
+    async fn _run(&mut self) -> Result<(), WifiError> {
         match self.state {
-            WpaState::Init => {
+            WifiState::Init => {
                 self.send_out_scan_request().await?;
-                self.state = WpaState::Scanning;
+                self.state = WifiState::Scanning;
             }
-            WpaState::Scanning => {
+            WifiState::Scanning => {
                 self.wait_scan_finish().await;
                 self.process_scan_results().await?;
                 self.send_out_auth_request().await?;
-                self.state = WpaState::Authenticating;
+                self.state = WifiState::Authenticating;
             }
-            WpaState::Authenticating => {
+            WifiState::Authenticating => {
                 let timed = tokio::time::timeout(
                     std::time::Duration::from_secs(AUTH_EVENT_TIMEOUT_SECS),
                     self.event_receiver.next(),
@@ -184,19 +160,19 @@ impl WpaClient {
                         }
                     }
                     Ok(None) => {
-                        return Err(WpaError::new(
+                        return Err(WifiError::new(
                             ErrorKind::Nl80211,
                             "event channel closed",
                         ));
                     }
                     Err(_) => {
                         log::warn!("authentication timed out; will retry");
-                        self.state = WpaState::Failed;
+                        self.state = WifiState::Failed;
                     }
                 }
             }
-            WpaState::ConnectedWithoutOffloadRekey
-            | WpaState::ConnectedWithOffloadRekey => {
+            WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey => {
                 // Keep draining events so group rekeys and disconnects are
                 // handled while the connection stays up.
                 match self.event_receiver.next().await {
@@ -206,22 +182,22 @@ impl WpaClient {
                         }
                     }
                     None => {
-                        return Err(WpaError::new(
+                        return Err(WifiError::new(
                             ErrorKind::Nl80211,
                             "event channel closed",
                         ));
                     }
                 }
             }
-            WpaState::Failed | WpaState::FailedAuthentication => {
-                let secs = if self.state == WpaState::FailedAuthentication {
+            WifiState::Failed | WifiState::FailedAuthentication => {
+                let secs = if self.state == WifiState::FailedAuthentication {
                     RETRY_AUTH_SEC
                 } else {
                     RETRY_WAIT_SEC
                 };
                 log::info!("{:?}; retrying in {} seconds", self.state, secs);
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                self.state = WpaState::Init;
+                self.state = WifiState::Init;
             }
         }
         Ok(())
@@ -258,7 +234,7 @@ impl WpaClient {
                             .await
                             {
                                 log::warn!("OWE ASSOCIATE failed: {e}");
-                                self.state = WpaState::Failed;
+                                self.state = WifiState::Failed;
                             }
                         } else {
                             // Plain open: associate without DH.
@@ -276,14 +252,14 @@ impl WpaClient {
                             .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
-                                self.state = WpaState::Failed;
+                                self.state = WifiState::Failed;
                             }
                         }
                     } else {
                         log::warn!(
                             "open-system AUTHENTICATE failed: status={status}"
                         );
-                        self.state = WpaState::Failed;
+                        self.state = WifiState::Failed;
                     }
                 } else if let Some(frame) = auth_frame {
                     // SAE: the auth frame carries the AP's commit
@@ -291,7 +267,7 @@ impl WpaClient {
                     self.handle_auth_frame(&frame).await;
                 } else if status != 0 {
                     log::warn!("AUTHENTICATE failed: status={status}");
-                    self.state = WpaState::FailedAuthentication;
+                    self.state = WifiState::FailedAuthentication;
                 } else {
                     log::debug!("AUTHENTICATE event without frame (status=0)");
                 }
@@ -303,7 +279,7 @@ impl WpaClient {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
                         );
-                        self.state = WpaState::ConnectedWithoutOffloadRekey;
+                        self.state = WifiState::ConnectedWithoutOffloadRekey;
                     } else if self.bss_info.security == SecurityType::Owe {
                         if self.process_owe_assoc_response(ies.as_deref()) {
                             log::info!(
@@ -311,14 +287,14 @@ impl WpaClient {
                                  4-way handshake"
                             );
                         } else {
-                            self.state = WpaState::Failed;
+                            self.state = WifiState::Failed;
                         }
                     } else {
                         log::info!("ASSOCIATED - waiting for 4-way handshake");
                     }
                 } else {
                     log::warn!("ASSOCIATE failed: status={status}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                 }
             }
 
@@ -329,7 +305,7 @@ impl WpaClient {
                     );
                 } else {
                     log::warn!("CONNECT failed: status={status}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                 }
             }
 
@@ -339,12 +315,12 @@ impl WpaClient {
 
             WifiEvent::PortAuthorized => {
                 log::info!("PORT_AUTHORIZED - connection ready");
-                self.state = WpaState::ConnectedWithoutOffloadRekey;
+                self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
 
             WifiEvent::Disconnect { reason } => {
                 log::warn!("DISCONNECT: reason={reason}");
-                self.state = WpaState::Failed;
+                self.state = WifiState::Failed;
             }
 
             WifiEvent::ScanStart | WifiEvent::NewScanResults => {
@@ -378,7 +354,7 @@ impl WpaClient {
                         // SAE crypto failure (wrong password / confirm
                         // mismatch): use the long retry backoff.
                         log::warn!("{e}");
-                        self.state = WpaState::FailedAuthentication;
+                        self.state = WifiState::FailedAuthentication;
                         return;
                     }
                 }
@@ -403,7 +379,7 @@ impl WpaClient {
                 .await
                 {
                     log::warn!("send SAE confirm failed: {e}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                 } else {
                     log::info!("SAE confirm sent");
                 }
@@ -420,7 +396,7 @@ impl WpaClient {
                 .await
                 {
                     log::warn!("ASSOCIATE failed: {e}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                 }
             }
         }
@@ -448,12 +424,12 @@ impl WpaClient {
                     SecurityType::Owe => {
                         let Some(ref owe_auth) = self.owe else {
                             log::warn!("no OWE state for 4-way handshake");
-                            self.state = WpaState::Failed;
+                            self.state = WifiState::Failed;
                             return;
                         };
                         let Some(pmk) = owe_auth.pmk() else {
                             log::warn!("OWE PMK not derived");
-                            self.state = WpaState::Failed;
+                            self.state = WifiState::Failed;
                             return;
                         };
                         (
@@ -468,7 +444,7 @@ impl WpaClient {
                             self.auth.as_ref().and_then(|a| a.pmk())
                         else {
                             log::warn!("no PMK for 4-way handshake");
-                            self.state = WpaState::Failed;
+                            self.state = WifiState::Failed;
                             return;
                         };
                         (
@@ -500,7 +476,7 @@ impl WpaClient {
                     Ok(msg2) => msg2,
                     Err(e) => {
                         log::warn!("process_message_1 failed: {e}");
-                        self.state = WpaState::Failed;
+                        self.state = WifiState::Failed;
                         return;
                     }
                 }
@@ -514,7 +490,7 @@ impl WpaClient {
             .await
             {
                 log::warn!("send msg2 failed: {e}");
-                self.state = WpaState::Failed;
+                self.state = WifiState::Failed;
                 return;
             }
             log::info!("4-way: Message 2 sent");
@@ -528,7 +504,7 @@ impl WpaClient {
                     Some(fw) => fw,
                     None => {
                         log::warn!("no 4-way state for Message 3");
-                        self.state = WpaState::Failed;
+                        self.state = WifiState::Failed;
                         return;
                     }
                 };
@@ -539,7 +515,7 @@ impl WpaClient {
                         // MIC mismatch here is a transient frame/AP issue:
                         // retry on the short backoff.
                         log::warn!("process_message_3 failed: {e}");
-                        self.state = WpaState::Failed;
+                        self.state = WifiState::Failed;
                         return;
                     }
                 }
@@ -554,7 +530,7 @@ impl WpaClient {
             .await
             {
                 log::warn!("send msg4 failed: {e}");
-                self.state = WpaState::Failed;
+                self.state = WifiState::Failed;
                 return;
             }
             log::info!("4-way: Message 4 sent");
@@ -569,7 +545,7 @@ impl WpaClient {
                 .await
                 {
                     log::warn!("install PTK failed: {e}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                     return;
                 }
                 log::info!("PTK installed");
@@ -587,7 +563,7 @@ impl WpaClient {
                 .await
                 {
                     log::warn!("install GTK failed: {e}");
-                    self.state = WpaState::Failed;
+                    self.state = WifiState::Failed;
                     return;
                 }
                 log::info!("GTK[{gtk_idx}] installed");
@@ -626,12 +602,12 @@ impl WpaClient {
 
             if offloaded {
                 log::info!("keys installed - connection established");
-                self.state = WpaState::ConnectedWithOffloadRekey;
+                self.state = WifiState::ConnectedWithOffloadRekey;
             } else {
                 log::info!(
                     "keys installed - connection established (userspace rekey)"
                 );
-                self.state = WpaState::ConnectedWithoutOffloadRekey;
+                self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
         } else if parsed.has_mic()
             && parsed.is_secure()
@@ -697,7 +673,7 @@ impl WpaClient {
     }
 }
 
-impl WpaClient {
+impl WifiClient {
     /// Process the Association Response IEs for OWE: find the AP's
     /// DH Parameter Element and derive PMK/PMKID (RFC 8110 §4.4).
     /// Returns true on success.
@@ -722,7 +698,7 @@ impl WpaClient {
     }
 }
 
-impl WpaClient {
+impl WifiClient {
     /// Cleanly disconnect from the AP.  Call this before dropping the
     /// client so the AP receives a proper deauthentication.
     pub async fn shutdown(&mut self) {
@@ -734,7 +710,7 @@ impl WpaClient {
     }
 }
 
-impl Drop for WpaClient {
+impl Drop for WifiClient {
     fn drop(&mut self) {
         let mut conn_handle = self.conn_handle.clone();
         let if_index = self.if_index;
@@ -762,7 +738,7 @@ async fn send_ctrl_port_frame(
     if_index: u32,
     bssid: [u8; 6],
     frame: &[u8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     const ETH_P_PAE: u16 = 0x888E;
 
     let mut nl_msg = netlink_packet_core::NetlinkMessage::from(
@@ -790,7 +766,7 @@ async fn send_ctrl_port_frame(
 async fn get_if_index_and_mac(
     handle: &Nl80211Handle,
     ifname: &str,
-) -> Result<(u32, [u8; ETH_ALEN]), WpaError> {
+) -> Result<(u32, [u8; ETH_ALEN]), WifiError> {
     let mut dump = handle.interface().get(vec![]).execute().await;
     while let Some(msg) = dump.try_next().await? {
         if msg.payload.attributes.iter().any(
@@ -808,7 +784,7 @@ async fn get_if_index_and_mac(
             if index != 0 && mac != [0u8; ETH_ALEN] {
                 return Ok((index, mac));
             } else {
-                return Err(WpaError::new(
+                return Err(WifiError::new(
                     ErrorKind::InterfaceNotFound,
                     format!(
                         "interface {ifname}: index or mac not found in \
@@ -818,7 +794,7 @@ async fn get_if_index_and_mac(
             }
         }
     }
-    Err(WpaError::new(
+    Err(WifiError::new(
         ErrorKind::InterfaceNotFound,
         format!("interface {ifname} not found"),
     ))

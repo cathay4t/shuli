@@ -13,7 +13,7 @@
 
 use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
 
-use crate::{ErrorKind, WpaError, crypto::kdf, ieee80211::eapol};
+use crate::{ErrorKind, WifiError, crypto::kdf, ieee80211::eapol};
 
 pub(crate) const KCK_LEN: usize = 16;
 pub(crate) const KEK_LEN: usize = 16;
@@ -109,7 +109,7 @@ impl FourWayState {
         &self,
         kck: &[u8; KCK_LEN],
         data: &[u8],
-    ) -> Result<[u8; EAPOL_MIC_LEN], WpaError> {
+    ) -> Result<[u8; EAPOL_MIC_LEN], WifiError> {
         match self.mic_alg {
             MicAlg::AesCmac => aes_cmac(kck, data),
             MicAlg::HmacSha256 => Ok(kdf::hmac_sha256_mic(kck, data)),
@@ -159,7 +159,7 @@ impl FourWayState {
         &mut self,
         anonce: &[u8; 32],
         replay_counter: u64,
-    ) -> Result<Vec<u8>, WpaError> {
+    ) -> Result<Vec<u8>, WifiError> {
         self.anonce = Some(*anonce);
         self.replay_counter = replay_counter;
         self.ptk = Some(self.derive_ptk());
@@ -184,10 +184,10 @@ impl FourWayState {
     pub fn process_message_3(
         &mut self,
         frame: &eapol::EapolKeyFrame,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), WpaError> {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), WifiError> {
         // 802.11-2020 §12.7.6.4: replay counter must be >= Message 1's.
         if frame.replay_counter < self.replay_counter {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!(
                     "Message 3 replay counter {} < Message 1 counter {}",
@@ -198,14 +198,14 @@ impl FourWayState {
         self.replay_counter = frame.replay_counter;
 
         let kck = self.kck().ok_or_else(|| {
-            WpaError::new(ErrorKind::HandshakeFailed, "PTK not derived")
+            WifiError::new(ErrorKind::HandshakeFailed, "PTK not derived")
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
         let expected =
             self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
         if expected != frame.key_mic {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "MIC mismatch",
             ));
@@ -214,7 +214,7 @@ impl FourWayState {
         // Extract the GTK from the (AES-Key-Wrapped) key data KDEs.
         let gtk = if !frame.key_data.is_empty() {
             let kek = self.kek().ok_or_else(|| {
-                WpaError::new(ErrorKind::HandshakeFailed, "KEK not derived")
+                WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
             })?;
             let plain = if frame.is_encrypted_data() {
                 aes_key_unwrap(&kek, &frame.key_data)?
@@ -248,11 +248,11 @@ impl FourWayState {
     pub fn process_group_rekey(
         &mut self,
         frame: &eapol::EapolKeyFrame,
-    ) -> Result<Vec<u8>, WpaError> {
+    ) -> Result<Vec<u8>, WifiError> {
         // 802.11-2020 §12.7.7.1: replay counter must be strictly greater
         // than the last accepted value.
         if frame.replay_counter <= self.replay_counter {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!(
                     "group rekey replay counter {} <= last accepted {}",
@@ -263,14 +263,14 @@ impl FourWayState {
         self.replay_counter = frame.replay_counter;
 
         let kck = self.kck().ok_or_else(|| {
-            WpaError::new(ErrorKind::HandshakeFailed, "PTK not derived")
+            WifiError::new(ErrorKind::HandshakeFailed, "PTK not derived")
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
         let expected =
             self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
         if expected != frame.key_mic {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "group rekey MIC mismatch",
             ));
@@ -278,13 +278,13 @@ impl FourWayState {
 
         // Decrypt/extract the new GTK from the key data KDEs.
         if frame.key_data.is_empty() {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "group rekey carries no key data",
             ));
         }
         let kek = self.kek().ok_or_else(|| {
-            WpaError::new(ErrorKind::HandshakeFailed, "KEK not derived")
+            WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
         })?;
         let plain = if frame.is_encrypted_data() {
             aes_key_unwrap(&kek, &frame.key_data)?
@@ -292,7 +292,7 @@ impl FourWayState {
             frame.key_data.clone()
         };
         let (idx, gtk) = parse_gtk_kde(&plain).ok_or_else(|| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "no GTK KDE in group rekey",
             )
@@ -315,12 +315,12 @@ impl FourWayState {
 pub(crate) fn aes_cmac(
     kck: &[u8; KCK_LEN],
     data: &[u8],
-) -> Result<[u8; EAPOL_MIC_LEN], WpaError> {
+) -> Result<[u8; EAPOL_MIC_LEN], WifiError> {
     let key = cmac::Key::new(cmac::AES_128, kck).map_err(|e| {
-        WpaError::new(ErrorKind::HandshakeFailed, e.to_string())
+        WifiError::new(ErrorKind::HandshakeFailed, e.to_string())
     })?;
     let tag = cmac::sign(&key, data).map_err(|e| {
-        WpaError::new(ErrorKind::HandshakeFailed, e.to_string())
+        WifiError::new(ErrorKind::HandshakeFailed, e.to_string())
     })?;
     let mut mic = [0u8; EAPOL_MIC_LEN];
     mic.copy_from_slice(tag.as_ref());
@@ -364,9 +364,9 @@ pub(crate) fn parse_gtk_kde(key_data: &[u8]) -> Option<(u8, Vec<u8>)> {
 pub(crate) fn aes_key_unwrap(
     kek_bytes: &[u8; KEK_LEN],
     wrapped: &[u8],
-) -> Result<Vec<u8>, WpaError> {
+) -> Result<Vec<u8>, WifiError> {
     if wrapped.len() < 16 || !wrapped.len().is_multiple_of(8) {
-        return Err(WpaError::new(
+        return Err(WifiError::new(
             ErrorKind::HandshakeFailed,
             "invalid wrapped key length",
         ));
@@ -375,13 +375,13 @@ pub(crate) fn aes_key_unwrap(
     let mut out = vec![0u8; out_len];
     let kek =
         key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!("key unwrap: {e}"),
             )
         })?;
     kek.unwrap(wrapped, &mut out).map_err(|e| {
-        WpaError::new(ErrorKind::HandshakeFailed, format!("key unwrap: {e}"))
+        WifiError::new(ErrorKind::HandshakeFailed, format!("key unwrap: {e}"))
     })?;
     Ok(out)
 }

@@ -3,7 +3,7 @@
 use aws_lc_rs::key_wrap::{self, KeyWrap};
 
 use crate::{
-    ErrorKind, WpaError,
+    ErrorKind, WifiError,
     crypto::handshake4::{
         FourWayState, KEK_LEN, MicAlg, aes_cmac, aes_key_unwrap, parse_gtk_kde,
     },
@@ -13,15 +13,15 @@ use crate::{
 fn aes_key_wrap(
     kek_bytes: &[u8; KEK_LEN],
     plaintext: &[u8],
-) -> Result<Vec<u8>, WpaError> {
+) -> Result<Vec<u8>, WifiError> {
     let out_len = plaintext.len() + 8;
     let mut out = vec![0u8; out_len];
     let kek =
         key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
-            WpaError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
+            WifiError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
         })?;
     kek.wrap(plaintext, &mut out).map_err(|e| {
-        WpaError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
+        WifiError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
     })?;
     Ok(out)
 }

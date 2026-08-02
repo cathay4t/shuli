@@ -4,7 +4,7 @@
 //! matching the configured SSID.
 
 use crate::{
-    ETH_ALEN, ErrorKind, WpaClient, WpaError,
+    ETH_ALEN, ErrorKind, WifiClient, WifiError,
     nl80211::scan::{
         extract_bssid, extract_freq, extract_ies, extract_signal,
         extract_ssid_from_ies, get_scan_results, trigger_scan,
@@ -52,10 +52,10 @@ impl PartialOrd for BssInfo {
     }
 }
 
-impl WpaClient {
+impl WifiClient {
     pub(crate) async fn send_out_scan_request(
         &mut self,
-    ) -> Result<(), WpaError> {
+    ) -> Result<(), WifiError> {
         log::info!("scanning for SSID '{}'", self.config.ssid);
         trigger_scan(&self.handle, self.if_index, Some(&self.config.ssid)).await
     }
@@ -71,7 +71,7 @@ impl WpaClient {
     /// Dump the scan results and keep the strongest BSS matching our SSID.
     pub(crate) async fn process_scan_results(
         &mut self,
-    ) -> Result<(), WpaError> {
+    ) -> Result<(), WifiError> {
         let bss_list = get_scan_results(&self.handle, self.if_index).await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
@@ -106,7 +106,7 @@ impl WpaClient {
 
         let best = candidates.into_iter().max();
         self.bss_info = best.ok_or_else(|| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::SsidNotFound,
                 format!(
                     "SSID '{}' not found in scan results",

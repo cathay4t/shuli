@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Integration tests for [`WifiClient::run()`] against real
+//! mac80211_hwsim radios + hostapd.  These require root and are
+//! marked `#[ignore]` — run with `cargo test -- --ignored`.
+//!
+//! A process-level [`Mutex`] serialises all tests that touch the
+//! shared hwsim hardware (same pattern as iproute-rs wwan tests).
+
+use std::sync::Mutex;
+
+use crate::{WifiClient, WifiConfig, WifiState};
+
+static WIFI_LOCK: Mutex<()> = Mutex::new(());
+
+const HWSIM0_PERM_MAC: &str = "02:00:00:00:00:00";
+const HWSIM1_PERM_MAC: &str = "02:00:00:00:01:00";
+const TEST_NIC: &str = "test-wlan0";
+const AP_NIC: &str = "wifi_ap";
+const TEST_NS: &str = "shuli_test";
+const AP_IP: &str = "192.0.2.1";
+
+struct WifiTestEnv {
+    hostapd_pid: Option<String>,
+}
+
+impl WifiTestEnv {
+    fn setup(hostapd_conf: &str) -> Self {
+        sh("modprobe -r mac80211_hwsim");
+        sh(&format!("ip netns del {TEST_NS}"));
+        sh(&format!("ip netns add {TEST_NS}"));
+        sh("modprobe mac80211_hwsim radios=2");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let nic0 = find_nic_by_mac(HWSIM0_PERM_MAC).expect("hwsim NIC 0");
+        let nic1 = find_nic_by_mac(HWSIM1_PERM_MAC).expect("hwsim NIC 1");
+        if nic0 != TEST_NIC {
+            sh(&format!("ip link set {nic0} name {TEST_NIC}"));
+        }
+        if nic1 != AP_NIC {
+            sh(&format!("ip link set {nic1} name {AP_NIC}"));
+        }
+
+        let phy = get_phy_id(AP_NIC);
+        sh(&format!("iw phy#{phy} set netns name {TEST_NS}"));
+        sh(&format!("ip link set {TEST_NIC} up"));
+        sh(&format!("ip netns exec {TEST_NS} ip link set {AP_NIC} up"));
+        sh(&format!(
+            "ip netns exec {TEST_NS} ip addr add {AP_IP}/24 dev {AP_NIC}"
+        ));
+
+        let conf_path = "/tmp/shuli_rs_test_hostapd.conf";
+        std::fs::write(conf_path, hostapd_conf).expect("write hostapd conf");
+        let pid_path = "/tmp/shuli_rs_test_hostapd.pid";
+        sh(&format!(
+            "ip netns exec {TEST_NS} hostapd -B -P {pid_path} {conf_path}"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let hostapd_pid = std::fs::read_to_string(pid_path)
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        Self { hostapd_pid }
+    }
+}
+
+impl Drop for WifiTestEnv {
+    fn drop(&mut self) {
+        if let Some(ref pid) = self.hostapd_pid {
+            sh(&format!("kill {pid}"));
+        }
+        sh(&format!("ip netns del {TEST_NS}"));
+        sh("modprobe -r mac80211_hwsim");
+    }
+}
+
+const OPEN_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-NOPASS
+wpa=0
+auth_algs=1
+";
+
+const SAE_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+sae_password=12345678
+";
+
+/// Run [`WifiClient::run()`] in a loop until a connected state is
+/// reached or `max_iters` is exhausted.
+async fn run_until_connected(
+    client: &mut WifiClient,
+    max_iters: u32,
+) -> Result<WifiState, crate::WifiError> {
+    for _ in 0..max_iters {
+        let state = client.run().await?;
+        match state {
+            WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey => return Ok(state),
+            _ => {}
+        }
+    }
+    Err(crate::WifiError::new(
+        crate::ErrorKind::ConnectFailed,
+        "did not reach connected state",
+    ))
+}
+
+#[tokio::test]
+#[ignore = "requires root + mac80211_hwsim"]
+async fn wifi_client_open_connect() {
+    let _guard = WIFI_LOCK.lock().unwrap();
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let config = WifiConfig::new(TEST_NIC, "Test-WIFI-NOPASS");
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires root + mac80211_hwsim"]
+async fn wifi_client_sae_connect() {
+    let _guard = WIFI_LOCK.lock().unwrap();
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC, "Test-WIFI");
+    config.set_password("12345678");
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+// --- helpers ---
+
+fn sh(cmd: &str) {
+    let _ = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output();
+}
+
+fn find_nic_by_mac(mac: &str) -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["-j", "link", "show"])
+        .output()
+        .ok()?;
+    let links: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).ok()?;
+    for link in &links {
+        if link.get("address").and_then(|a| a.as_str()) == Some(mac) {
+            return link
+                .get("ifname")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+fn get_phy_id(nic: &str) -> String {
+    let out = std::process::Command::new("iw")
+        .args(["dev", nic, "info"])
+        .output()
+        .expect("iw dev info");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(pos) = line.find("wiphy ") {
+            return line[pos + 6..].trim().to_string();
+        }
+    }
+    panic!("no wiphy found for {nic}");
+}

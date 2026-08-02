@@ -9,7 +9,7 @@
 //! passphrase) and EAP/802.1X plug in here without touching the client flow.
 
 use crate::{
-    ETH_ALEN, ErrorKind, WpaClient, WpaError, crypto::sae::SaeAuth,
+    ETH_ALEN, ErrorKind, WifiClient, WifiError, crypto::sae::SaeAuth,
     nl80211::auth_assoc, scan::SecurityType,
 };
 
@@ -36,14 +36,14 @@ impl AuthMethod {
         ssid: &str,
         sta_mac: [u8; ETH_ALEN],
         bssid: [u8; ETH_ALEN],
-    ) -> Result<Self, WpaError> {
+    ) -> Result<Self, WifiError> {
         Ok(AuthMethod::Sae(SaeAuth::new(
             password, ssid, sta_mac, bssid,
         )?))
     }
 
     /// Build the initial AUTHENTICATE payload (SAE commit for WPA3).
-    pub(crate) fn initial_frame(&mut self) -> Result<Vec<u8>, WpaError> {
+    pub(crate) fn initial_frame(&mut self) -> Result<Vec<u8>, WifiError> {
         match self {
             AuthMethod::Sae(sae) => Ok(sae.build_init_auth_msg()),
         }
@@ -55,7 +55,7 @@ impl AuthMethod {
         auth_seq: u16,
         status: u16,
         payload: &[u8],
-    ) -> Result<AuthAction, WpaError> {
+    ) -> Result<AuthAction, WifiError> {
         match self {
             AuthMethod::Sae(sae) => {
                 process_sae_frame(sae, auth_seq, status, payload)
@@ -82,7 +82,7 @@ fn process_sae_frame(
     auth_seq: u16,
     status: u16,
     payload: &[u8],
-) -> Result<AuthAction, WpaError> {
+) -> Result<AuthAction, WifiError> {
     // Once SAE has completed we may already have sent ASSOCIATE; ignore any
     // further (retransmitted) SAE frames instead of re-firing association.
     if sae.confirmed() {
@@ -95,7 +95,7 @@ fn process_sae_frame(
         _ => status == 0,
     };
     if !status_ok {
-        return Err(WpaError::new(
+        return Err(WifiError::new(
             ErrorKind::AuthFailed,
             format!("SAE auth failed: seq={auth_seq} status={status}"),
         ));
@@ -105,14 +105,14 @@ fn process_sae_frame(
         // AP commit: body is group(2 LE) || scalar(32) || element(64).
         1 => {
             if payload.len() < 2 + 32 + 64 {
-                return Err(WpaError::new(
+                return Err(WifiError::new(
                     ErrorKind::AuthFailed,
                     format!("SAE commit too short: {} bytes", payload.len()),
                 ));
             }
             let group = u16::from_le_bytes([payload[0], payload[1]]);
             if group != sae.group_id() {
-                return Err(WpaError::new(
+                return Err(WifiError::new(
                     ErrorKind::AuthFailed,
                     format!("unsupported SAE group {group}"),
                 ));
@@ -130,7 +130,7 @@ fn process_sae_frame(
     }
 }
 
-impl WpaClient {
+impl WifiClient {
     /// Start authentication with the selected BSS.
     ///
     /// Open networks: send open-system AUTHENTICATE (no auth method, no
@@ -139,7 +139,7 @@ impl WpaClient {
     /// SAE networks: create a fresh SAE auth method and send the commit.
     pub(crate) async fn send_out_auth_request(
         &mut self,
-    ) -> Result<(), WpaError> {
+    ) -> Result<(), WifiError> {
         self.auth = None;
         self.fourway = None;
 
@@ -162,7 +162,7 @@ impl WpaClient {
         }
 
         let password = self.config.password.as_deref().ok_or_else(|| {
-            WpaError::new(
+            WifiError::new(
                 ErrorKind::InvalidConfig,
                 "password required for encrypted network",
             )

@@ -13,7 +13,7 @@ use wl_nl80211::{
     Nl80211Message, Nl80211UseMfp,
 };
 
-use crate::{ErrorKind, WpaError};
+use crate::{ErrorKind, WifiError};
 
 /// Send NL80211_CMD_AUTHENTICATE with SAE auth type and auth_data.
 /// The auth_data is the SAE commit frame body (auth_alg=3, auth_seq=1,
@@ -25,7 +25,7 @@ pub async fn authenticate_sae_commit(
     bssid: [u8; 6],
     freq_mhz: u32,
     auth_data: &[u8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     // Mirror wpa_supplicant's minimal NL80211_CMD_AUTHENTICATE attribute set
     // for the mac80211 SME-in-userspace path. Extra RSN/cipher attributes are
     // only valid for ASSOCIATE/CONNECT and confuse this command.
@@ -51,7 +51,7 @@ pub async fn authenticate_sae_confirm(
     bssid: [u8; 6],
     freq_mhz: u32,
     confirm_hash: &[u8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     // auth_data = trans(2 LE=2) || status(2 LE=0) || send_confirm(2 LE=1)
     //             || confirm_hash(32)
     let mut auth_data = Vec::with_capacity(6 + confirm_hash.len());
@@ -80,7 +80,7 @@ pub async fn authenticate_open(
     ssid: &str,
     bssid: [u8; 6],
     freq_mhz: u32,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Mac(bssid),
@@ -100,7 +100,7 @@ pub async fn associate_open(
     ssid: &str,
     bssid: [u8; 6],
     freq_mhz: u32,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Mac(bssid),
@@ -120,7 +120,7 @@ pub async fn associate_owe(
     bssid: [u8; 6],
     freq_mhz: u32,
     owe_dh_element: &[u8],
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let mut ie_buf = crate::ieee80211::elements::owe_ie();
     ie_buf.extend_from_slice(owe_dh_element);
     log::debug!("associate OWE IE: {ie_buf:02x?}");
@@ -146,7 +146,7 @@ pub async fn associate(
     ssid: &str,
     bssid: [u8; 6],
     freq_mhz: u32,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     // Build the RSNE + RSNXE exactly as they appear in 4-way handshake
     // Message 2 so the AP's consistency check passes.
     let ie_buf = crate::ieee80211::elements::sae_ie();
@@ -170,7 +170,7 @@ async fn send_nl80211_cmd(
     handle: &Nl80211Handle,
     cmd: Nl80211Command,
     attrs: Vec<Nl80211Attr>,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let mut nl_msg =
         NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
             cmd,
@@ -186,7 +186,7 @@ async fn send_nl80211_cmd(
         if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
             && let Some(code) = err.code
         {
-            return Err(WpaError::new(
+            return Err(WifiError::new(
                 ErrorKind::ConnectFailed,
                 format!("{cmd:?} failed: netlink error {code}"),
             ));

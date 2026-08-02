@@ -6,13 +6,13 @@ use wl_nl80211::{
     Nl80211Attr, Nl80211BssInfo, Nl80211Element, Nl80211Elements, Nl80211Handle,
 };
 
-use crate::WpaError;
+use crate::WifiError;
 
 pub async fn trigger_scan(
     handle: &Nl80211Handle,
     if_index: u32,
     ssid: Option<&str>,
-) -> Result<(), WpaError> {
+) -> Result<(), WifiError> {
     let mut builder = wl_nl80211::Nl80211Scan::new(if_index);
     if let Some(ssid) = ssid {
         builder = builder.ssids(vec![ssid.to_string()]);
@@ -30,7 +30,7 @@ pub async fn trigger_scan(
 pub async fn get_scan_results(
     handle: &Nl80211Handle,
     if_index: u32,
-) -> Result<Vec<Vec<Nl80211BssInfo>>, WpaError> {
+) -> Result<Vec<Vec<Nl80211BssInfo>>, WifiError> {
     let mut dump = handle.scan().dump(if_index).execute().await;
     let mut bss_list = Vec::new();
     while let Some(msg) = dump.try_next().await? {

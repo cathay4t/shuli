@@ -43,42 +43,42 @@ impl fmt::Display for ErrorKind {
 }
 
 #[derive(Debug)]
-pub struct WpaError {
+pub struct WifiError {
     pub kind: ErrorKind,
     pub msg: String,
 }
 
-impl WpaError {
+impl WifiError {
     pub fn new(kind: ErrorKind, msg: impl Into<String>) -> Self {
-        WpaError {
+        WifiError {
             kind,
             msg: msg.into(),
         }
     }
 }
 
-impl fmt::Display for WpaError {
+impl fmt::Display for WifiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.kind, self.msg)
     }
 }
 
-impl std::error::Error for WpaError {}
+impl std::error::Error for WifiError {}
 
-impl From<wl_nl80211::Nl80211Error> for WpaError {
+impl From<wl_nl80211::Nl80211Error> for WifiError {
     fn from(e: wl_nl80211::Nl80211Error) -> Self {
-        WpaError::new(ErrorKind::Nl80211, e.to_string())
+        WifiError::new(ErrorKind::Nl80211, e.to_string())
     }
 }
 
-impl From<std::io::Error> for WpaError {
+impl From<std::io::Error> for WifiError {
     fn from(e: std::io::Error) -> Self {
-        WpaError::new(ErrorKind::Io, e.to_string())
+        WifiError::new(ErrorKind::Io, e.to_string())
     }
 }
 
-impl From<netlink_packet_core::DecodeError> for WpaError {
+impl From<netlink_packet_core::DecodeError> for WifiError {
     fn from(e: netlink_packet_core::DecodeError) -> Self {
-        WpaError::new(ErrorKind::NetlinkDecode, e.to_string())
+        WifiError::new(ErrorKind::NetlinkDecode, e.to_string())
     }
 }

@@ -131,7 +131,7 @@ interfaces:
 
     log_f = open(SHULI_OPEN_LOG, "w")
     daemon_proc = subprocess.Popen(
-        [SHULI_BIN, "--config", SHULI_OPEN_CONFIG],
+        [SHULI_BIN, SHULI_OPEN_CONFIG],
         stdout=log_f,
         stderr=subprocess.STDOUT,
         env={**os.environ, "RUST_LOG": "info"},
