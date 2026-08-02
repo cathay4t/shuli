@@ -224,7 +224,12 @@ impl SaeAuth {
             &self.own_elem_bytes,
         );
 
-        if expected.as_slice() != peer_hash {
+        if aws_lc_rs::constant_time::verify_slices_are_equal(
+            &expected,
+            peer_hash,
+        )
+        .is_err()
+        {
             return Err(WpaError::new(
                 ErrorKind::SaeFailed,
                 "confirm mismatch",
