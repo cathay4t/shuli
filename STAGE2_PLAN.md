@@ -5,6 +5,33 @@
 > usable, controllable daemon and a drop-in replacement for nipart's
 > wpa_supplicant control code.
 
+## 0. Current state (post-Stage 1)
+
+Stage 1 delivered a working `shulid` daemon with:
+
+- **Modules:** `client.rs` (linear per-interface connection walk over
+  `WpaState`), `auth.rs` (SAE `AuthMethod` abstraction), `scan.rs`
+  (trigger/wait/pick BSS), `config.rs` (YAML schema + loader), `mac.rs`
+  (MAC helpers), `nl80211/` (scan, auth/assoc, keys, events, connect,
+  mcast), `crypto/` (SAE H2E, 4-way handshake, KDF — built on `p256`
+  + `aws-lc-rs`), `ieee80211/` (auth frames, EAPOL-Key, RSNE/RSNXE
+  elements).
+- **Crypto stack:** `p256` (ECC group 19 / SSWU hash-to-curve) and
+  `aws-lc-rs` (HMAC-SHA256, AES-CMAC, AES Key Wrap, HKDF).  The
+  RustCrypto suite originally planned in Stage 1 §6 was replaced by
+  `aws-lc-rs` for the symmetric/KDF primitives (commit `2589f1f`).
+- **Robustness already in place:** auto-reconnect with backoff
+  (10 s general / 10 min auth-failure), SIGINT + SIGTERM clean
+  teardown, GTK rekey offload to driver when supported (falls back
+  to userspace rekey), replay-counter validation, constant-time
+  SAE confirm comparison.
+- **Packaging:** `man/shulid.8` man page, SPDX headers on all
+  source files, `cargo clippy -- -D warnings` clean.
+- **Tests:** 20 Rust unit tests (SAE KATs, KDF vectors, EAPOL
+  round-trips, config parsing) + Python pytest integration suite
+  (mac80211_hwsim + hostapd WPA3-SAE/H2E, full SAE + 4-way
+  handshake + data path).
+
 ## 1. Stage 2 Goals
 
 ### Primary (from product brief)
@@ -31,15 +58,20 @@
    behaviour).
 7. **Event/notification stream**: clients can subscribe to connection-state
    changes (connected/disconnected/auth-failed) for monitoring.
-8. **Packaging & service**: systemd unit, default config dir, man pages;
+8. **Packaging & service**: systemd unit, default config dir;
    correct privilege handling (`CAP_NET_ADMIN`).
-9. **Robustness for daily use**: auto-reconnect with backoff, handle AP
-   roaming/BSS loss, PMKSA caching to speed reconnects, multiple managed
-   interfaces.
+   *(Man page `shulid.8` and SIGTERM handling already done in Stage 1.)*
+9. **Robustness for daily use**: handle AP roaming/BSS loss, PMKSA
+   caching to speed reconnects, multiple managed interfaces.
+   *(Auto-reconnect with backoff and GTK rekey offload already done
+   in Stage 1.)*
+10. **WPA2-Personal (PSK)**: connect to WPA2-PSK networks
+    (AKM `00-0F-AC:2`), covering the vast majority of existing
+    home/office APs that have not upgraded to WPA3.
 
 ### Non-goals for Stage 2
 
-- WPA2-Personal, 802.1X, WPA3-Enterprise (Stage 3).
+- 802.1X, WPA3-Enterprise (Stage 3).
 - AP mode, mesh, P2P, DPP, OWE.
 - Routing / IP / DHCP management (left to nipart / external tools).
 
@@ -99,15 +131,28 @@ shuli/
 ├── shuli/                    # library crate (client + schema + protocol)
 │   └── src/{lib,client,protocol,schema,error}.rs
 ├── shulid/                   # daemon binary (Stage 1 engine + server)
-│   └── src/{main,server,manager,...}.rs   # reuses Stage 1 nl80211/crypto/sm
+│   └── src/
+│       ├── main.rs           # entry, arg parse, signal handling
+│       ├── server.rs         # UNIX socket server, per-client tasks
+│       ├── manager.rs        # central config + interface state owner
+│       ├── client.rs         # per-interface connection walk (Stage 1)
+│       ├── auth.rs           # AuthMethod abstraction (Stage 1)
+│       ├── scan.rs           # scan flow (Stage 1)
+│       ├── config.rs         # YAML schema + loader (Stage 1)
+│       ├── mac.rs            # MAC helpers (Stage 1)
+│       ├── nl80211/          # scan, auth_assoc, keys, events, ...
+│       ├── crypto/           # sae, handshake4, kdf
+│       └── ieee80211/        # auth, eapol, elements
 └── shulictl/                 # CLI binary
     └── src/main.rs           # show / apply / scan subcommands
 ```
 
 - `shuli` (lib): protocol messages, `ShuliClient`, `WifiConfig`/`NetworkState`
   schema, errors — **no root required**, usable by nipart and `shulictl`.
-- `shulid`: the Stage 1 connection engine + a tokio server task per client
-  connection + a central manager (config, interfaces, event bus).
+- `shulid`: the Stage 1 connection engine (`client.rs` linear walk,
+  `auth.rs`, `scan.rs`, `nl80211/`, `crypto/`, `ieee80211/`) + a tokio
+  server task per client connection + a central manager (config,
+  interfaces, event bus).
 - `shulictl`: thin CLI over `shuli::ShuliClient`.
 
 ---
@@ -163,6 +208,42 @@ shuli/
   framed JSON codec over UNIX abstract socket; `ShuliClient`.
 - Unit tests for codec + schema (round-trip, hide-secrets).
 
+### M1b — WPA2-Personal (PSK)
+
+No SAE round-trip — the PMK is derived directly from the
+password, so the flow is: scan → associate → 4-way handshake →
+keys installed.
+
+- **PMK derivation:** PBKDF2-HMAC-SHA1(password, SSID, 4096,
+  256 bits) per 802.11-2020 §12.7.1.2.  Add `pbkdf2` +
+  `sha1` (or use `aws-lc-rs` PBKDF2 if available) to the
+  crypto stack.
+- **AuthMethod extension:** add a `Wpa2Psk` variant to the
+  `AuthMethod` trait in `auth.rs`.  `start()` returns
+  immediately (no auth frames); the client skips the
+  `Authenticating` state and goes straight to `Associating`.
+- **RSNE:** emit AKM `00-0F-AC:2` (PSK) instead of
+  `00-0F-AC:8` (SAE).  No RSNXE.  Detect the AP's AKM from
+  the scan RSNE and select PSK vs SAE accordingly.
+- **4-way handshake differences (AKM 00-0F-AC:2):**
+  - PTK KDF: PRF-384 (HMAC-SHA1, `label || 0x00 || context ||
+    counter` format, single-octet counter from 0) — **not**
+    the KDF-Hash-Length used by SAE.  Add a `prf()` function
+    to `kdf.rs`.
+  - MIC: HMAC-SHA1-128 (first 16 bytes of HMAC-SHA1) for
+    descriptor version 1, or AES-CMAC for descriptor version 2.
+    Check the key-info descriptor-version bits to select.
+  - Key descriptor version 1 uses HMAC-SHA1 MIC; version 2
+    uses AES-CMAC.  Most WPA2-PSK APs use version 1.
+- **Rekey offload:** pass AKM `0x000FAC02` in
+  `NL80211_REKEY_DATA_AKM` when offloading.
+- **Tests:** unit tests for PBKDF2 PMK derivation (known
+  vectors from 802.11-2020 / wpa_supplicant), PRF-384 PTK
+  derivation, HMAC-SHA1 MIC.  Integration test with hostapd
+  configured for WPA2-PSK (`wpa=2`, `wpa_key_mgmt=WPA-PSK`).
+- **Exit:** `shulid` connects to both WPA3-SAE and WPA2-PSK
+  APs, selecting the AKM automatically from the scan RSNE.
+
 ### M2 — Daemon server
 - `shulid` listens on the abstract socket; one tokio task per connection;
   central manager owns interface state machines (from Stage 1) and an event bus
@@ -179,8 +260,11 @@ shuli/
   `shulictl scan`. Man pages + `--help`.
 
 ### M5 — Events & resilience
-- `Subscribe` event stream; auto-reconnect with backoff; BSS-loss/roam
-  handling; PMKSA caching for fast reconnect; multi-interface.
+- `Subscribe` event stream; BSS-loss/roam handling; PMKSA caching
+  for fast reconnect; multi-interface.
+  *(Auto-reconnect with backoff and GTK rekey offload already done
+  in Stage 1 — build on the existing `WpaState` retry logic and
+  `keys::set_rekey_offload()`.)*
 
 ### M6 — nipart integration
 - Land `shuli` backend in nipart behind a switch; port `apply`/`query`/`scan`;
@@ -190,31 +274,40 @@ shuli/
 
 ### M7 — Packaging & docs
 - systemd unit (`shulid.service`), default `/etc/shuli/` layout, capability
-  setup (`CAP_NET_ADMIN`), README, man pages, `docs/` for the protocol + client
-  API.
+  setup (`CAP_NET_ADMIN`), README, `docs/` for the protocol + client API.
+  *(Man page `man/shulid.8` already exists; extend for `shulictl`.)*
 
 ---
 
 ## 6. Engineering conventions (align with nipart where shared)
 
-- **Edition 2024**; pick an MSRV compatible with nipart (nipart MSRV **1.88**)
-  if code/types are shared.
-- **SPDX header** on every source file (`// SPDX-License-Identifier: Apache-2.0`
-  unless a different licence is chosen for shuli — confirm with owner).
+- **Edition 2024**; MSRV **1.96** (shuli).  If code/types are shared
+  with nipart (MSRV 1.88), either lower shuli's MSRV or keep the
+  shared surface in the `shuli` lib crate at nipart's MSRV.
+- **SPDX header** on every source file (`// SPDX-License-Identifier:
+  Apache-2.0`).
 - rustfmt: `max_width=80`, `group_imports=StdExternalCrate`,
-  `imports_granularity=Crate` (matches both shuli's `.rustfmt.toml` and nipart).
-- `cargo clippy -- -D warnings` clean; `cargo +nightly fmt --all -- --check`.
-- Secrets never logged; hidden in `Debug`/`Display` (copy nipart's pattern).
+  `imports_granularity=Crate` (matches both shuli's `.rustfmt.toml`
+  and nipart).
+- `cargo clippy -- -D warnings` clean; `cargo fmt --all -- --check`.
+- Secrets never logged; hidden in `Debug`/`Display` (copy nipart's
+  pattern).
+- **Crypto:** `p256` for ECC, `aws-lc-rs` for symmetric/KDF
+  primitives (HMAC-SHA256, AES-CMAC, AES Key Wrap, HKDF,
+  PBKDF2, HMAC-SHA1 for WPA2-PSK).  Do **not** add RustCrypto
+  symmetric crates alongside `aws-lc-rs`.
 
 ## 7. Stage 2 exit criteria
 
 1. `shulid` exposes a UNIX abstract-socket control interface; `shulictl show`
-   and `shulictl apply` work for WPA3-Personal.
-2. `shuli` client library is documented and stable enough for nipart to depend
+   and `shulictl apply` work for WPA3-Personal and WPA2-Personal.
+2. `shulid` connects to both WPA3-SAE and WPA2-PSK APs, selecting the
+   AKM automatically from the scan RSNE.
+3. `shuli` client library is documented and stable enough for nipart to depend
    on.
-3. nipart drives WPA3-Personal through shuli (D-Bus/wpa_supplicant path removed
+4. nipart drives WPA3-Personal through shuli (D-Bus/wpa_supplicant path removed
    or switchable-off) and its wifi tests pass.
-4. Daily-use robustness: auto-reconnect, PMKSA caching, multi-interface, secret
+5. Daily-use robustness: auto-reconnect, PMKSA caching, multi-interface, secret
    hygiene; systemd packaging present.
-5. CI green: fmt/clippy/test + an integration test (mac80211_hwsim + hostapd
-   WPA3) exercising show/apply/scan through the socket.
+6. CI green: fmt/clippy/test + integration tests (mac80211_hwsim + hostapd)
+   exercising WPA3-SAE, WPA2-PSK, and show/apply/scan through the socket.
