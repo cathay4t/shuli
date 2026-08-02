@@ -11,11 +11,13 @@ use crate::{
     },
 };
 
+use futures::TryStreamExt;
+
 const SCAN_SLEEP_SECS: u64 = 3;
 
 /// Security type detected from the BSS's RSNE in scan results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum SecurityType {
+pub enum SecurityType {
     /// No RSNE — open / no encryption.
     #[default]
     Open,
@@ -29,11 +31,11 @@ pub(crate) enum SecurityType {
 
 /// The best BSS candidate for the configured SSID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct BssInfo {
-    pub(crate) bssid: [u8; ETH_ALEN],
-    pub(crate) freq_mhz: u32,
-    pub(crate) signal_dbm: i32,
-    pub(crate) security: SecurityType,
+pub struct BssInfo {
+    pub bssid: [u8; ETH_ALEN],
+    pub freq_mhz: u32,
+    pub signal_dbm: i32,
+    pub security: SecurityType,
 }
 
 // Prefer the strongest signal; break ties by frequency (higher band first),
@@ -182,4 +184,66 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
     // RSNE present but no SAE/OWE AKM — treat as open for now
     // (WPA2-PSK etc. will be added later).
     SecurityType::Open
+}
+
+/// Standalone scan: create a nl80211 handle, trigger a scan on the
+/// given interface, wait, and return all discovered BSSes with their
+/// raw IE buffers (for generation detection by the caller).
+pub async fn scan_wifi_with_ies(
+    iface_name: &str,
+) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
+    let (conn, handle, _) = wl_nl80211::new_connection()
+        .map_err(|e| WifiError::new(ErrorKind::Nl80211, e.to_string()))?;
+    tokio::spawn(conn);
+
+    let if_index = resolve_if_index(&handle, iface_name).await?;
+
+    trigger_scan(&handle, if_index, None).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS)).await;
+
+    let bss_list = get_scan_results(&handle, if_index).await?;
+    let mut results = Vec::new();
+    for bss in &bss_list {
+        let Some(ies) = extract_ies(bss) else {
+            continue;
+        };
+        if extract_ssid_from_ies(ies).is_none() {
+            continue;
+        }
+        let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) =
+            (extract_bssid(bss), extract_freq(bss), extract_signal(bss))
+        else {
+            continue;
+        };
+        let info = BssInfo {
+            bssid,
+            freq_mhz,
+            signal_dbm,
+            security: detect_security(ies),
+        };
+        results.push((info, ies.to_vec()));
+    }
+    Ok(results)
+}
+
+async fn resolve_if_index(
+    handle: &wl_nl80211::Nl80211Handle,
+    iface_name: &str,
+) -> Result<u32, WifiError> {
+    let mut dump = handle.interface().get(vec![]).execute().await;
+    while let Some(msg) = dump.try_next().await? {
+        if msg.payload.attributes.iter().any(|attr| {
+            matches!(attr, wl_nl80211::Nl80211Attr::IfName(n) if n == iface_name)
+        }) {
+            for attr in &msg.payload.attributes {
+                if let wl_nl80211::Nl80211Attr::IfIndex(idx) = attr {
+                    return Ok(*idx);
+                }
+            }
+        }
+    }
+    Err(WifiError::new(
+        ErrorKind::InterfaceNotFound,
+        format!("interface {iface_name} not found"),
+    ))
 }

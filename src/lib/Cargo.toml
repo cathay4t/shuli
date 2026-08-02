@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Tests are unit tests declared as `mod tests` in lib.rs, not
+# integration tests in the tests/ directory.
+autotests = false
+
+[lib]
+name = "shuli"
+path = "lib.rs"
 
 [dependencies]
 wl-nl80211.workspace = true

@@ -8,7 +8,7 @@ license.workspace = true
 
 [[bin]]
 name = "shulid"
-path = "src/main.rs"
+path = "main.rs"
 
 [dependencies]
 shuli = { path = "../lib" }

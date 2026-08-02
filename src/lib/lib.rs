@@ -7,8 +7,8 @@ mod crypto;
 mod error;
 mod ieee80211;
 mod mac;
-mod nl80211;
-mod scan;
+pub mod nl80211;
+pub mod scan;
 #[cfg(test)]
 mod tests;
 
@@ -17,4 +17,5 @@ pub use self::{
     client::{WifiClient, WifiState},
     config::WifiConfig,
     error::{ErrorKind, WifiError},
+    scan::{BssInfo, SecurityType},
 };
