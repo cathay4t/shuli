@@ -118,7 +118,7 @@ impl SaeAuth {
         peer_scalar_bytes: &[u8],
         peer_elem_bytes: &[u8],
     ) -> Result<Vec<u8>, WpaError> {
-        let peer_scalar = scalar_from_bytes(peer_scalar_bytes);
+        let peer_scalar = scalar_from_bytes(peer_scalar_bytes)?;
         let peer_elem = projective_from_elem(peer_elem_bytes);
 
         if bool::from(peer_elem.is_identity()) {
@@ -362,11 +362,30 @@ fn scalar_to_array(s: &Scalar) -> [u8; 32] {
     arr
 }
 
-fn scalar_from_bytes(bytes: &[u8]) -> Scalar {
-    let mut arr = [0u8; 32];
-    let len = bytes.len().min(32);
-    arr[..len].copy_from_slice(&bytes[..len]);
-    Scalar::from_repr(arr.into()).unwrap_or(Scalar::ZERO)
+/// Decode a peer scalar, rejecting values outside [1, r-1]
+/// (802.11-2020 §12.4.5.3).
+fn scalar_from_bytes(bytes: &[u8]) -> Result<Scalar, WpaError> {
+    if bytes.len() < 32 {
+        return Err(WpaError::new(
+            ErrorKind::SaeFailed,
+            format!("peer scalar too short: {} bytes", bytes.len()),
+        ));
+    }
+    let opt = Scalar::from_repr(GenericArray::clone_from_slice(&bytes[..32]));
+    if bool::from(opt.is_none()) {
+        return Err(WpaError::new(
+            ErrorKind::SaeFailed,
+            "peer scalar out of range",
+        ));
+    }
+    let scalar = opt.unwrap();
+    if bool::from(scalar.is_zero()) {
+        return Err(WpaError::new(
+            ErrorKind::SaeFailed,
+            "peer scalar is zero",
+        ));
+    }
+    Ok(scalar)
 }
 
 /// Reconstruct a curve point from a 64-byte x||y encoding.
