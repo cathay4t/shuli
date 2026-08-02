@@ -23,7 +23,7 @@ use p256::{
 };
 
 use crate::{
-    ShuliResult,
+    ErrorKind, WpaError,
     crypto::kdf::{hkdf_expand, hkdf_extract_sha256, kdf, sae_confirm},
 };
 
@@ -32,10 +32,11 @@ const SAE_FIELD_LEN: usize = 32;
 const SAE_KCK_LEN: usize = 32;
 const SAE_PMK_LEN: usize = 32;
 
-/// SAE handshake state machine (supplicant side, H2E group 19).
+/// SAE handshake
+/// Hash-to-Element group 19(NIST P-256 elliptic curve)
 #[derive(Clone, Debug)]
-pub struct SaeState {
-    pwe: ProjectivePoint,
+pub(crate) struct SaeAuth {
+    pub(crate) pwe: ProjectivePoint,
     rand: Scalar,
     scalar: Scalar,
     elem: ProjectivePoint,
@@ -44,18 +45,18 @@ pub struct SaeState {
     kck: Option<[u8; SAE_KCK_LEN]>,
     pmk: Option<[u8; SAE_PMK_LEN]>,
     pmkid: Option<[u8; 16]>,
+    confirmed: bool,
     own_scalar_bytes: [u8; 32],
     own_elem_bytes: [u8; 64], // x || y uncompressed
 }
 
-impl SaeState {
-    /// Create a new SAE state. The PWE is derived immediately via H2E.
-    pub fn new(
+impl SaeAuth {
+    pub(crate) fn new(
         password: &str,
         ssid: &str,
         mac_sta: [u8; 6],
         mac_ap: [u8; 6],
-    ) -> ShuliResult<Self> {
+    ) -> Result<Self, WpaError> {
         let pwe = compute_pwe_h2e(password, ssid, &mac_sta, &mac_ap)?;
         Ok(Self {
             pwe,
@@ -67,18 +68,19 @@ impl SaeState {
             kck: None,
             pmk: None,
             pmkid: None,
+            confirmed: false,
             own_scalar_bytes: [0u8; 32],
             own_elem_bytes: [0u8; 64],
         })
     }
 
     /// SAE group identifier (19 = P-256).
-    pub fn group_id(&self) -> u16 {
+    pub(crate) fn group_id(&self) -> u16 {
         SAE_GROUP19_ID
     }
 
     /// Generate our commit (scalar + element) using the given RNG.
-    pub fn build_commit(
+    pub(crate) fn build_commit(
         &mut self,
         rng: &mut impl CryptoRngCore,
     ) -> (Vec<u8>, Vec<u8>) {
@@ -111,25 +113,27 @@ impl SaeState {
 
     /// Process peer's commit (scalar + element). Derives KCK/PMK/PMKID and
     /// returns our confirm value (32-byte CN output).
-    pub fn process_commit(
+    pub(crate) fn process_commit(
         &mut self,
         peer_scalar_bytes: &[u8],
         peer_elem_bytes: &[u8],
-    ) -> ShuliResult<Vec<u8>> {
+    ) -> Result<Vec<u8>, WpaError> {
         let peer_scalar = scalar_from_bytes(peer_scalar_bytes);
         let peer_elem = projective_from_elem(peer_elem_bytes);
 
         if bool::from(peer_elem.is_identity()) {
-            return Err(crate::ShuliError::SaeFailed(
-                "failed to reconstruct peer element".into(),
+            return Err(WpaError::new(
+                ErrorKind::SaeFailed,
+                "failed to reconstruct peer element",
             ));
         }
 
         // K = rand * (peer_scalar * PWE + peer_elem); k = K.x
         let k_point = (self.pwe * peer_scalar + peer_elem) * self.rand;
         if bool::from(k_point.is_identity()) {
-            return Err(crate::ShuliError::SaeFailed(
-                "shared secret is identity".into(),
+            return Err(WpaError::new(
+                ErrorKind::SaeFailed,
+                "shared secret is identity",
             ));
         }
         let k_affine = k_point.to_affine();
@@ -178,25 +182,27 @@ impl SaeState {
     }
 
     /// Process peer's confirm message body: `send_confirm(2 LE) || CN(32)`.
-    pub fn process_confirm(
-        &self,
+    pub(crate) fn process_confirm(
+        &mut self,
         peer_confirm_body: &[u8],
-    ) -> ShuliResult<[u8; 32]> {
+    ) -> Result<[u8; 32], WpaError> {
         let kck = self.kck.ok_or_else(|| {
-            crate::ShuliError::SaeFailed(
-                "no KCK derived - process commit first".into(),
+            WpaError::new(
+                ErrorKind::SaeFailed,
+                "no KCK derived - process commit first",
             )
         })?;
         let peer_scalar = self.peer_scalar.ok_or_else(|| {
-            crate::ShuliError::SaeFailed("no peer commit processed".into())
+            WpaError::new(ErrorKind::SaeFailed, "no peer commit processed")
         })?;
         let peer_elem = self.peer_elem.ok_or_else(|| {
-            crate::ShuliError::SaeFailed("no peer commit processed".into())
+            WpaError::new(ErrorKind::SaeFailed, "no peer commit processed")
         })?;
 
         if peer_confirm_body.len() < 2 + 32 {
-            return Err(crate::ShuliError::SaeFailed(
-                "confirm too short".into(),
+            return Err(WpaError::new(
+                ErrorKind::SaeFailed,
+                "confirm too short",
             ));
         }
         let peer_send_confirm =
@@ -219,37 +225,71 @@ impl SaeState {
         );
 
         if expected.as_slice() != peer_hash {
-            return Err(crate::ShuliError::SaeFailed(
-                "confirm mismatch".into(),
+            return Err(WpaError::new(
+                ErrorKind::SaeFailed,
+                "confirm mismatch",
             ));
         }
 
-        Ok(self.pmk.unwrap())
+        let pmk = self.pmk.ok_or_else(|| {
+            WpaError::new(ErrorKind::SaeFailed, "no PMK derived")
+        })?;
+        self.confirmed = true;
+        Ok(pmk)
     }
 
-    pub fn pmk(&self) -> Option<[u8; 32]> {
+    pub(crate) fn pmk(&self) -> Option<[u8; 32]> {
         self.pmk
     }
 
-    pub fn pmkid(&self) -> Option<[u8; 16]> {
+    pub(crate) fn pmkid(&self) -> Option<[u8; 16]> {
         self.pmkid
+    }
+
+    /// Whether the peer's confirm has been validated (SAE completed).
+    pub(crate) fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    pub(crate) fn build_init_auth_msg(&mut self) -> Vec<u8> {
+        let (scalar, element) =
+            self.build_commit(&mut p256::elliptic_curve::rand_core::OsRng);
+
+        // Build SAE commit auth_data for NL80211_ATTR_AUTH_DATA. The kernel
+        // reads the first 4 bytes as transaction(2 LE) and status(2
+        // LE); the remaining bytes become the authentication frame
+        // body. For H2E the status code is SAE_HASH_TO_ELEMENT (126),
+        // and the body is:   group(2 LE) || scalar(32) || element(64)
+        const SAE_STATUS_H2E: u16 = 126;
+        let mut auth_data =
+            Vec::with_capacity(6 + scalar.len() + element.len());
+        // transaction = commit
+        auth_data.extend_from_slice(&1u16.to_le_bytes());
+        auth_data.extend_from_slice(&SAE_STATUS_H2E.to_le_bytes()); // status
+        auth_data.extend_from_slice(&self.group_id().to_le_bytes()); // group 19
+        auth_data.extend_from_slice(&scalar);
+        auth_data.extend_from_slice(&element);
+        auth_data
     }
 }
 
 // ---- PWE derivation: H2E for group 19 (RFC 9380 SSWU, hostapd-compatible) --
 
-fn compute_pwe_h2e(
+pub(crate) fn compute_pwe_h2e(
     password: &str,
     ssid: &str,
     mac_sta: &[u8; 6],
     mac_ap: &[u8; 6],
-) -> ShuliResult<ProjectivePoint> {
+) -> Result<ProjectivePoint, WpaError> {
     let pt = derive_pt_ecc(ssid.as_bytes(), password.as_bytes())?;
     derive_pwe_from_pt(&pt, mac_sta, mac_ap)
 }
 
 /// Derive the password token PT (group 19), per sae_derive_pt_ecc.
-fn derive_pt_ecc(ssid: &[u8], password: &[u8]) -> ShuliResult<ProjectivePoint> {
+fn derive_pt_ecc(
+    ssid: &[u8],
+    password: &[u8],
+) -> Result<ProjectivePoint, WpaError> {
     // pwd-seed = HKDF-Extract(ssid, password)
     let pwd_seed = hkdf_extract_sha256(ssid, password);
 
@@ -258,7 +298,7 @@ fn derive_pt_ecc(ssid: &[u8], password: &[u8]) -> ShuliResult<ProjectivePoint> {
 
     let pt = p1 + p2;
     if bool::from(pt.is_identity()) {
-        return Err(crate::ShuliError::SaeFailed("PT is identity".into()));
+        return Err(WpaError::new(ErrorKind::SaeFailed, "PT is identity"));
     }
     Ok(pt)
 }
@@ -266,7 +306,7 @@ fn derive_pt_ecc(ssid: &[u8], password: &[u8]) -> ShuliResult<ProjectivePoint> {
 fn sswu_from_label(
     pwd_seed: &[u8; 32],
     label: &[u8],
-) -> ShuliResult<ProjectivePoint> {
+) -> Result<ProjectivePoint, WpaError> {
     // pwd-value = HKDF-Expand(pwd-seed, label, len); len = prime+ceil(prime/2)
     let mut okm = [0u8; SAE_FIELD_LEN + SAE_FIELD_LEN.div_ceil(2)]; // 48
     hkdf_expand(pwd_seed, label, &mut okm);
@@ -281,7 +321,7 @@ fn derive_pwe_from_pt(
     pt: &ProjectivePoint,
     mac_sta: &[u8; 6],
     mac_ap: &[u8; 6],
-) -> ShuliResult<ProjectivePoint> {
+) -> Result<ProjectivePoint, WpaError> {
     let (max_mac, min_mac) = if u64_from_mac(mac_sta) > u64_from_mac(mac_ap) {
         (mac_sta, mac_ap)
     } else {
@@ -303,25 +343,18 @@ fn derive_pwe_from_pt(
     let val_bytes = val_int.to_be_bytes();
     let val_scalar = Scalar::from_repr(val_bytes.into());
     if bool::from(val_scalar.is_none()) {
-        return Err(crate::ShuliError::SaeFailed("val out of range".into()));
+        return Err(WpaError::new(ErrorKind::SaeFailed, "val out of range"));
     }
     let val_scalar = val_scalar.unwrap();
 
     let pwe = *pt * val_scalar;
     if bool::from(pwe.is_identity()) {
-        return Err(crate::ShuliError::SaeFailed("PWE is identity".into()));
+        return Err(WpaError::new(ErrorKind::SaeFailed, "PWE is identity"));
     }
     Ok(pwe)
 }
 
 // ---- Helpers ----
-
-#[cfg(test)]
-fn affine_x_bytes(point: &AffinePoint) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(point.x().as_ref());
-    bytes
-}
 
 fn scalar_to_array(s: &Scalar) -> [u8; 32] {
     let mut arr = [0u8; 32];
@@ -370,79 +403,4 @@ fn u64_from_mac(mac: &[u8; 6]) -> u64 {
     let mut buf = [0u8; 8];
     buf[2..8].copy_from_slice(mac);
     u64::from_be_bytes(buf)
-}
-
-// ---- Tests ----
-
-#[cfg(test)]
-mod tests {
-    use p256::elliptic_curve::rand_core::OsRng;
-
-    use super::*;
-
-    #[test]
-    fn test_pwe_derivation() {
-        let mac_sta = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mac_ap = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
-        let pwe = compute_pwe_h2e("12345678", "Test-WIFI", &mac_sta, &mac_ap);
-        assert!(pwe.is_ok());
-        assert!(!bool::from(pwe.unwrap().is_identity()));
-    }
-
-    #[test]
-    fn test_full_sae_exchange() {
-        let mut rng = OsRng;
-        let mac_sta = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mac_ap = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
-        let password = "12345678";
-        let ssid = "Test-WIFI";
-
-        let mut supp = SaeState::new(password, ssid, mac_sta, mac_ap).unwrap();
-        let (supp_scalar, supp_elem) = supp.build_commit(&mut rng);
-
-        let mut ap = SaeState::new(password, ssid, mac_ap, mac_sta).unwrap();
-        let (ap_scalar, ap_elem) = ap.build_commit(&mut rng);
-
-        // PWE must match on both sides (symmetric in MAC ordering).
-        let supp_pwe_x = affine_x_bytes(&supp.pwe.to_affine());
-        let ap_pwe_x = affine_x_bytes(&ap.pwe.to_affine());
-        assert_eq!(supp_pwe_x, ap_pwe_x, "PWE x must match");
-
-        let supp_confirm = supp.process_commit(&ap_scalar, &ap_elem).unwrap();
-        let ap_confirm = ap.process_commit(&supp_scalar, &supp_elem).unwrap();
-
-        assert_eq!(supp.pmk(), ap.pmk(), "PMK must match");
-        assert_eq!(supp.pmkid(), ap.pmkid(), "PMKID must match");
-
-        // Each side verifies the other's confirm. Confirm body = send_confirm
-        // (1, LE) || hash.
-        let mut ap_confirm_body = vec![1u8, 0u8];
-        ap_confirm_body.extend_from_slice(&ap_confirm);
-        supp.process_confirm(&ap_confirm_body).unwrap();
-
-        let mut supp_confirm_body = vec![1u8, 0u8];
-        supp_confirm_body.extend_from_slice(&supp_confirm);
-        ap.process_confirm(&supp_confirm_body).unwrap();
-    }
-
-    #[test]
-    fn test_sae_different_passwords() {
-        let mut rng = OsRng;
-        let mac_sta = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mac_ap = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
-        let ssid = "Test-WIFI";
-
-        let mut supp =
-            SaeState::new("12345678", ssid, mac_sta, mac_ap).unwrap();
-        let (supp_scalar, supp_elem) = supp.build_commit(&mut rng);
-
-        let mut ap =
-            SaeState::new("wrong_password", ssid, mac_ap, mac_sta).unwrap();
-        let (ap_scalar, ap_elem) = ap.build_commit(&mut rng);
-
-        supp.process_commit(&ap_scalar, &ap_elem).unwrap();
-        ap.process_commit(&supp_scalar, &supp_elem).unwrap();
-
-        assert_ne!(supp.pmk(), ap.pmk(), "PMK must differ");
-    }
 }

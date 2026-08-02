@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod config;
-pub mod crypto;
-pub mod error;
-pub mod ieee80211;
-pub mod nl80211;
-pub mod sm;
+mod auth;
+mod client;
+mod config;
+mod crypto;
+mod error;
+mod ieee80211;
+mod mac;
+mod nl80211;
+mod scan;
+#[cfg(test)]
+mod tests;
 
-pub use error::{ShuliError, ShuliResult};
+pub(crate) use self::mac::ETH_ALEN;
+pub use self::{
+    client::{WpaClient, WpaConfig, WpaState},
+    error::{ErrorKind, WpaError},
+};

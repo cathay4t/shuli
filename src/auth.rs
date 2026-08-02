@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Authentication method abstraction.
+//!
+//! The connection flow in `client.rs` only knows [`AuthMethod`]: build the
+//! initial AUTHENTICATE payload, feed in incoming authentication frames, and
+//! collect PMK/PMKID once authenticated. SAE (WPA3-Personal) is implemented
+//! today; WPA2-PSK (no pre-association exchange, PMK derived from the
+//! passphrase) and EAP/802.1X plug in here without touching the client flow.
+
+use crate::{
+    ETH_ALEN, ErrorKind, WpaClient, WpaError, crypto::sae::SaeAuth,
+    nl80211::auth_assoc,
+};
+
+/// What the client should do after processing an authentication frame.
+pub(crate) enum AuthAction {
+    /// Keep waiting for more authentication frames.
+    Continue,
+    /// Send this confirmation frame back to the AP.
+    SendConfirm(Vec<u8>),
+    /// Authentication succeeded; proceed to association.
+    Complete,
+}
+
+/// The pre-association authentication method in use.
+/// TODO(WPA2/EAP): add `Psk` (derive PMK from passphrase, skip the SAE
+/// exchange) and `Eap` (802.1X) variants here.
+pub(crate) enum AuthMethod {
+    Sae(SaeAuth),
+}
+
+impl AuthMethod {
+    pub(crate) fn new_sae(
+        password: &str,
+        ssid: &str,
+        sta_mac: [u8; ETH_ALEN],
+        bssid: [u8; ETH_ALEN],
+    ) -> Result<Self, WpaError> {
+        Ok(AuthMethod::Sae(SaeAuth::new(
+            password, ssid, sta_mac, bssid,
+        )?))
+    }
+
+    /// Build the initial AUTHENTICATE payload (SAE commit for WPA3).
+    pub(crate) fn initial_frame(&mut self) -> Result<Vec<u8>, WpaError> {
+        match self {
+            AuthMethod::Sae(sae) => Ok(sae.build_init_auth_msg()),
+        }
+    }
+
+    /// Process an authentication frame received from the AP.
+    pub(crate) fn process_frame(
+        &mut self,
+        auth_seq: u16,
+        status: u16,
+        payload: &[u8],
+    ) -> Result<AuthAction, WpaError> {
+        match self {
+            AuthMethod::Sae(sae) => {
+                process_sae_frame(sae, auth_seq, status, payload)
+            }
+        }
+    }
+
+    pub(crate) fn pmk(&self) -> Option<[u8; 32]> {
+        match self {
+            AuthMethod::Sae(sae) => sae.pmk(),
+        }
+    }
+
+    pub(crate) fn pmkid(&self) -> Option<[u8; 16]> {
+        match self {
+            AuthMethod::Sae(sae) => sae.pmkid(),
+        }
+    }
+}
+
+/// SAE exchange: commit (transaction 1) then confirm (transaction 2).
+fn process_sae_frame(
+    sae: &mut SaeAuth,
+    auth_seq: u16,
+    status: u16,
+    payload: &[u8],
+) -> Result<AuthAction, WpaError> {
+    // Once SAE has completed we may already have sent ASSOCIATE; ignore any
+    // further (retransmitted) SAE frames instead of re-firing association.
+    if sae.confirmed() {
+        return Ok(AuthAction::Continue);
+    }
+
+    const SAE_STATUS_H2E: u16 = 126;
+    let status_ok = match auth_seq {
+        1 => status == 0 || status == SAE_STATUS_H2E,
+        _ => status == 0,
+    };
+    if !status_ok {
+        return Err(WpaError::new(
+            ErrorKind::AuthFailed,
+            format!("SAE auth failed: seq={auth_seq} status={status}"),
+        ));
+    }
+
+    match auth_seq {
+        // AP commit: body is group(2 LE) || scalar(32) || element(64).
+        1 => {
+            if payload.len() < 2 + 32 + 64 {
+                return Err(WpaError::new(
+                    ErrorKind::AuthFailed,
+                    format!("SAE commit too short: {} bytes", payload.len()),
+                ));
+            }
+            let group = u16::from_le_bytes([payload[0], payload[1]]);
+            if group != sae.group_id() {
+                return Err(WpaError::new(
+                    ErrorKind::AuthFailed,
+                    format!("unsupported SAE group {group}"),
+                ));
+            }
+            let confirm =
+                sae.process_commit(&payload[2..34], &payload[34..98])?;
+            Ok(AuthAction::SendConfirm(confirm))
+        }
+        // AP confirm: send_confirm(2 LE) || CN(32). SAE is done.
+        2 => {
+            sae.process_confirm(payload)?;
+            Ok(AuthAction::Complete)
+        }
+        _ => Ok(AuthAction::Continue),
+    }
+}
+
+impl WpaClient {
+    /// Start authentication with the selected BSS:
+    /// 1. Create a fresh auth method for this attempt (new nonces/scalars).
+    /// 2. Send the initial AUTHENTICATE command carrying the SAE commit.
+    pub(crate) async fn send_out_auth_request(
+        &mut self,
+    ) -> Result<(), WpaError> {
+        self.auth = Some(AuthMethod::new_sae(
+            &self.config.password,
+            &self.config.ssid,
+            self.mac,
+            self.bss_info.bssid,
+        )?);
+        self.fourway = None;
+
+        let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
+        auth_assoc::authenticate_sae_commit(
+            &self.handle,
+            self.if_index,
+            &self.config.ssid,
+            self.bss_info.bssid,
+            self.bss_info.freq_mhz,
+            &auth_data,
+        )
+        .await
+    }
+}

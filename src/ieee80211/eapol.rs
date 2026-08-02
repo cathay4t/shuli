@@ -32,20 +32,15 @@ const KEY_INFO_INSTALL: u16 = 0x0040;
 const KEY_INFO_ACK: u16 = 0x0080;
 const KEY_INFO_MIC: u16 = 0x0100;
 const KEY_INFO_SECURE: u16 = 0x0200;
-const KEY_INFO_ERROR: u16 = 0x0400;
-const KEY_INFO_REQUEST: u16 = 0x0800;
 const KEY_INFO_ENCRYPTED_DATA: u16 = 0x1000;
 
 /// EAPOL-Key frame parsed fields.
 #[derive(Debug, Clone)]
 pub struct EapolKeyFrame {
     pub key_info: u16,
-    pub key_len: u16,
     pub replay_counter: u64,
     pub key_nonce: [u8; 32],
-    pub key_iv: [u8; 16],
     pub key_rsc: [u8; 8],
-    pub key_id: [u8; 8],
     pub key_mic: [u8; 16],
     pub key_data: Vec<u8>,
     /// The full received PDU bytes (version byte onwards).
@@ -53,16 +48,8 @@ pub struct EapolKeyFrame {
 }
 
 impl EapolKeyFrame {
-    pub fn descriptor_type(&self) -> u16 {
-        self.key_info & KEY_INFO_DESC_TYPE_MASK
-    }
-
     pub fn is_pairwise(&self) -> bool {
         self.key_info & KEY_INFO_PAIRWISE != 0
-    }
-
-    pub fn has_install(&self) -> bool {
-        self.key_info & KEY_INFO_INSTALL != 0
     }
 
     pub fn has_ack(&self) -> bool {
@@ -79,14 +66,6 @@ impl EapolKeyFrame {
 
     pub fn is_encrypted_data(&self) -> bool {
         self.key_info & KEY_INFO_ENCRYPTED_DATA != 0
-    }
-
-    pub fn has_error(&self) -> bool {
-        self.key_info & KEY_INFO_ERROR != 0
-    }
-
-    pub fn has_request(&self) -> bool {
-        self.key_info & KEY_INFO_REQUEST != 0
     }
 }
 
@@ -107,19 +86,14 @@ pub fn parse_eapol_key_frame(pdu: &[u8]) -> Option<EapolKeyFrame> {
     }
 
     let key_info = u16::from_be_bytes([key[1], key[2]]);
-    let key_len = u16::from_be_bytes([key[3], key[4]]);
     let replay_counter = u64::from_be_bytes([
         key[5], key[6], key[7], key[8], key[9], key[10], key[11], key[12],
     ]);
 
     let mut key_nonce = [0u8; 32];
     key_nonce.copy_from_slice(&key[13..45]);
-    let mut key_iv = [0u8; 16];
-    key_iv.copy_from_slice(&key[45..61]);
     let mut key_rsc = [0u8; 8];
     key_rsc.copy_from_slice(&key[61..69]);
-    let mut key_id = [0u8; 8];
-    key_id.copy_from_slice(&key[69..77]);
     let mut key_mic = [0u8; 16];
     key_mic.copy_from_slice(&key[77..93]);
 
@@ -131,12 +105,9 @@ pub fn parse_eapol_key_frame(pdu: &[u8]) -> Option<EapolKeyFrame> {
 
     Some(EapolKeyFrame {
         key_info,
-        key_len,
         replay_counter,
         key_nonce,
-        key_iv,
         key_rsc,
-        key_id,
         key_mic,
         key_data,
         raw: pdu.to_vec(),
@@ -276,35 +247,4 @@ pub fn fmt_key_info(key_info: u16) -> String {
         }
     }
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_msg2() {
-        let snonce = [0xABu8; 32];
-        let rsne = vec![0x30, 0x14, 0x01, 0x00];
-        let pdu = build_message_2(&snonce, 1, &rsne);
-        let parsed = parse_eapol_key_frame(&pdu).unwrap();
-        assert!(parsed.has_mic());
-        assert!(parsed.is_pairwise());
-        assert_eq!(parsed.key_nonce, snonce);
-        assert_eq!(parsed.key_data, rsne);
-        assert_eq!(parsed.replay_counter, 1);
-    }
-
-    #[test]
-    fn mic_offset_is_correct() {
-        assert_eq!(OFF_MIC, 81);
-        let pdu = build_message_4(&[0u8; 32], 2);
-        let zeroed = pdu_with_zeroed_mic(&pdu);
-        assert_eq!(&zeroed[OFF_MIC..OFF_MIC + 16], &[0u8; 16]);
-    }
-
-    #[test]
-    fn reject_non_eapol() {
-        assert!(parse_eapol_key_frame(&[0u8; 20]).is_none());
-    }
 }

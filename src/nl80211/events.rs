@@ -8,10 +8,7 @@ use wl_nl80211::{Nl80211Attr, Nl80211Command};
 
 #[derive(Debug)]
 pub enum WifiEvent {
-    ExternalAuth {
-        bssid: [u8; 6],
-        ssid: String,
-    },
+    ExternalAuth,
     ConnectResult {
         status: u16,
     },
@@ -20,7 +17,6 @@ pub enum WifiEvent {
     },
     Frame {
         frame: Vec<u8>,
-        freq: Option<u32>,
     },
     ControlPortFrame {
         frame: Vec<u8>,
@@ -51,7 +47,7 @@ pub fn parse_event(msg: NetlinkMessage<RawGenlMessage>) -> Option<WifiEvent> {
                     let nl_msg = genl_msg.payload;
                     match nl_msg.cmd {
                         Nl80211Command::ExternalAuth => {
-                            parse_external_auth(&nl_msg)
+                            Some(WifiEvent::ExternalAuth)
                         }
                         Nl80211Command::Connect => {
                             parse_connect_result(&nl_msg)
@@ -89,22 +85,6 @@ pub fn parse_event(msg: NetlinkMessage<RawGenlMessage>) -> Option<WifiEvent> {
         }
         _ => None,
     }
-}
-
-fn parse_external_auth(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
-    let mut bssid = None;
-    let mut ssid = None;
-    for attr in &msg.attributes {
-        match attr {
-            Nl80211Attr::Bssid(addr) => bssid = Some(*addr),
-            Nl80211Attr::Ssid(s) => ssid = Some(s.clone()),
-            _ => {}
-        }
-    }
-    Some(WifiEvent::ExternalAuth {
-        bssid: bssid.unwrap_or([0u8; 6]),
-        ssid: ssid.unwrap_or_default(),
-    })
 }
 
 fn parse_connect_result(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
@@ -161,16 +141,12 @@ fn parse_associate(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
 }
 
 fn parse_frame(msg: &wl_nl80211::Nl80211Message) -> Option<WifiEvent> {
-    let mut frame = None;
-    let mut freq = None;
     for attr in &msg.attributes {
-        match attr {
-            Nl80211Attr::Frame(f) => frame = Some(f.clone()),
-            Nl80211Attr::WiphyFreq(f) => freq = Some(*f),
-            _ => {}
+        if let Nl80211Attr::Frame(f) = attr {
+            return Some(WifiEvent::Frame { frame: f.clone() });
         }
     }
-    frame.map(|f| WifiEvent::Frame { frame: f, freq })
+    None
 }
 
 fn parse_ctrl_port_frame(

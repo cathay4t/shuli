@@ -20,7 +20,7 @@ use wl_nl80211::{
     Nl80211KeyDefaultType, Nl80211KeyType, Nl80211Message,
 };
 
-use crate::ShuliResult;
+use crate::{ErrorKind, WpaError};
 
 const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000F_AC04;
 
@@ -29,7 +29,7 @@ pub async fn install_ptk(
     if_index: u32,
     peer_mac: [u8; 6],
     key_data: &[u8],
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Mac(peer_mac),
@@ -60,7 +60,7 @@ pub async fn install_gtk(
     if_index: u32,
     key_data: &[u8],
     key_index: u8,
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     let attrs = vec![
         Nl80211Attr::IfIndex(if_index),
         Nl80211Attr::Key(vec![
@@ -80,7 +80,7 @@ pub async fn install_gtk(
 async fn send_new_key(
     handle: &Nl80211Handle,
     attrs: Vec<Nl80211Attr>,
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     let mut nl_msg =
         NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
             cmd: Nl80211Command::NewKey,
@@ -94,9 +94,10 @@ async fn send_new_key(
         if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
             && let Some(code) = err.code
         {
-            return Err(crate::ShuliError::HandshakeFailed(format!(
-                "NEW_KEY failed: netlink error {code}"
-            )));
+            return Err(WpaError::new(
+                ErrorKind::HandshakeFailed,
+                format!("NEW_KEY failed: netlink error {code}"),
+            ));
         }
     }
     Ok(())

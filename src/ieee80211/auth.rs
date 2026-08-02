@@ -3,6 +3,10 @@
 /// Build an SAE Authentication frame (commit or confirm).
 /// Returns the full 802.11 management frame (without FCS).
 /// Frame body format per 802.11-2020 §9.3.3.1.
+///
+/// Only used by tests: the client sends SAE via `NL80211_ATTR_AUTH_DATA`
+/// rather than raw management frames.
+#[cfg(test)]
 pub fn build_sae_auth_frame(
     sta_mac: [u8; 6],
     bssid: [u8; 6],
@@ -60,39 +64,4 @@ pub fn parse_sae_auth_frame(full_frame: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
     let status_code = u16::from_le_bytes([body[4], body[5]]);
     let sae_payload = body[6..].to_vec();
     Some((auth_seq, status_code, sae_payload))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_sae_commit_frame() {
-        let sta = [0x02u8; 6];
-        let ap = [0x01u8; 6];
-        let payload = b"0123456789abcdef0123456789abcdef".to_vec();
-        let frame = build_sae_auth_frame(sta, ap, 1, 0, &payload);
-        assert!(frame.len() > 24);
-        let parsed = parse_sae_auth_frame(&frame);
-        assert!(parsed.is_some());
-        let (seq, status, pl) = parsed.unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(status, 0);
-        assert_eq!(pl, payload);
-    }
-
-    #[test]
-    fn parse_wrong_auth_alg() {
-        let frame = build_sae_auth_frame([0u8; 6], [0u8; 6], 1, 0, &[]);
-        // Change auth algorithm to non-SAE
-        let mut modified = frame.clone();
-        modified[24] = 0;
-        modified[25] = 1;
-        assert!(parse_sae_auth_frame(&modified).is_none());
-    }
-
-    #[test]
-    fn parse_too_short() {
-        assert!(parse_sae_auth_frame(&[0u8; 10]).is_none());
-    }
 }

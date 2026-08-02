@@ -13,7 +13,7 @@ use wl_nl80211::{
     Nl80211Message, Nl80211UseMfp,
 };
 
-use crate::ShuliResult;
+use crate::{ErrorKind, WpaError};
 
 /// Send NL80211_CMD_AUTHENTICATE with SAE auth type and auth_data.
 /// The auth_data is the SAE commit frame body (auth_alg=3, auth_seq=1,
@@ -25,7 +25,7 @@ pub async fn authenticate_sae_commit(
     bssid: [u8; 6],
     freq_mhz: u32,
     auth_data: &[u8],
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     // Mirror wpa_supplicant's minimal NL80211_CMD_AUTHENTICATE attribute set
     // for the mac80211 SME-in-userspace path. Extra RSN/cipher attributes are
     // only valid for ASSOCIATE/CONNECT and confuse this command.
@@ -51,7 +51,7 @@ pub async fn authenticate_sae_confirm(
     bssid: [u8; 6],
     freq_mhz: u32,
     confirm_hash: &[u8],
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     // auth_data = trans(2 LE=2) || status(2 LE=0) || send_confirm(2 LE=1)
     //             || confirm_hash(32)
     let mut auth_data = Vec::with_capacity(6 + confirm_hash.len());
@@ -79,7 +79,7 @@ pub async fn associate(
     ssid: &str,
     bssid: [u8; 6],
     freq_mhz: u32,
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     // Build the RSNE + RSNXE exactly as they appear in 4-way handshake
     // Message 2 so the AP's consistency check passes.
     let ie_buf = crate::ieee80211::elements::sae_ie();
@@ -103,7 +103,7 @@ async fn send_nl80211_cmd(
     handle: &Nl80211Handle,
     cmd: Nl80211Command,
     attrs: Vec<Nl80211Attr>,
-) -> ShuliResult<()> {
+) -> Result<(), WpaError> {
     let mut nl_msg =
         NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
             cmd,
@@ -119,9 +119,10 @@ async fn send_nl80211_cmd(
         if let netlink_packet_core::NetlinkPayload::Error(ref err) = msg.payload
             && let Some(code) = err.code
         {
-            return Err(crate::ShuliError::ConnectFailed(format!(
-                "{cmd:?} failed: netlink error {code}"
-            )));
+            return Err(WpaError::new(
+                ErrorKind::ConnectFailed,
+                format!("{cmd:?} failed: netlink error {code}"),
+            ));
         }
         log::debug!("nl80211 cmd response: {msg:?}");
     }
