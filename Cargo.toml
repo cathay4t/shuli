@@ -19,14 +19,18 @@ serde_yaml = "0.9"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 futures = "0.3"
-wl-nl80211 = { path = "../netlink/wl-nl80211" }
 netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 genetlink = "0.2"
 netlink-proto = "0.12"
 netlink-sys = "0.8"
-rtnetlink = { path = "../netlink/rtnetlink" }
 netlink-packet-route = { path = "../netlink/netlink-packet-route" }
 mozim = { path = "../mozim", default-features = false, features = ["netlink"] }
 p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field", "ecdh"] }
 aws-lc-rs = "1"
+
+[workspace.dependencies.rtnetlink]
+git = "https://github.com/rust-netlink/rtnetlink"
+
+[workspace.dependencies.wl-nl80211]
+git = "https://github.com/rust-netlink/wl-nl80211"
