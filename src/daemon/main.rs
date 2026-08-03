@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod config;
+mod dhcp;
 mod ip;
 
 use std::{path::Path, process::ExitCode};
@@ -79,12 +80,10 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
                                 log::info!(
                                     "connection established - link up"
                                 );
-                                // Apply static IP config.
-                                if let Err(e) = ip::apply_ip_config(
+                                // Apply IP config: static or DHCP.
+                                if let Err(e) = apply_network_config(
                                     &iface_name,
-                                    wifi_entry.ipv4.as_ref(),
-                                    wifi_entry.ipv6.as_ref(),
-                                    wifi_entry.dns.as_ref(),
+                                    wifi_entry,
                                 )
                                 .await
                                 {
@@ -156,4 +155,40 @@ async fn resolve_iface_name(
         shuli::ErrorKind::InterfaceNotFound,
         "no wifi interface found",
     ))
+}
+
+/// Apply network configuration after WiFi connection: static IP,
+/// DHCP, and/or IPv6 RA depending on the config.
+async fn apply_network_config(
+    iface_name: &str,
+    wifi_entry: &config::WifiEntry,
+) -> Result<(), shuli::WifiError> {
+    let mut dns = wifi_entry.dns.clone();
+
+    // IPv4: static or DHCP.
+    if let Some(ref ipv4) = wifi_entry.ipv4
+        && ipv4.auto
+    {
+        let lease_dns = dhcp::run_dhcpv4(iface_name).await?;
+        if dns.is_none() {
+            dns = lease_dns;
+        }
+    }
+
+    // IPv6: enable RA (SLAAC) when auto.
+    if let Some(ref ipv6) = wifi_entry.ipv6
+        && ipv6.auto
+    {
+        dhcp::enable_ipv6_ra(iface_name)?;
+    }
+
+    // Apply static IP config (addresses/gateway for non-auto, and
+    // DNS from either config or DHCP lease).
+    ip::apply_ip_config(
+        iface_name,
+        wifi_entry.ipv4.as_ref(),
+        wifi_entry.ipv6.as_ref(),
+        dns.as_ref(),
+    )
+    .await
 }

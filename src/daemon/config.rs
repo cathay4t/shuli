@@ -38,7 +38,7 @@ pub(crate) struct WifiEntry {
     pub ipv6: Option<IpConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct DnsConfig {
     #[serde(default)]
     pub nameservers: Vec<String>,
