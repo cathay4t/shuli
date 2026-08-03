@@ -31,12 +31,11 @@ def shulid_connection(wifi_env):
 
     with open(SHULI_CONFIG, "w") as fd:
         fd.write(f"""---
-interfaces:
-  - name: {TEST_NIC}
-    type: wifi-phy
-    wifi:
-      ssid: {TEST_WIFI_SSID}
-      password: "{TEST_WIFI_PSK}"
+version: 1
+wifis:
+  - ssid: {TEST_WIFI_SSID}
+    password: "{TEST_WIFI_PSK}"
+    interface: {TEST_NIC}
 """)
 
     log_f = open(SHULI_LOG, "w")

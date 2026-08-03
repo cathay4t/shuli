@@ -122,11 +122,10 @@ def shulid_open_connection(wifi_env_open):
 
     with open(SHULI_OPEN_CONFIG, "w") as fd:
         fd.write(f"""---
-interfaces:
-  - name: {TEST_NIC}
-    type: wifi-phy
-    wifi:
-      ssid: {OPEN_SSID}
+version: 1
+wifis:
+  - ssid: {OPEN_SSID}
+    interface: {TEST_NIC}
 """)
 
     log_f = open(SHULI_OPEN_LOG, "w")

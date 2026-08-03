@@ -122,12 +122,11 @@ def shulid_wpa2_connection(wifi_env_wpa2):
 
     with open(SHULI_WPA2_CONFIG, "w") as fd:
         fd.write(f"""---
-interfaces:
-  - name: {TEST_NIC}
-    type: wifi-phy
-    wifi:
-      ssid: {WPA2_SSID}
-      password: "{WPA2_PSK}"
+version: 1
+wifis:
+  - ssid: {WPA2_SSID}
+    password: "{WPA2_PSK}"
+    interface: {TEST_NIC}
 """)
 
     log_f = open(SHULI_WPA2_LOG, "w")

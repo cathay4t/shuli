@@ -139,11 +139,10 @@ def shulid_owe_connection(wifi_env_owe):
 
     with open(SHULI_OWE_CONFIG, "w") as fd:
         fd.write(f"""---
-interfaces:
-  - name: {TEST_NIC}
-    type: wifi-phy
-    wifi:
-      ssid: {OWE_SSID}
+version: 1
+wifis:
+  - ssid: {OWE_SSID}
+    interface: {TEST_NIC}
 """)
 
     log_f = open(SHULI_OWE_LOG, "w")

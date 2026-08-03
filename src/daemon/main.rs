@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod config;
+mod ip;
 
 use std::{path::Path, process::ExitCode};
 
@@ -16,7 +17,7 @@ const DEFAULT_CONFIG: &str = "/etc/shuli/config.yml";
 #[tokio::main]
 async fn main() -> ExitCode {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("trace"),
+        env_logger::Env::default().default_filter_or("info"),
     )
     .init();
 
@@ -35,12 +36,17 @@ async fn main() -> ExitCode {
 
 async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     let shuli_config = ShuliConfig::load(config_path)?;
-    let wifi_config = shuli_config.to_wifi_config()?;
-    log::info!(
-        "shulid: iface={}, ssid={}",
-        wifi_config.iface_name,
-        wifi_config.ssid
-    );
+    let wifi_entry = shuli_config.wifis.first().ok_or_else(|| {
+        shuli::WifiError::new(
+            shuli::ErrorKind::InvalidConfig,
+            "no wifis in config",
+        )
+    })?;
+
+    let iface_name =
+        resolve_iface_name(wifi_entry.interface.as_deref()).await?;
+    let wifi_config = wifi_entry.to_wifi_config(&iface_name);
+    log::info!("shulid: iface={iface_name}, ssid={}", wifi_entry.ssid);
 
     let mut client = WifiClient::init(wifi_config).await?;
     let mut connected = false;
@@ -71,8 +77,22 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
                             if !connected {
                                 connected = true;
                                 log::info!(
-                                    "connection established - link up, \
-                                     holding (Ctrl-C to disconnect)"
+                                    "connection established - link up"
+                                );
+                                // Apply static IP config.
+                                if let Err(e) = ip::apply_ip_config(
+                                    &iface_name,
+                                    wifi_entry.ipv4.as_ref(),
+                                    wifi_entry.ipv6.as_ref(),
+                                    wifi_entry.dns.as_ref(),
+                                )
+                                .await
+                                {
+                                    log::warn!("IP config failed: {e}");
+                                }
+                                log::info!(
+                                    "holding connection \
+                                     (Ctrl-C to disconnect)"
                                 );
                             }
                         }
@@ -104,4 +124,36 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
             "shutdown before connection established",
         ))
     }
+}
+
+/// Resolve the interface name.  `"any"` or absent picks the first
+/// available wifi interface via nispor.
+async fn resolve_iface_name(
+    interface: Option<&str>,
+) -> Result<String, shuli::WifiError> {
+    if let Some(name) = interface
+        && name != "any"
+    {
+        return Ok(name.to_string());
+    }
+    // Find the first wifi interface.
+    let mut filter = nispor::NetStateFilter::minimum();
+    filter.iface = Some(nispor::NetStateIfaceFilter::minimum());
+    let np_state = nispor::NetState::retrieve_with_filter_async(&filter)
+        .await
+        .map_err(|e| {
+            shuli::WifiError::new(
+                shuli::ErrorKind::Nl80211,
+                format!("nispor: {e}"),
+            )
+        })?;
+    for np_iface in np_state.ifaces.values() {
+        if np_iface.iface_type == nispor::IfaceType::Wifi {
+            return Ok(np_iface.name.to_string());
+        }
+    }
+    Err(shuli::WifiError::new(
+        shuli::ErrorKind::InterfaceNotFound,
+        "no wifi interface found",
+    ))
 }

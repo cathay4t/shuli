@@ -3,34 +3,65 @@
 //! Daemon-level configuration with serde support.
 //!
 //! `ShuliConfig` is deserialized from the YAML config file
-//! (`/etc/shuli/config.yml` or `$1`).  It is converted into the
-//! lib's `WifiConfig` before being passed to `WifiClient`.
+//! (`/etc/shuli/config.yml` or `$1`).  It targets small systems
+//! that don't run nipart: full static or full dynamic (DHCP).
 
 use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
-use shuli::{ErrorKind, WifiConfig, WifiError};
+use shuli::{ErrorKind, WifiError};
 
-/// Top-level daemon configuration (YAML), compatible with the nipart
-/// `wifi-phy` interface schema.
+/// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShuliConfig {
     #[serde(default)]
-    pub interfaces: Vec<InterfaceConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct InterfaceConfig {
-    pub name: String,
+    pub version: u32,
     #[serde(default)]
-    pub wifi: Option<WifiSection>,
+    pub wifis: Vec<WifiEntry>,
 }
 
+/// A single WiFi network entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WifiSection {
+pub(crate) struct WifiEntry {
     pub ssid: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Interface name to bind to.  `"any"` (or absent) picks the
+    /// first available wifi interface.
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
+    #[serde(default)]
+    pub ipv4: Option<IpConfig>,
+    #[serde(default)]
+    pub ipv6: Option<IpConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DnsConfig {
+    #[serde(default)]
+    pub nameservers: Vec<String>,
+    #[serde(default)]
+    pub searches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpConfig {
+    /// `true` = DHCP / auto-config, `false` = full static.
+    #[serde(default)]
+    pub auto: bool,
+    #[serde(default)]
+    pub address: Vec<IpAddress>,
+    #[serde(default)]
+    pub gateway: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpAddress {
+    pub ip: String,
+    #[serde(rename = "prefix-length")]
+    pub prefix_length: u8,
 }
 
 impl ShuliConfig {
@@ -48,20 +79,15 @@ impl ShuliConfig {
             })?;
         Ok(config)
     }
+}
 
-    /// Convert the first interface's wifi section into a lib
-    /// `WifiConfig`.
-    pub(crate) fn to_wifi_config(&self) -> Result<WifiConfig, WifiError> {
-        let iface = self.interfaces.first().ok_or_else(|| {
-            WifiError::new(ErrorKind::InvalidConfig, "no interfaces")
-        })?;
-        let wifi = iface.wifi.as_ref().ok_or_else(|| {
-            WifiError::new(ErrorKind::InvalidConfig, "no wifi config")
-        })?;
-        let mut config = WifiConfig::new(&iface.name, &wifi.ssid);
-        if let Some(ref password) = wifi.password {
+impl WifiEntry {
+    /// Convert to the lib's `WifiConfig`.
+    pub(crate) fn to_wifi_config(&self, iface_name: &str) -> shuli::WifiConfig {
+        let mut config = shuli::WifiConfig::new(iface_name, &self.ssid);
+        if let Some(ref password) = self.password {
             config.set_password(password);
         }
-        Ok(config)
+        config
     }
 }

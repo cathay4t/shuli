@@ -25,5 +25,7 @@ netlink-packet-generic = "0.4"
 genetlink = "0.2"
 netlink-proto = "0.12"
 netlink-sys = "0.8"
+rtnetlink = { path = "../netlink/rtnetlink" }
+netlink-packet-route = { path = "../netlink/netlink-packet-route" }
 p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field", "ecdh"] }
 aws-lc-rs = "1"

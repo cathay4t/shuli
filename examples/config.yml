@@ -1,7 +1,33 @@
+# Shulid is targeting small system which don't want to run Nipart for
+# full feature network management. Hence we only provides the suppport
+# of most-common use case: full static and full dynamic.
 ---
-interfaces:
-  - name: wlan0
-    type: wifi-phy
-    wifi:
-      ssid: Test-WIFI
-      password: "12345678"
+version: 1
+wifis:
+  - ssid: Test-WIFI
+    password: "12345678"
+    dns:
+      nameservers:
+        - 2001:db8:1::254
+        - 192.0.2.1
+      searches:
+        - example.org
+        - example.net
+    ipv4:
+      auto: false # full static configuration
+      address:
+        - ip: 192.0.2.251
+          prefix-length: 24
+      gateway: 192.0.2.1
+    ipv6:
+      auto: false
+      address:
+        - ip: 2001:db8:1::1
+          prefix-length: 64
+      gateway: 2001:db8:1::254
+  - ssid: Test-WIFI-OPEN
+    interface: any
+    ipv4:
+      auto: true
+    ipv6:
+      auto: true
