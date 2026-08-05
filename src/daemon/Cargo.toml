@@ -18,7 +18,6 @@ env_logger.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 rtnetlink.workspace = true
-netlink-packet-route.workspace = true
 futures.workspace = true
 mozim.workspace = true
 nispor = "2"

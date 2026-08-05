@@ -30,7 +30,7 @@ p256 = { version = "0.13", features = ["arithmetic", "hash2curve", "expose-field
 aws-lc-rs = "1"
 
 [workspace.dependencies.rtnetlink]
-git = "https://github.com/rust-netlink/rtnetlink"
+version = "0.21"
 
 [workspace.dependencies.wl-nl80211]
 version = "0.5"
