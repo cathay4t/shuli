@@ -5,13 +5,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "shulid"
 path = "main.rs"
 
 [dependencies]
-shuli = { path = "../lib" }
+shuli = { version = "0.1", path = "../lib" }
 tokio.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -20,4 +23,4 @@ serde_yaml.workspace = true
 rtnetlink.workspace = true
 futures.workspace = true
 mozim.workspace = true
-nispor = "2"
+nispor.workspace = true
