@@ -10,7 +10,7 @@
 
 use crate::{
     ETH_ALEN, ErrorKind, WifiClient, WifiError, crypto::sae::SaeAuth,
-    nl80211::auth_assoc, scan::SecurityType,
+    scan::SecurityType,
 };
 
 /// What the client should do after processing an authentication frame.
@@ -166,12 +166,14 @@ impl WifiClient {
                 "open-system AUTHENTICATE ({:?} network)",
                 self.bss_info.security
             );
-            return auth_assoc::authenticate_open(
-                &self.handle,
-                self.if_index,
-                &self.config.ssid,
-                self.bss_info.bssid,
-                self.bss_info.freq_mhz,
+            let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
+                .ssid(&self.config.ssid)
+                .mac(self.bss_info.bssid)
+                .frequency(self.bss_info.freq_mhz)
+                .auth_type(wl_nl80211::Nl80211AuthType::OpenSystem)
+                .build();
+            return crate::client::drain_request(
+                self.conn_handle.authenticate(attrs).execute().await,
             )
             .await;
         }
@@ -190,13 +192,16 @@ impl WifiClient {
         )?);
 
         let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
-        auth_assoc::authenticate_sae_commit(
-            &self.handle,
-            self.if_index,
-            &self.config.ssid,
-            self.bss_info.bssid,
-            self.bss_info.freq_mhz,
-            &auth_data,
+        let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
+            .ssid(&self.config.ssid)
+            .mac(self.bss_info.bssid)
+            .frequency(self.bss_info.freq_mhz)
+            .auth_type(wl_nl80211::Nl80211AuthType::Sae)
+            // NL80211_ATTR_AUTH_DATA: SAE commit (trans||status||body)
+            .auth_data(auth_data)
+            .build();
+        crate::client::drain_request(
+            self.conn_handle.authenticate(attrs).execute().await,
         )
         .await
     }

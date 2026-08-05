@@ -1,17 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests for [`WifiClient::run()`] against real
-//! mac80211_hwsim radios + hostapd.  These require root and are
-//! marked `#[ignore]` — run with `cargo test -- --ignored`.
+//! mac80211_hwsim radios + hostapd.
 //!
-//! A process-level [`Mutex`] serialises all tests that touch the
-//! shared hwsim hardware (same pattern as iproute-rs wwan tests).
+//! These tests are fully self-contained: [`WifiTestEnv::setup`] provisions
+//! the virtual radios (`modprobe mac80211_hwsim radios=2`), moves one radio
+//! into a dedicated network namespace, starts `hostapd` there, and [`Drop`]
+//! tears everything down again afterwards (hostapd, netns, module). No
+//! manual environment preparation is needed.
+//!
+//! They require root (they touch the kernel wifi stack) and are skipped
+//! with a message when the test process is not running as root — run them
+//! with `sudo -E cargo test --workspace`. A process-level [`Mutex`]
+//! serialises all tests that touch the shared hwsim hardware (same pattern
+//! as iproute-rs wwan tests).
+//!
+//! A stray wifi daemon on the node (wpa_supplicant, NetworkManager, iwd)
+//! will grab the fresh hwsim radios, run its own scans / connect them, and
+//! make the client's first scan fail with "Device or resource busy" — stop
+//! such daemons before running these tests.
+//!
+//! Set `RUST_LOG=info` (or `debug`) to get the client's `log` output while
+//! debugging.
 
 use std::sync::Mutex;
 
 use crate::{WifiClient, WifiConfig, WifiState};
 
 static WIFI_LOCK: Mutex<()> = Mutex::new(());
+
+/// Initialise `env_logger` once per test process when `RUST_LOG` is set.
+/// Defaults to `trace` so the full client flow is captured and printed by
+/// the test harness when a test fails.
+pub fn init_logger() {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("trace"),
+    )
+    .try_init();
+}
 
 const HWSIM0_PERM_MAC: &str = "02:00:00:00:00:00";
 const HWSIM1_PERM_MAC: &str = "02:00:00:00:01:00";
@@ -26,33 +52,35 @@ struct WifiTestEnv {
 
 impl WifiTestEnv {
     fn setup(hostapd_conf: &str) -> Self {
-        sh("modprobe -r mac80211_hwsim");
-        sh(&format!("ip netns del {TEST_NS}"));
-        sh(&format!("ip netns add {TEST_NS}"));
-        sh("modprobe mac80211_hwsim radios=2");
+        // Pre-clean leftovers from a previous crashed run.
+        sh_allow_fail("modprobe -r mac80211_hwsim");
+        sh_allow_fail(&format!("ip netns del {TEST_NS}"));
+
+        sh_ok(&format!("ip netns add {TEST_NS}"));
+        sh_ok("modprobe mac80211_hwsim radios=2");
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         let nic0 = find_nic_by_mac(HWSIM0_PERM_MAC).expect("hwsim NIC 0");
         let nic1 = find_nic_by_mac(HWSIM1_PERM_MAC).expect("hwsim NIC 1");
         if nic0 != TEST_NIC {
-            sh(&format!("ip link set {nic0} name {TEST_NIC}"));
+            sh_ok(&format!("ip link set {nic0} name {TEST_NIC}"));
         }
         if nic1 != AP_NIC {
-            sh(&format!("ip link set {nic1} name {AP_NIC}"));
+            sh_ok(&format!("ip link set {nic1} name {AP_NIC}"));
         }
 
         let phy = get_phy_id(AP_NIC);
-        sh(&format!("iw phy#{phy} set netns name {TEST_NS}"));
-        sh(&format!("ip link set {TEST_NIC} up"));
-        sh(&format!("ip netns exec {TEST_NS} ip link set {AP_NIC} up"));
-        sh(&format!(
+        sh_ok(&format!("iw phy#{phy} set netns name {TEST_NS}"));
+        sh_ok(&format!("ip link set {TEST_NIC} up"));
+        sh_ok(&format!("ip netns exec {TEST_NS} ip link set {AP_NIC} up"));
+        sh_ok(&format!(
             "ip netns exec {TEST_NS} ip addr add {AP_IP}/24 dev {AP_NIC}"
         ));
 
         let conf_path = "/tmp/shuli_rs_test_hostapd.conf";
         std::fs::write(conf_path, hostapd_conf).expect("write hostapd conf");
         let pid_path = "/tmp/shuli_rs_test_hostapd.pid";
-        sh(&format!(
+        sh_ok(&format!(
             "ip netns exec {TEST_NS} hostapd -B -P {pid_path} {conf_path}"
         ));
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -68,10 +96,16 @@ impl WifiTestEnv {
 impl Drop for WifiTestEnv {
     fn drop(&mut self) {
         if let Some(ref pid) = self.hostapd_pid {
-            sh(&format!("kill {pid}"));
+            sh_allow_fail(&format!("kill {pid}"));
         }
-        sh(&format!("ip netns del {TEST_NS}"));
-        sh("modprobe -r mac80211_hwsim");
+        sh_allow_fail(&format!("ip netns del {TEST_NS}"));
+        // The STA radio stays in the default netns and would pin the module
+        // (rmmod fails with "resource busy" while it exists), so remove it
+        // before unloading.
+        sh_allow_fail(&format!("ip link del {TEST_NIC}"));
+        sh_allow_fail("modprobe -r mac80211_hwsim");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_hostapd.conf");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_hostapd.pid");
     }
 }
 
@@ -120,9 +154,20 @@ async fn run_until_connected(
 }
 
 #[tokio::test]
-#[ignore = "requires root + mac80211_hwsim"]
 async fn wifi_client_open_connect() {
-    let _guard = WIFI_LOCK.lock().unwrap();
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_open_connect: requires root to \
+             self-provision mac80211_hwsim + hostapd; run `sudo -E cargo test \
+             --workspace`"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK
+        .lock()
+        // Recover from a previous test that panicked while holding the lock.
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
 
     let config = WifiConfig::new(TEST_NIC, "Test-WIFI-NOPASS");
@@ -137,9 +182,20 @@ async fn wifi_client_open_connect() {
 }
 
 #[tokio::test]
-#[ignore = "requires root + mac80211_hwsim"]
 async fn wifi_client_sae_connect() {
-    let _guard = WIFI_LOCK.lock().unwrap();
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_connect: requires root to \
+             self-provision mac80211_hwsim + hostapd; run `sudo -E cargo test \
+             --workspace`"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK
+        .lock()
+        // Recover from a previous test that panicked while holding the lock.
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
 
     let mut config = WifiConfig::new(TEST_NIC, "Test-WIFI");
@@ -156,7 +212,37 @@ async fn wifi_client_sae_connect() {
 
 // --- helpers ---
 
-fn sh(cmd: &str) {
+/// Whether the test process runs with root privileges (needed to touch the
+/// kernel wifi stack: modprobe, netns, nl80211 connection commands).
+fn is_root() -> bool {
+    std::process::Command::new("id")
+        .args(["-u"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+/// Run a command that must succeed; panic with the failure otherwise so a
+/// broken environment never silently masquerades as a passing test.
+fn sh_ok(cmd: &str) {
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .expect("spawn shell");
+    assert!(
+        out.status.success(),
+        "command failed ({cmd}) status={:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Run a best-effort command (pre-cleanup / teardown); failures are ignored
+/// because the target may legitimately not exist (e.g. `modprobe -r` when the
+/// module is already unloaded).
+fn sh_allow_fail(cmd: &str) {
     let _ = std::process::Command::new("bash")
         .arg("-c")
         .arg(cmd)

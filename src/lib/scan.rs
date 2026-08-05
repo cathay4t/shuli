@@ -3,6 +3,8 @@
 //! Scan flow: trigger a scan, wait for results, then pick the strongest BSS
 //! matching the configured SSID.
 
+use futures::TryStreamExt;
+
 use crate::{
     ETH_ALEN, ErrorKind, WifiClient, WifiError,
     nl80211::scan::{
@@ -10,8 +12,6 @@ use crate::{
         extract_ssid_from_ies, get_scan_results, trigger_scan,
     },
 };
-
-use futures::TryStreamExt;
 
 const SCAN_SLEEP_SECS: u64 = 3;
 

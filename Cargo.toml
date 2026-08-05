@@ -33,4 +33,4 @@ aws-lc-rs = "1"
 git = "https://github.com/rust-netlink/rtnetlink"
 
 [workspace.dependencies.wl-nl80211]
-git = "https://github.com/rust-netlink/wl-nl80211"
+version = "0.5"

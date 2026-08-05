@@ -3,7 +3,7 @@
 // NL80211_CMD_CONNECT / DISCONNECT helpers.
 //
 // The connection path used by the client is AUTHENTICATE + ASSOCIATE (see
-// `auth_assoc.rs`); CONNECT is only used here to tear down a connection.
+// `client.rs`); CONNECT is only used here to tear down a connection.
 
 use futures::TryStreamExt;
 use wl_nl80211::Nl80211ConnectionHandle;

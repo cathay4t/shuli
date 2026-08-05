@@ -10,7 +10,12 @@
 //! (SAE today, WPA2/EAP later) in `auth.rs`, and nl80211 details in `nl80211/`.
 
 use futures::{StreamExt, TryStreamExt};
-use wl_nl80211::{Nl80211Attr, Nl80211ConnectionHandle, Nl80211Handle};
+use wl_nl80211::{
+    Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
+    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Event,
+    Nl80211EventCode, Nl80211Handle, Nl80211Key, Nl80211MulticastGroup,
+    Nl80211RekeyOffload, Nl80211UseMfp,
+};
 
 use crate::{
     ETH_ALEN, ErrorKind, WifiError,
@@ -21,11 +26,7 @@ use crate::{
         owe::{self, OweAuth},
     },
     ieee80211::{auth, eapol, elements},
-    nl80211::{
-        auth_assoc, connect,
-        events::{WifiEvent, parse_event},
-        keys,
-    },
+    nl80211::connect,
     scan::{BssInfo, SecurityType},
 };
 
@@ -83,15 +84,17 @@ impl WifiClient {
     /// Validate the configuration by checking the WiFi PHY interface exists,
     /// then open the nl80211 connection and join the event multicast groups.
     pub async fn init(config: WifiConfig) -> Result<Self, WifiError> {
-        let (mut conn, handle, event_receiver) = wl_nl80211::new_connection()
-            .map_err(|e| {
-            WifiError::new(ErrorKind::Config, e.to_string())
-        })?;
-
-        if let Err(e) = crate::nl80211::mcast::join_multicast_groups(&mut conn)
-        {
-            log::warn!("multicast join: {e}");
-        }
+        // One socket for everything: it issues commands (and owns the
+        // connection, so the kernel unicasts EAPOL control-port frames to
+        // it) and is joined to the event multicast groups. A dedicated
+        // event-only socket would miss those unicast EAPOL frames.
+        let (conn, handle, event_receiver) =
+            wl_nl80211::new_multicast_connection(&[
+                Nl80211MulticastGroup::Scan,
+                Nl80211MulticastGroup::Mlme,
+                Nl80211MulticastGroup::Config,
+            ])
+            .map_err(|e| WifiError::new(ErrorKind::Config, e.to_string()))?;
         tokio::spawn(conn);
 
         let (if_index, mac) =
@@ -158,7 +161,9 @@ impl WifiClient {
                 .await;
                 match timed {
                     Ok(Some((raw_msg, _addr))) => {
-                        if let Some(event) = parse_event(raw_msg) {
+                        if let Some(event) =
+                            wl_nl80211::Nl80211Event::parse(raw_msg)
+                        {
                             self.handle_event(event).await;
                         }
                     }
@@ -180,7 +185,9 @@ impl WifiClient {
                 // handled while the connection stays up.
                 match self.event_receiver.next().await {
                     Some((raw_msg, _addr)) => {
-                        if let Some(event) = parse_event(raw_msg) {
+                        if let Some(event) =
+                            wl_nl80211::Nl80211Event::parse(raw_msg)
+                        {
                             self.handle_event(event).await;
                         }
                     }
@@ -206,17 +213,17 @@ impl WifiClient {
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: WifiEvent) {
+    async fn handle_event(&mut self, event: Nl80211Event) {
         match event {
-            WifiEvent::Frame { frame } => {
+            Nl80211Event::Frame { frame } => {
                 self.handle_auth_frame(&frame).await;
             }
 
-            WifiEvent::Authenticated { status, auth_frame } => {
+            Nl80211Event::Authenticated { status, frame } => {
                 if self.bss_info.security != SecurityType::Sae {
                     // Open-system auth (open + OWE): no frame, just
                     // a status.
-                    if status == 0 {
+                    if status == Nl80211EventCode::Success {
                         if self.bss_info.security == SecurityType::Owe {
                             // OWE: associate with DH element.
                             let owe_auth = OweAuth::new();
@@ -226,16 +233,10 @@ impl WifiClient {
                                 "open-system AUTHENTICATE ok - sending OWE \
                                  ASSOCIATE"
                             );
-                            if let Err(e) = auth_assoc::associate_owe(
-                                &self.handle,
-                                self.if_index,
-                                &self.config.ssid,
-                                self.bss_info.bssid,
-                                self.bss_info.freq_mhz,
-                                &dh_elem,
-                            )
-                            .await
-                            {
+                            let mut ie_buf = elements::owe_ie();
+                            ie_buf.extend_from_slice(&dh_elem);
+                            log::debug!("associate OWE IE: {ie_buf:02x?}");
+                            if let Err(e) = self.associate(ie_buf, true).await {
                                 log::warn!("OWE ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
                             }
@@ -247,14 +248,9 @@ impl WifiClient {
                                 "open-system AUTHENTICATE ok - sending \
                                  WPA2-PSK ASSOCIATE"
                             );
-                            if let Err(e) = auth_assoc::associate_wpa2_psk(
-                                &self.handle,
-                                self.if_index,
-                                &self.config.ssid,
-                                self.bss_info.bssid,
-                                self.bss_info.freq_mhz,
-                            )
-                            .await
+                            if let Err(e) = self
+                                .associate(elements::wpa2_psk_ie(), false)
+                                .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
@@ -265,14 +261,8 @@ impl WifiClient {
                                 "open-system AUTHENTICATE ok - sending \
                                  ASSOCIATE"
                             );
-                            if let Err(e) = auth_assoc::associate_open(
-                                &self.handle,
-                                self.if_index,
-                                &self.config.ssid,
-                                self.bss_info.bssid,
-                                self.bss_info.freq_mhz,
-                            )
-                            .await
+                            if let Err(e) =
+                                self.associate(Vec::new(), false).await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
@@ -284,11 +274,11 @@ impl WifiClient {
                         );
                         self.state = WifiState::Failed;
                     }
-                } else if let Some(frame) = auth_frame {
+                } else if let Some(frame) = frame {
                     // SAE: the auth frame carries the AP's commit
                     // (transaction 1) or confirm (transaction 2).
                     self.handle_auth_frame(&frame).await;
-                } else if status != 0 {
+                } else if status != Nl80211EventCode::Success {
                     log::warn!("AUTHENTICATE failed: status={status}");
                     self.state = WifiState::FailedAuthentication;
                 } else {
@@ -296,8 +286,8 @@ impl WifiClient {
                 }
             }
 
-            WifiEvent::Associated { status, ies } => {
-                if status == 0 {
+            Nl80211Event::Associated { status, ies } => {
+                if status == Nl80211EventCode::Success {
                     if self.bss_info.security == SecurityType::Open {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
@@ -321,8 +311,8 @@ impl WifiClient {
                 }
             }
 
-            WifiEvent::ConnectResult { status } => {
-                if status == 0 {
+            Nl80211Event::ConnectResult { status } => {
+                if status == Nl80211EventCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
                     );
@@ -332,28 +322,33 @@ impl WifiClient {
                 }
             }
 
-            WifiEvent::ControlPortFrame { frame } => {
+            Nl80211Event::ControlPortFrame { frame } => {
                 self.handle_control_port_frame(&frame).await;
             }
 
-            WifiEvent::PortAuthorized => {
+            Nl80211Event::PortAuthorized => {
                 log::info!("PORT_AUTHORIZED - connection ready");
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
 
-            WifiEvent::Disconnect { reason } => {
+            Nl80211Event::Disconnect { reason } => {
                 log::warn!("DISCONNECT: reason={reason}");
                 self.state = WifiState::Failed;
             }
 
-            WifiEvent::ScanStart | WifiEvent::NewScanResults => {
+            Nl80211Event::ScanStart | Nl80211Event::NewScanResults => {
                 log::debug!("scan event: {event:?}");
             }
-            WifiEvent::ExternalAuth => {
+            Nl80211Event::ExternalAuth => {
                 log::debug!("EXTERNAL_AUTH event (unsupported in this mode)");
             }
-            WifiEvent::Unknown { cmd } => {
+            Nl80211Event::Unknown { cmd } => {
                 log::debug!("event: {cmd:?}");
+            }
+            // `Nl80211Event` is #[non_exhaustive]; keep future variants
+            // from silently wedging the state machine.
+            _ => {
+                log::debug!("unhandled nl80211 event: {event:?}");
             }
         }
     }
@@ -391,13 +386,23 @@ impl WifiClient {
         match action {
             AuthAction::Continue => {}
             AuthAction::SendConfirm(confirm) => {
-                if let Err(e) = auth_assoc::authenticate_sae_confirm(
-                    &self.handle,
-                    self.if_index,
-                    &self.config.ssid,
-                    self.bss_info.bssid,
-                    self.bss_info.freq_mhz,
-                    &confirm,
+                // auth_data = trans(2 LE=2) || status(2 LE=0)
+                //             || send_confirm(2 LE=1) || confirm_hash(32)
+                let mut auth_data = Vec::with_capacity(6 + confirm.len());
+                auth_data.extend_from_slice(&2u16.to_le_bytes());
+                auth_data.extend_from_slice(&0u16.to_le_bytes());
+                auth_data.extend_from_slice(&1u16.to_le_bytes());
+                auth_data.extend_from_slice(&confirm);
+
+                let attrs = Nl80211Authenticate::new(self.if_index)
+                    .ssid(&self.config.ssid)
+                    .mac(self.bss_info.bssid)
+                    .frequency(self.bss_info.freq_mhz)
+                    .auth_type(Nl80211AuthType::Sae)
+                    .auth_data(auth_data)
+                    .build();
+                if let Err(e) = drain_request(
+                    self.conn_handle.authenticate(attrs).execute().await,
                 )
                 .await
                 {
@@ -409,15 +414,7 @@ impl WifiClient {
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
-                if let Err(e) = auth_assoc::associate(
-                    &self.handle,
-                    self.if_index,
-                    &self.config.ssid,
-                    self.bss_info.bssid,
-                    self.bss_info.freq_mhz,
-                )
-                .await
-                {
+                if let Err(e) = self.associate(elements::sae_ie(), true).await {
                     log::warn!("ASSOCIATE failed: {e}");
                     self.state = WifiState::Failed;
                 }
@@ -519,7 +516,7 @@ impl WifiClient {
                 }
             };
             if let Err(e) = send_ctrl_port_frame(
-                &self.handle,
+                &mut self.conn_handle,
                 self.if_index,
                 self.bss_info.bssid,
                 &msg2,
@@ -559,7 +556,7 @@ impl WifiClient {
             };
 
             if let Err(e) = send_ctrl_port_frame(
-                &self.handle,
+                &mut self.conn_handle,
                 self.if_index,
                 self.bss_info.bssid,
                 &msg4,
@@ -573,11 +570,18 @@ impl WifiClient {
             log::info!("4-way: Message 4 sent");
 
             if let Some(tk) = self.fourway.as_ref().and_then(|fw| fw.tk()) {
-                if let Err(e) = keys::install_ptk(
-                    &self.handle,
-                    self.if_index,
-                    self.bss_info.bssid,
-                    &tk,
+                if let Err(e) = drain_request(
+                    self.conn_handle
+                        .new_key(
+                            Nl80211Key::new_ptk(
+                                self.if_index,
+                                self.bss_info.bssid,
+                                tk.to_vec(),
+                            )
+                            .build(),
+                        )
+                        .execute()
+                        .await,
                 )
                 .await
                 {
@@ -591,11 +595,18 @@ impl WifiClient {
             if let Some(ref gtk_data) = gtk {
                 let gtk_idx =
                     self.fourway.as_ref().map(|fw| fw.gtk_index()).unwrap_or(0);
-                if let Err(e) = keys::install_gtk(
-                    &self.handle,
-                    self.if_index,
-                    gtk_data,
-                    gtk_idx,
+                if let Err(e) = drain_request(
+                    self.conn_handle
+                        .new_key(
+                            Nl80211Key::new_gtk(
+                                self.if_index,
+                                gtk_data.to_vec(),
+                                gtk_idx,
+                            )
+                            .build(),
+                        )
+                        .execute()
+                        .await,
                 )
                 .await
                 {
@@ -615,12 +626,13 @@ impl WifiClient {
                 &self.fourway,
             ) {
                 let rc = fw.replay_counter_bytes();
-                match keys::set_rekey_offload(
-                    &self.handle,
-                    self.if_index,
-                    &kek,
-                    &kck,
-                    &rc,
+                let attrs = Nl80211RekeyOffload::new(self.if_index)
+                    .kek(kek.to_vec())
+                    .kck(kck.to_vec())
+                    .replay_ctr(rc)
+                    .build();
+                match drain_request(
+                    self.conn_handle.set_rekey_offload(attrs).execute().await,
                 )
                 .await
                 {
@@ -674,7 +686,7 @@ impl WifiClient {
             };
 
             if let Err(e) = send_ctrl_port_frame(
-                &self.handle,
+                &mut self.conn_handle,
                 self.if_index,
                 self.bss_info.bssid,
                 &msg2,
@@ -691,11 +703,18 @@ impl WifiClient {
                 None => (None, 0),
             };
             if let Some(gtk_data) = gtk_data {
-                if let Err(e) = keys::install_gtk(
-                    &self.handle,
-                    self.if_index,
-                    &gtk_data,
-                    gtk_idx,
+                if let Err(e) = drain_request(
+                    self.conn_handle
+                        .new_key(
+                            Nl80211Key::new_gtk(
+                                self.if_index,
+                                gtk_data,
+                                gtk_idx,
+                            )
+                            .build(),
+                        )
+                        .execute()
+                        .await,
                 )
                 .await
                 {
@@ -771,31 +790,64 @@ impl Drop for WifiClient {
 }
 
 async fn send_ctrl_port_frame(
-    handle: &Nl80211Handle,
+    conn_handle: &mut Nl80211ConnectionHandle,
     if_index: u32,
     bssid: [u8; 6],
     frame: &[u8],
 ) -> Result<(), WifiError> {
-    const ETH_P_PAE: u16 = 0x888E;
+    let attrs = Nl80211ControlPortFrame::new(if_index)
+        .mac(bssid)
+        .frame(frame.to_vec())
+        .control_port_ethertype(netlink_packet_core::EthernetProtocol::Pae)
+        .build();
+    drain_request(conn_handle.control_port_frame(attrs).execute().await).await
+}
 
-    let mut nl_msg = netlink_packet_core::NetlinkMessage::from(
-        netlink_packet_generic::GenlMessage::from_payload(
-            wl_nl80211::Nl80211Message {
-                cmd: wl_nl80211::Nl80211Command::ControlPortFrame,
-                attributes: vec![
-                    Nl80211Attr::IfIndex(if_index),
-                    Nl80211Attr::Mac(bssid),
-                    Nl80211Attr::Frame(frame.to_vec()),
-                    Nl80211Attr::ControlPortEthertype(ETH_P_PAE),
-                ],
-            },
-        ),
-    );
-    nl_msg.header.flags =
-        netlink_packet_core::NLM_F_REQUEST | netlink_packet_core::NLM_F_ACK;
+impl WifiClient {
+    /// Send `NL80211_CMD_ASSOCIATE` for the selected BSS.
+    ///
+    /// `ie` carries the RSN element built for the network's security mode
+    /// (plus e.g. the OWE DH Parameter Element); empty for open networks.
+    /// MFP (IEEE 802.11w) is required for SAE and OWE.
+    async fn associate(
+        &mut self,
+        ie: Vec<u8>,
+        use_mfp: bool,
+    ) -> Result<(), WifiError> {
+        let mut builder = Nl80211Associate::new(self.if_index)
+            .ssid(&self.config.ssid)
+            .mac(self.bss_info.bssid)
+            .frequency(self.bss_info.freq_mhz);
+        if !ie.is_empty() {
+            builder = builder.ie(ie);
+        }
+        if use_mfp {
+            builder = builder.use_mfp(Nl80211UseMfp::Required);
+        }
+        // Encrypted networks carry EAPOL over nl80211 and tie the
+        // connection's lifetime to this socket; open networks don't.
+        if self.bss_info.security != SecurityType::Open {
+            builder =
+                builder.control_port_over_nl80211(true).socket_owner(true);
+        }
+        let attrs = builder.build();
+        drain_request(self.conn_handle.associate(attrs).execute().await).await
+    }
+}
 
-    let mut h = handle.clone();
-    let mut stream = h.request(nl_msg).await?;
+/// Drain the reply stream of a high-level nl80211 request until it closes.
+/// Netlink errors surface as stream errors and are converted to
+/// [`WifiError`] via the `From<Nl80211Error>` impl.
+pub(crate) async fn drain_request<S>(stream: S) -> Result<(), WifiError>
+where
+    S: futures::TryStream<
+            Ok = netlink_packet_generic::GenlMessage<
+                wl_nl80211::Nl80211Message,
+            >,
+            Error = wl_nl80211::Nl80211Error,
+        > + Unpin,
+{
+    let mut stream = stream;
     while let Some(_msg) = stream.try_next().await? {}
     Ok(())
 }
