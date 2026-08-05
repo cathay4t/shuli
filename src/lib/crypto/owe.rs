@@ -11,7 +11,7 @@ use aws_lc_rs::digest;
 use p256::{
     PublicKey, SecretKey,
     ecdh::diffie_hellman,
-    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
+    elliptic_curve::{Generate, sec1::ToSec1Point},
 };
 
 use crate::{ErrorKind, WifiError, crypto::kdf};
@@ -35,9 +35,9 @@ pub(crate) struct OweAuth {
 
 impl OweAuth {
     pub fn new() -> Self {
-        let secret = SecretKey::random(&mut OsRng);
+        let secret = SecretKey::generate();
         let pubkey = secret.public_key();
-        let encoded = pubkey.to_encoded_point(false);
+        let encoded = pubkey.to_sec1_point(false);
         // Compact representation: x-coordinate only (skip 0x04 tag
         // and y-coordinate).  RFC 8110 §4.3, RFC 6090 §4.3.1.
         let our_pubkey_raw = encoded.as_bytes()[1..1 + P256_COORD_LEN].to_vec();

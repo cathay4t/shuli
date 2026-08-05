@@ -2,7 +2,7 @@
 
 use p256::{
     AffinePoint,
-    elliptic_curve::{Group, point::AffineCoordinates, rand_core::OsRng},
+    elliptic_curve::{Group, point::AffineCoordinates},
 };
 
 use crate::crypto::sae::{SaeAuth, compute_pwe_h2e};
@@ -24,17 +24,17 @@ fn test_pwe_derivation() {
 
 #[test]
 fn test_full_sae_exchange() {
-    let mut rng = OsRng;
+    let mut rng = getrandom::SysRng;
     let mac_sta = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mac_ap = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
     let password = "12345678";
     let ssid = "Test-WIFI";
 
     let mut supp = SaeAuth::new(password, ssid, mac_sta, mac_ap).unwrap();
-    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng);
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
 
     let mut ap = SaeAuth::new(password, ssid, mac_ap, mac_sta).unwrap();
-    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng);
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
 
     let supp_pwe_x = affine_x_bytes(&supp.pwe.to_affine());
     let ap_pwe_x = affine_x_bytes(&ap.pwe.to_affine());
@@ -57,16 +57,16 @@ fn test_full_sae_exchange() {
 
 #[test]
 fn test_sae_different_passwords() {
-    let mut rng = OsRng;
+    let mut rng = getrandom::SysRng;
     let mac_sta = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mac_ap = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
     let ssid = "Test-WIFI";
 
     let mut supp = SaeAuth::new("12345678", ssid, mac_sta, mac_ap).unwrap();
-    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng);
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
 
     let mut ap = SaeAuth::new("wrong_password", ssid, mac_ap, mac_sta).unwrap();
-    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng);
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
 
     supp.process_commit(&ap_scalar, &ap_elem).unwrap();
     ap.process_commit(&supp_scalar, &supp_elem).unwrap();

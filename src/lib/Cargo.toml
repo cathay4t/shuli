@@ -24,6 +24,7 @@ genetlink.workspace = true
 netlink-proto.workspace = true
 netlink-sys.workspace = true
 p256.workspace = true
+getrandom.workspace = true
 aws-lc-rs.workspace = true
 
 [dev-dependencies]

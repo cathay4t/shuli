@@ -9,17 +9,17 @@
 use core::ops::Neg;
 
 use p256::{
-    self, AffinePoint, EncodedPoint, FieldElement, NistP256, ProjectivePoint,
-    Scalar,
+    self, AffinePoint, NistP256, ProjectivePoint, Scalar,
     elliptic_curve::{
         Curve, Field, Group, PrimeField,
-        bigint::{Encoding, NonZero},
-        generic_array::GenericArray,
-        hash2curve::{FromOkm, MapToCurve},
+        array::Array,
+        bigint::NonZero,
+        ops::Reduce,
         point::AffineCoordinates,
-        rand_core::CryptoRngCore,
-        sec1::{FromEncodedPoint, ToEncodedPoint},
+        rand_core::TryRng,
+        sec1::{FromSec1Point, ToSec1Point},
     },
+    hash2curve::MapToCurve,
 };
 
 use crate::{
@@ -82,15 +82,29 @@ impl SaeAuth {
     /// Generate our commit (scalar + element) using the given RNG.
     pub(crate) fn build_commit(
         &mut self,
-        rng: &mut impl CryptoRngCore,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let mut rand = Scalar::random(&mut *rng);
+        rng: &mut impl TryRng,
+    ) -> Result<(Vec<u8>, Vec<u8>), WifiError> {
+        let mut rand = Scalar::try_random(&mut *rng).map_err(|e| {
+            WifiError::new(ErrorKind::SaeFailed, format!("rng failure: {e}"))
+        })?;
         while bool::from(rand.is_zero()) {
-            rand = Scalar::random(&mut *rng);
+            rand = Scalar::try_random(&mut *rng).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::SaeFailed,
+                    format!("rng failure: {e}"),
+                )
+            })?;
         }
-        let mut mask = Scalar::random(&mut *rng);
+        let mut mask = Scalar::try_random(&mut *rng).map_err(|e| {
+            WifiError::new(ErrorKind::SaeFailed, format!("rng failure: {e}"))
+        })?;
         while bool::from(mask.is_zero()) {
-            mask = Scalar::random(&mut *rng);
+            mask = Scalar::try_random(&mut *rng).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::SaeFailed,
+                    format!("rng failure: {e}"),
+                )
+            })?;
         }
 
         // scalar = (rand + mask) mod r
@@ -108,7 +122,7 @@ impl SaeAuth {
         self.own_scalar_bytes = scalar_bytes;
         self.own_elem_bytes = elem_bytes;
 
-        (scalar_bytes.to_vec(), elem_bytes.to_vec())
+        Ok((scalar_bytes.to_vec(), elem_bytes.to_vec()))
     }
 
     /// Process peer's commit (scalar + element). Derives KCK/PMK/PMKID and
@@ -256,8 +270,9 @@ impl SaeAuth {
     }
 
     pub(crate) fn build_init_auth_msg(&mut self) -> Vec<u8> {
-        let (scalar, element) =
-            self.build_commit(&mut p256::elliptic_curve::rand_core::OsRng);
+        let (scalar, element) = self
+            .build_commit(&mut getrandom::SysRng)
+            .expect("OS random number generator failure");
 
         // Build SAE commit auth_data for NL80211_ATTR_AUTH_DATA. The kernel
         // reads the first 4 bytes as transaction(2 LE) and status(2
@@ -316,8 +331,10 @@ fn sswu_from_label(
     hkdf_expand(pwd_seed, label, &mut okm);
 
     // u = OS2IP(pwd-value) mod p ; P = SSWU(u)
-    let u = FieldElement::from_okm(GenericArray::from_slice(&okm));
-    Ok(u.map_to_curve())
+    let u = <NistP256 as MapToCurve>::FieldElement::reduce(
+        &Array::try_from(&okm[..]).expect("SSWU okm is 48 bytes"),
+    );
+    Ok(<NistP256 as MapToCurve>::map_to_curve(u))
 }
 
 /// PWE = val * PT, where val = H(0^n, MAX(mac)||MIN(mac)) mod (q-1) + 1.
@@ -339,7 +356,7 @@ fn derive_pwe_from_pt(
     let val_hash = hkdf_extract_sha256(&[0u8; 32], &ikm);
 
     // val = (OS2IP(val) mod (q - 1)) + 1
-    let order = NistP256::ORDER;
+    let order = NistP256::ORDER.as_ref();
     let order_m1 = order.wrapping_sub(&p256::U256::ONE);
     let nz = NonZero::new(order_m1).unwrap();
     let val_int = p256::U256::from_be_slice(&val_hash) % nz;
@@ -375,7 +392,9 @@ fn scalar_from_bytes(bytes: &[u8]) -> Result<Scalar, WifiError> {
             format!("peer scalar too short: {} bytes", bytes.len()),
         ));
     }
-    let opt = Scalar::from_repr(GenericArray::clone_from_slice(&bytes[..32]));
+    let opt = Scalar::from_repr(
+        Array::try_from(&bytes[..32]).expect("32-byte scalar"),
+    );
     if bool::from(opt.is_none()) {
         return Err(WifiError::new(
             ErrorKind::SaeFailed,
@@ -397,12 +416,12 @@ fn projective_from_elem(elem_bytes: &[u8]) -> ProjectivePoint {
     if elem_bytes.len() < 64 {
         return ProjectivePoint::IDENTITY;
     }
-    let ep = EncodedPoint::from_affine_coordinates(
-        GenericArray::from_slice(&elem_bytes[..32]),
-        GenericArray::from_slice(&elem_bytes[32..64]),
+    let ep = p256::Sec1Point::from_affine_coordinates(
+        &Array::try_from(&elem_bytes[..32]).expect("32-byte x"),
+        &Array::try_from(&elem_bytes[32..64]).expect("32-byte y"),
         false,
     );
-    let affine = AffinePoint::from_encoded_point(&ep);
+    let affine = AffinePoint::from_sec1_point(&ep);
     if bool::from(affine.is_some()) {
         let affine = affine.unwrap();
         if bool::from(!affine.is_identity()) {
@@ -415,7 +434,7 @@ fn projective_from_elem(elem_bytes: &[u8]) -> ProjectivePoint {
 /// Encode a point as 64-byte x||y (uncompressed without prefix).
 fn point_to_x_y(point: &ProjectivePoint, out: &mut [u8; 64]) {
     let affine = point.to_affine();
-    let encoded = affine.to_encoded_point(false);
+    let encoded = affine.to_sec1_point(false);
     if let (Some(x), Some(y)) = (encoded.x(), encoded.y()) {
         out[..32].copy_from_slice(x.as_ref());
         out[32..64].copy_from_slice(y.as_ref());
