@@ -87,8 +87,8 @@ use shuli::{WifiClient, WifiConfig, WifiState};
 
 #[tokio::main]
 async fn main() -> Result<(), shuli::WifiError> {
-    let mut config = WifiConfig::new("wlan0", "Test-WIFI");
-    config.set_password("12345678");
+    let mut config = WifiConfig::new("wlan0");
+    config.add_network("Test-WIFI", Some("12345678"));
 
     let mut client = WifiClient::init(config).await?;
 
@@ -111,6 +111,18 @@ async fn main() -> Result<(), shuli::WifiError> {
         }
     }
 }
+```
+
+To scan for and connect to several networks, add them to the config - a
+single scan schedule probes for all of them and the strongest matching
+BSS wins:
+
+```rust
+let mut config = WifiConfig::new("wlan0");
+config
+    .add_network("Home-WIFI", Some("home-secret"))
+    .add_network("Office-WIFI", Some("office-secret"))
+    .add_network("Guest-Open", None);
 ```
 
 ## License

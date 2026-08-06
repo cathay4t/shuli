@@ -151,7 +151,7 @@ impl WifiClient {
             // PMK from the passphrase via PBKDF2.
             if self.bss_info.security == SecurityType::Wpa2Psk {
                 let password =
-                    self.config.password.as_deref().ok_or_else(|| {
+                    self.network.password.as_deref().ok_or_else(|| {
                         WifiError::new(
                             ErrorKind::InvalidConfig,
                             "password required for WPA2-PSK",
@@ -159,7 +159,7 @@ impl WifiClient {
                     })?;
                 self.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
                     password,
-                    &self.config.ssid,
+                    &self.network.ssid,
                 ));
             }
             log::info!(
@@ -167,7 +167,7 @@ impl WifiClient {
                 self.bss_info.security
             );
             let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
-                .ssid(&self.config.ssid)
+                .ssid(&self.network.ssid)
                 .mac(self.bss_info.bssid)
                 .frequency(self.bss_info.freq_mhz)
                 .auth_type(wl_nl80211::Nl80211AuthType::OpenSystem)
@@ -178,7 +178,7 @@ impl WifiClient {
             .await;
         }
 
-        let password = self.config.password.as_deref().ok_or_else(|| {
+        let password = self.network.password.as_deref().ok_or_else(|| {
             WifiError::new(
                 ErrorKind::InvalidConfig,
                 "password required for encrypted network",
@@ -186,14 +186,14 @@ impl WifiClient {
         })?;
         self.auth = Some(AuthMethod::new_sae(
             password,
-            &self.config.ssid,
+            &self.network.ssid,
             self.mac,
             self.bss_info.bssid,
         )?);
 
         let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
         let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
-            .ssid(&self.config.ssid)
+            .ssid(&self.network.ssid)
             .mac(self.bss_info.bssid)
             .frequency(self.bss_info.freq_mhz)
             .auth_type(wl_nl80211::Nl80211AuthType::Sae)

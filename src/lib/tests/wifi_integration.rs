@@ -10,10 +10,11 @@
 //! manual environment preparation is needed.
 //!
 //! They require root (they touch the kernel wifi stack) and are skipped
-//! with a message when the test process is not running as root — run them
-//! with `sudo -E cargo test --workspace`. A process-level [`Mutex`]
-//! serialises all tests that touch the shared hwsim hardware (same pattern
-//! as iproute-rs wwan tests).
+//! with a message when the test binary is not running as root. They run
+//! as root automatically: `.cargo/config.toml` sets the test runner to
+//! `sudo`, so plain `cargo test --workspace` is enough. A process-level
+//! [`Mutex`] serialises all tests that touch the shared hwsim hardware
+//! (same pattern as iproute-rs wwan tests).
 //!
 //! A stray wifi daemon on the node (wpa_supplicant, NetworkManager, iwd)
 //! will grab the fresh hwsim radios, run its own scans / connect them, and
@@ -27,7 +28,10 @@ use std::sync::LazyLock;
 
 use tokio::sync::Mutex;
 
-use crate::{WifiClient, WifiConfig, WifiState};
+use crate::{
+    ErrorKind, WifiClient, WifiConfig, WifiState,
+    client::RETRY_BACKOFF_INIT_SEC,
+};
 
 static WIFI_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -53,7 +57,21 @@ struct WifiTestEnv {
 }
 
 impl WifiTestEnv {
+    /// Provision the environment (hwsim radios + netns + NICs) AND start
+    /// hostapd right away. Tests that want to observe the client's
+    /// background scan before any AP exists should use
+    /// [`provision`](Self::provision) + [`start_hostapd`](Self::start_hostapd)
+    /// instead.
     fn setup(hostapd_conf: &str) -> Self {
+        let mut env = Self::provision();
+        env.start_hostapd(hostapd_conf);
+        env
+    }
+
+    /// Provision hwsim radios + netns + NICs, but do NOT start hostapd,
+    /// so the client's background scan can be observed while no AP is on
+    /// air. Start the AP later with [`start_hostapd`](Self::start_hostapd).
+    fn provision() -> Self {
         // Pre-clean leftovers from a previous crashed run.
         sh_allow_fail("modprobe -r mac80211_hwsim");
         sh_allow_fail(&format!("ip netns del {TEST_NS}"));
@@ -79,6 +97,13 @@ impl WifiTestEnv {
             "ip netns exec {TEST_NS} ip addr add {AP_IP}/24 dev {AP_NIC}"
         ));
 
+        Self { hostapd_pid: None }
+    }
+
+    /// Start hostapd with `hostapd_conf` in the test netns. Idempotent
+    /// only in the sense of being callable once; a second call would
+    /// start a second instance.
+    fn start_hostapd(&mut self, hostapd_conf: &str) {
         let conf_path = "/tmp/shuli_rs_test_hostapd.conf";
         std::fs::write(conf_path, hostapd_conf).expect("write hostapd conf");
         let pid_path = "/tmp/shuli_rs_test_hostapd.pid";
@@ -90,8 +115,7 @@ impl WifiTestEnv {
         let hostapd_pid = std::fs::read_to_string(pid_path)
             .ok()
             .map(|s| s.trim().to_string());
-
-        Self { hostapd_pid }
+        self.hostapd_pid = hostapd_pid;
     }
 }
 
@@ -160,16 +184,17 @@ async fn wifi_client_open_connect() {
     init_logger();
     if !is_root() {
         eprintln!(
-            "skipping wifi_client_open_connect: requires root to \
-             self-provision mac80211_hwsim + hostapd; run `sudo -E cargo test \
-             --workspace`"
+            "skipping wifi_client_open_connect: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
         );
         return;
     }
     let _guard = WIFI_LOCK.lock().await;
     let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
 
-    let config = WifiConfig::new(TEST_NIC, "Test-WIFI-NOPASS");
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
     let mut client = WifiClient::init(config).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
@@ -185,17 +210,17 @@ async fn wifi_client_sae_connect() {
     init_logger();
     if !is_root() {
         eprintln!(
-            "skipping wifi_client_sae_connect: requires root to \
-             self-provision mac80211_hwsim + hostapd; run `sudo -E cargo test \
-             --workspace`"
+            "skipping wifi_client_sae_connect: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
         );
         return;
     }
     let _guard = WIFI_LOCK.lock().await;
     let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
 
-    let mut config = WifiConfig::new(TEST_NIC, "Test-WIFI");
-    config.set_password("12345678");
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
     let mut client = WifiClient::init(config).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
@@ -203,6 +228,62 @@ async fn wifi_client_sae_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn wifi_client_multi_network_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_multi_network_connect: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    // Radios + netns up, but NO hostapd yet: the client must run its
+    // background scan on its own while no AP is on air.
+    let mut env = WifiTestEnv::provision();
+
+    // Only `Test-WIFI` will exist on air; the decoy listed first must
+    // not shadow it. One scan probes both SSIDs.
+    let mut config = WifiConfig::new(TEST_NIC);
+    config
+        .add_network("Ghost-Network", Some("wrong-password"))
+        .add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+
+    // First cycle: scan triggered. The empty result then hands the
+    // periodic scanning to the firmware when PNO is available, or arms
+    // the host-side retry backoff otherwise.
+    assert_eq!(
+        client.run().await.expect("scan triggered"),
+        WifiState::Scanning
+    );
+    if client.sched_scan_supported {
+        assert_eq!(
+            client.run().await.expect("sched scan"),
+            WifiState::SchedScanWait
+        );
+    } else {
+        let err = client.run().await.expect_err("empty scan");
+        assert_eq!(err.kind, ErrorKind::SsidNotFound);
+        assert_eq!(client.state, WifiState::Failed);
+        assert_eq!(client.scan_retry_interval, RETRY_BACKOFF_INIT_SEC);
+    }
+
+    // Bring the AP up late: the background scan picks it up on a later
+    // cycle and connects with the right passphrase.
+    env.start_hostapd(SAE_HOSTAPD_CONF);
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(client.current_ssid(), "Test-WIFI");
     client.shutdown().await;
 }
 

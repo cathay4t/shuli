@@ -15,11 +15,12 @@ use wl_nl80211::{
     Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
     Nl80211Event, Nl80211EventCode, Nl80211Handle, Nl80211Key,
     Nl80211MulticastGroup, Nl80211RekeyOffload, Nl80211SchedScanMatch,
-    Nl80211SchedScanPlan, Nl80211UseMfp,
+    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
+    Nl80211UseMfp,
 };
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiError,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiError,
     auth::{AuthAction, AuthMethod},
     config::WifiConfig,
     crypto::{
@@ -34,7 +35,7 @@ use crate::{
 /// Initial scan-retry backoff (seconds) used while hunting for the
 /// configured SSID. Doubles after each failed scan, capped at
 /// [`RETRY_BACKOFF_MAX_SEC`].
-const RETRY_BACKOFF_INIT_SEC: u64 = 10;
+pub(crate) const RETRY_BACKOFF_INIT_SEC: u64 = 10;
 /// Cap (seconds) for the scan-retry backoff; mirrors iwd's
 /// `MaximumPeriodicScanInterval` default.
 const RETRY_BACKOFF_MAX_SEC: u64 = 300;
@@ -107,6 +108,9 @@ pub struct WifiClient {
     pub(crate) if_index: u32,
     pub(crate) mac: [u8; ETH_ALEN],
     pub(crate) config: WifiConfig,
+    /// The configured network whose BSS the scan phase selected; carries
+    /// the passphrase used for authentication.
+    pub(crate) network: NetworkConfig,
     /// Best BSS found by the scan phase.
     pub(crate) bss_info: BssInfo,
     /// Active pre-association authentication method.
@@ -170,6 +174,13 @@ impl WifiClient {
 
         let conn_handle = handle.connection();
 
+        let network = config.networks.first().cloned().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "WifiConfig: no networks configured",
+            )
+        })?;
+
         Ok(WifiClient {
             handle,
             conn_handle,
@@ -182,6 +193,7 @@ impl WifiClient {
             if_index,
             mac,
             config,
+            network,
             bss_info: BssInfo::default(),
             auth: None,
             owe: None,
@@ -223,8 +235,9 @@ impl WifiClient {
                         && self.start_sched_scan().await?
                     {
                         log::info!(
-                            "SSID '{}' not found; entering scheduled scan mode",
-                            self.config.ssid
+                            "no configured SSID ([{}]) found; entering \
+                             scheduled scan mode",
+                            self.config.ssids().collect::<Vec<_>>().join(", ")
                         );
                         self.state = WifiState::SchedScanWait;
                         return Ok(());
@@ -378,17 +391,33 @@ impl WifiClient {
         if !self.sched_scan_supported {
             return Ok(false);
         }
+        let ssids: Vec<String> = self
+            .config
+            .networks
+            .iter()
+            .map(|network| network.ssid.clone())
+            .collect();
         let attrs = vec![
             Nl80211Attr::IfIndex(self.if_index),
-            // Active probe for the configured SSID...
-            Nl80211Attr::ScanSsids(vec![self.config.ssid.clone()]),
-            // ...and only wake us when it shows up.
-            Nl80211Attr::SchedScanMatch(vec![Nl80211SchedScanMatch::Ssid(
-                self.config.ssid.clone(),
-            )]),
-            Nl80211Attr::SchedScanPlans(vec![Nl80211SchedScanPlan::Interval(
-                SCHED_SCAN_INTERVAL_SEC,
-            )]),
+            // Active probe for the configured SSIDs...
+            Nl80211Attr::ScanSsids(ssids.clone()),
+            // ...and only wake us when one of them shows up.
+            Nl80211Attr::SchedScanMatch(
+                self.config
+                    .networks
+                    .iter()
+                    .map(|network| {
+                        Nl80211SchedScanMatch(vec![
+                            Nl80211SchedScanMatchAttr::Ssid(
+                                network.ssid.clone(),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+            Nl80211Attr::SchedScanPlans(vec![Nl80211SchedScanPlan(vec![
+                Nl80211SchedScanPlanAttr::Interval(SCHED_SCAN_INTERVAL_SEC),
+            ])]),
             // Tie the scan to this socket so the kernel stops it if shuli
             // dies without a chance to clean up.
             Nl80211Attr::SocketOwner,
@@ -409,8 +438,8 @@ impl WifiClient {
             Ok(()) => {
                 self.sched_scan_active = true;
                 log::info!(
-                    "scheduled scan started: ssid='{}', interval={}s",
-                    self.config.ssid,
+                    "scheduled scan started: ssids=[{}], interval={}s",
+                    ssids.join(", "),
                     SCHED_SCAN_INTERVAL_SEC
                 );
                 Ok(true)
@@ -677,7 +706,7 @@ impl WifiClient {
                 auth_data.extend_from_slice(&confirm);
 
                 let attrs = Nl80211Authenticate::new(self.if_index)
-                    .ssid(&self.config.ssid)
+                    .ssid(&self.network.ssid)
                     .mac(self.bss_info.bssid)
                     .frequency(self.bss_info.freq_mhz)
                     .auth_type(Nl80211AuthType::Sae)
@@ -1039,6 +1068,14 @@ impl WifiClient {
 }
 
 impl WifiClient {
+    /// SSID of the network the client is currently working toward.
+    /// Before the first scan selects a BSS this is the first configured
+    /// network; after a successful scan it is the network whose BSS was
+    /// selected (and whose passphrase is used for authentication).
+    pub fn current_ssid(&self) -> &str {
+        &self.network.ssid
+    }
+
     /// Cleanly disconnect from the AP.  Call this before dropping the
     /// client so the AP receives a proper deauthentication.
     pub async fn shutdown(&mut self) {
@@ -1114,7 +1151,7 @@ impl WifiClient {
         use_mfp: bool,
     ) -> Result<(), WifiError> {
         let mut builder = Nl80211Associate::new(self.if_index)
-            .ssid(&self.config.ssid)
+            .ssid(&self.network.ssid)
             .mac(self.bss_info.bssid)
             .frequency(self.bss_info.freq_mhz);
         if !ie.is_empty() {

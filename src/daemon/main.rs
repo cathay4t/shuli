@@ -37,20 +37,29 @@ async fn main() -> ExitCode {
 
 async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     let shuli_config = ShuliConfig::load(config_path)?;
-    let wifi_entry = shuli_config.wifis.first().ok_or_else(|| {
+    let wifis = &shuli_config.wifis;
+    let first = wifis.first().ok_or_else(|| {
         shuli::WifiError::new(
             shuli::ErrorKind::InvalidConfig,
             "no wifis in config",
         )
     })?;
 
-    let iface_name =
-        resolve_iface_name(wifi_entry.interface.as_deref()).await?;
-    let wifi_config = wifi_entry.to_wifi_config(&iface_name);
-    log::info!("shulid: iface={iface_name}, ssid={}", wifi_entry.ssid);
+    let iface_name = resolve_iface_name(first.interface.as_deref()).await?;
+    let wifi_config = shuli_config.to_wifi_config(&iface_name);
+    log::info!(
+        "shulid: iface={iface_name}, ssids=[{}]",
+        wifis
+            .iter()
+            .map(|entry| entry.ssid.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let mut client = WifiClient::init(wifi_config).await?;
-    let mut connected = false;
+    // SSID whose IP config was last applied; lets us re-apply when a
+    // later connection lands on a different configured network.
+    let mut applied_ssid: Option<String> = None;
     let mut sigterm = unix_signal(SignalKind::terminate()).map_err(|e| {
         shuli::WifiError::new(
             shuli::ErrorKind::ConnectFailed,
@@ -75,24 +84,39 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
                     Ok(state) => match state {
                         WifiState::ConnectedWithoutOffloadRekey
                         | WifiState::ConnectedWithOffloadRekey => {
-                            if !connected {
-                                connected = true;
+                            let ssid = client.current_ssid().to_string();
+                            if applied_ssid.as_deref() != Some(ssid.as_str()) {
+                                applied_ssid = Some(ssid.clone());
                                 log::info!(
-                                    "connection established - link up"
+                                    "connection established to '{ssid}' - \
+                                     link up"
                                 );
-                                // Apply IP config: static or DHCP.
-                                if let Err(e) = apply_network_config(
-                                    &iface_name,
-                                    wifi_entry,
-                                )
-                                .await
+                                // Apply the IP config of the network we
+                                // actually connected to; never fall back to
+                                // another network's config silently.
+                                match wifis
+                                    .iter()
+                                    .find(|entry| entry.ssid == ssid)
                                 {
-                                    log::warn!("IP config failed: {e}");
+                                    Some(entry) => {
+                                        if let Err(e) = apply_network_config(
+                                            &iface_name,
+                                            entry,
+                                        )
+                                        .await
+                                        {
+                                            log::warn!("IP config failed: {e}");
+                                        }
+                                        log::info!(
+                                            "holding connection \
+                                             (Ctrl-C to disconnect)"
+                                        );
+                                    }
+                                    None => log::warn!(
+                                        "no wifis config entry for connected \
+                                         SSID '{ssid}'; skipping IP config"
+                                    ),
                                 }
-                                log::info!(
-                                    "holding connection \
-                                     (Ctrl-C to disconnect)"
-                                );
                             }
                         }
                         WifiState::Failed => {
@@ -114,7 +138,7 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
         }
     }
 
-    if connected {
+    if applied_ssid.is_some() {
         log::info!("connection established");
         Ok(())
     } else {

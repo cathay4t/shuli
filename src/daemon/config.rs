@@ -79,14 +79,13 @@ impl ShuliConfig {
             })?;
         Ok(config)
     }
-}
 
-impl WifiEntry {
-    /// Convert to the lib's `WifiConfig`.
+    /// Convert all configured networks into the lib's `WifiConfig`, so
+    /// one scan schedule probes for every SSID.
     pub(crate) fn to_wifi_config(&self, iface_name: &str) -> shuli::WifiConfig {
-        let mut config = shuli::WifiConfig::new(iface_name, &self.ssid);
-        if let Some(ref password) = self.password {
-            config.set_password(password);
+        let mut config = shuli::WifiConfig::new(iface_name);
+        for entry in &self.wifis {
+            config.add_network(&entry.ssid, entry.password.as_deref());
         }
         config
     }

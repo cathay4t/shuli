@@ -8,16 +8,19 @@ use wl_nl80211::{
 
 use crate::WifiError;
 
+/// Trigger an active scan probing for `ssids` (all of them in one
+/// scan); `None` or an empty list performs a passive scan instead.
 pub async fn trigger_scan(
     handle: &Nl80211Handle,
     if_index: u32,
-    ssid: Option<&str>,
+    ssids: Option<&[String]>,
 ) -> Result<(), WifiError> {
     let mut builder = wl_nl80211::Nl80211Scan::new(if_index);
-    if let Some(ssid) = ssid {
-        builder = builder.ssids(vec![ssid.to_string()]);
-    } else {
-        builder = builder.passive(true);
+    match ssids {
+        Some(ssids) if !ssids.is_empty() => {
+            builder = builder.ssids(ssids.to_vec());
+        }
+        _ => builder = builder.passive(true),
     }
     let attrs = builder.build();
     let mut stream = handle.scan().trigger(attrs).execute().await;

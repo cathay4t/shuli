@@ -6,7 +6,7 @@
 use futures::TryStreamExt;
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiClient, WifiError,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
     nl80211::scan::{
         extract_bssid, extract_freq, extract_ies, extract_signal,
         extract_ssid_from_ies, get_scan_results, trigger_scan,
@@ -60,8 +60,14 @@ impl WifiClient {
     pub(crate) async fn send_out_scan_request(
         &mut self,
     ) -> Result<(), WifiError> {
-        log::info!("scanning for SSID '{}'", self.config.ssid);
-        trigger_scan(&self.handle, self.if_index, Some(&self.config.ssid)).await
+        let ssids: Vec<String> = self
+            .config
+            .networks
+            .iter()
+            .map(|network| network.ssid.clone())
+            .collect();
+        log::info!("scanning for SSIDs [{}]", ssids.join(", "));
+        trigger_scan(&self.handle, self.if_index, Some(&ssids)).await
     }
 
     // TODO: use multicast to wait for scan completion instead of a fixed
@@ -72,14 +78,16 @@ impl WifiClient {
             .await;
     }
 
-    /// Dump the scan results and keep the strongest BSS matching our SSID.
+    /// Dump the scan results and keep the strongest BSS matching any of
+    /// the configured networks; the matched network (with its passphrase)
+    /// is recorded for the authentication phase.
     pub(crate) async fn process_scan_results(
         &mut self,
     ) -> Result<(), WifiError> {
         let bss_list = get_scan_results(&self.handle, self.if_index).await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
-        let mut candidates: Vec<BssInfo> = Vec::new();
+        let mut candidates: Vec<(BssInfo, NetworkConfig)> = Vec::new();
         for bss in &bss_list {
             let Some(ies) = extract_ies(bss) else {
                 continue;
@@ -87,9 +95,15 @@ impl WifiClient {
             let Some(bss_ssid) = extract_ssid_from_ies(ies) else {
                 continue;
             };
-            if bss_ssid != self.config.ssid {
+            let Some(network) = self
+                .config
+                .networks
+                .iter()
+                .find(|network| network.ssid == bss_ssid)
+                .cloned()
+            else {
                 continue;
-            }
+            };
             let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) =
                 (extract_bssid(bss), extract_freq(bss), extract_signal(bss))
             else {
@@ -97,30 +111,35 @@ impl WifiClient {
                 continue;
             };
             log::trace!(
-                "candidate BSS: bssid={bssid:02x?}, freq={freq_mhz} MHz, \
-                 signal={signal_dbm}"
+                "candidate BSS: ssid={bss_ssid}, bssid={bssid:02x?}, \
+                 freq={freq_mhz} MHz, signal={signal_dbm}"
             );
-            candidates.push(BssInfo {
-                bssid,
-                freq_mhz,
-                signal_dbm,
-                security: detect_security(ies),
-            });
+            candidates.push((
+                BssInfo {
+                    bssid,
+                    freq_mhz,
+                    signal_dbm,
+                    security: detect_security(ies),
+                },
+                network,
+            ));
         }
 
-        let best = candidates.into_iter().max();
-        self.bss_info = best.ok_or_else(|| {
-            WifiError::new(
+        let best = candidates.into_iter().max_by(|a, b| a.0.cmp(&b.0));
+        let Some((bss_info, network)) = best else {
+            return Err(WifiError::new(
                 ErrorKind::SsidNotFound,
                 format!(
-                    "SSID '{}' not found in scan results",
-                    self.config.ssid
+                    "no configured SSID ([{}]) found in scan results",
+                    self.config.ssids().collect::<Vec<_>>().join(", ")
                 ),
-            )
-        })?;
+            ));
+        };
+        self.bss_info = bss_info;
+        self.network = network;
         log::info!(
             "selected BSS: ssid={}, bssid={:02x?}, freq={} MHz, signal={} dBm",
-            self.config.ssid,
+            self.network.ssid,
             self.bss_info.bssid,
             self.bss_info.freq_mhz,
             self.bss_info.signal_dbm
