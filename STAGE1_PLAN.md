@@ -1,6 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 1 Development Plan
 
+> **Status: COMPLETE (v0.1.0).** Stage 1 goals were met; see §9 for the
+> deviations from this plan and the known carry-over defects now tracked
+> in `STAGE2_PLAN.md`.
+
 > 书立 / *Book stand* — a pure-Rust Linux WiFi authentication daemon.
 > The name is a pun: a book stand resembles the WiFi signal-bar icon.
 
@@ -11,9 +15,10 @@
 1. **WPA3-Personal authentication** working end-to-end on a real STA
    (station/client) interface: scan → SAE authentication → 4-way handshake →
    keys installed → data link up (ready for DHCP by an external tool).
-2. **`shulid` daemon** that reads static configuration from
-   `/etc/shuli/*.yml` and brings the configured interface(s) onto the
-   configured network. Example config:
+2. **`shulid` daemon** that reads its static configuration from a
+   single YAML file (`/etc/shuli/config.yml` or `$1`) and brings the
+   configured interface(s) onto the configured network. Example
+   config:
 
    ```yaml
    ---
@@ -109,7 +114,7 @@ shuli/
 │   ├── main.rs                # shulid entry: arg parse, load config, run
 │   ├── lib.rs                 # re-exports, error, prelude
 │   ├── error.rs               # ShuliError + ErrorKind
-│   ├── config/                # /etc/shuli/*.yml loader + schema (serde)
+│   ├── config/                # config.yml loader + schema (serde)
 │   │   ├── mod.rs
 │   │   └── schema.rs          # Config, InterfaceConfig, WifiConfig
 │   ├── nl80211/               # thin async wrappers over wl-nl80211
@@ -169,7 +174,8 @@ with nipart-compatible toolchain (nipart MSRV is 1.88; shuli currently declares
 
 ### M1 — Skeleton & config (no radio)
 - Workspace, `error.rs`, logging, `--config` flag, signal handling.
-- YAML schema + loader for `/etc/shuli/*.yml`; unit tests with example config.
+- YAML schema + loader for the single config file
+  (`/etc/shuli/config.yml`); unit tests with example config.
 - `fmt`/`clippy -D warnings`/`test` all green. SPDX headers everywhere.
 - **Exit:** `shulid --config examples/test.yml` parses and logs the desired
   state (no radio actions yet).
@@ -212,7 +218,7 @@ with nipart-compatible toolchain (nipart MSRV is 1.88; shuli currently declares
   disconnect handling.
 - Integration test harness (mac80211_hwsim + hostapd WPA3 AP) — automatable in
   CI as a root test.
-- README + man page stub; record the §6 conclusion as `docs/crypto.md`.
+- README + man page stub.
 
 ---
 
@@ -284,10 +290,55 @@ work. Do not take a heavy dependency for the few frames we construct.
 
 ## 8. Stage 1 exit criteria
 
-1. `shulid` reads `/etc/shuli/*.yml` and connects `wlan0` to a WPA3-Personal
-   network, with keys installed and data path working (DHCP succeeds).
+1. `shulid` reads its config file and connects `wlan0` to a
+   WPA3-Personal network, with keys installed and data path working
+   (DHCP succeeds).
 2. WPA3-Personal works via **userspace SAE** (path A).
-3. `crypto.md` records the §6 conclusion, validated by passing SAE/handshake
-   KATs.
+3. The §6 crypto conclusion is validated by passing SAE/handshake
+   KATs (the `docs/crypto.md` deliverable was dropped; the conclusion
+   lives in this plan).
 4. `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all green;
    integration test passes under `mac80211_hwsim`.
+
+## 9. Post-completion notes (deviations & carry-overs)
+
+Recorded 2026-08 after the iwd / wpa_supplicant feature audit.
+
+### Deviations from this plan
+
+* **Crypto stack:** `p256` (ECC group 19 + SSWU hash-to-curve) +
+  `aws-lc-rs` (HMAC-SHA1/256, AES-CMAC, AES Key Wrap, HKDF, PBKDF2)
+  instead of the RustCrypto symmetric suite proposed in §6.
+* **Connect path:** direct `NL80211_CMD_AUTHENTICATE` /
+  `NL80211_CMD_ASSOCIATE` with control-port-over-nl80211, not the
+  `CONNECT` + `EXTERNAL_AUTH` path described in §2/§5-M3.
+* **Scope:** per the 2026-08 scope decision, Stage 1 ends at
+  "keys installed + link up"; DHCP was intentionally not part of
+  Stage 1 and was later added at the daemon level (mozim).  This
+  split is permanent: the `shuli` crate does no IP work - all
+  layer 3+ is left to the caller (e.g. nipart); only `shulid`
+  configures IP, and only because it targets environments where a
+  full nipart is not wanted.
+* **Layout:** the workspace was later split into `src/lib` (the
+  `shuli` crate) + `src/daemon` (the `shulid` binary); the §3 layout
+  is the pre-split one.
+* **Config handling (decided 2026-08):** a single YAML file -
+  `/etc/shuli/config.yml` or `$1`.  No `/etc/shuli/*.yml` directory
+  support, and the path is a positional argument rather than a
+  `--config` flag.
+* **`docs/crypto.md` dropped:** no standalone crypto document; the §6
+  conclusion stays in this plan.
+
+### Carry-over defects found by the 2026-08 audit
+
+Tracked and prioritized in `STAGE2_PLAN.md`:
+
+1. 4-way Message 3 parses only the GTK KDE; **IGTK/BIGTK KDEs are
+   ignored**, so under PMF (mandatory for SAE) protected management
+   frames are dropped by mac80211.
+2. No verification of the AP's RSNE in Message 3 against the beacon
+   RSNE (downgrade defence).
+3. No SAE anti-clogging token handling (status 76) and no
+   hunting-and-pecking fallback (H2E-only).
+4. BSSes with unsupported AKMs are classified as `Open` instead of
+   unsupported.
