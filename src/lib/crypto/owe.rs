@@ -138,6 +138,9 @@ impl OweAuth {
         self.pmk
     }
 
+    /// PMKID of the completed OWE exchange; consumed by the PMKSA cache
+    /// (Stage 2 G4).
+    #[allow(dead_code)]
     pub fn pmkid(&self) -> Option<[u8; 16]> {
         self.pmkid
     }

@@ -32,6 +32,7 @@ const KEY_INFO_INSTALL: u16 = 0x0040;
 const KEY_INFO_ACK: u16 = 0x0080;
 const KEY_INFO_MIC: u16 = 0x0100;
 const KEY_INFO_SECURE: u16 = 0x0200;
+const KEY_INFO_REQUEST: u16 = 0x0800;
 const KEY_INFO_ENCRYPTED_DATA: u16 = 0x1000;
 
 /// EAPOL-Key frame parsed fields.
@@ -62,6 +63,13 @@ impl EapolKeyFrame {
 
     pub fn is_secure(&self) -> bool {
         self.key_info & KEY_INFO_SECURE != 0
+    }
+
+    /// The Request bit: the AP asks the supplicant to initiate a
+    /// handshake. Supplicants drop these frames (both wpa_supplicant and
+    /// iwd do); shuli never starts a handshake on its own either.
+    pub fn is_request(&self) -> bool {
+        self.key_info & KEY_INFO_REQUEST != 0
     }
 
     pub fn is_encrypted_data(&self) -> bool {
@@ -244,6 +252,7 @@ pub fn fmt_key_info(key_info: u16) -> String {
         (KEY_INFO_ACK, "ack"),
         (KEY_INFO_MIC, "mic"),
         (KEY_INFO_SECURE, "secure"),
+        (KEY_INFO_REQUEST, "request"),
         (KEY_INFO_ENCRYPTED_DATA, "enc-data"),
     ] {
         if key_info & bit != 0 {

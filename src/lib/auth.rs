@@ -69,6 +69,9 @@ impl AuthMethod {
         }
     }
 
+    /// PMKID of the completed authentication; consumed by the PMKSA
+    /// cache (Stage 2 G4).
+    #[allow(dead_code)]
     pub(crate) fn pmkid(&self) -> Option<[u8; 16]> {
         match self {
             AuthMethod::Sae(sae) => sae.pmkid(),

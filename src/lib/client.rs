@@ -537,20 +537,34 @@ impl WifiClient {
                             let mut ie_buf = elements::owe_ie();
                             ie_buf.extend_from_slice(&dh_elem);
                             log::debug!("associate OWE IE: {ie_buf:02x?}");
-                            if let Err(e) = self.associate(ie_buf, true).await {
+                            if let Err(e) = self
+                                .associate(
+                                    ie_buf,
+                                    Some(Nl80211UseMfp::Required),
+                                )
+                                .await
+                            {
                                 log::warn!("OWE ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
                             }
                         } else if self.bss_info.security
                             == SecurityType::Wpa2Psk
                         {
-                            // WPA2-PSK: associate with PSK RSNE.
+                            // WPA2-PSK: associate with PSK RSNE. PMF is
+                            // negotiated as optional (MFPC in the RSNE);
+                            // when the AP supports it, request MFP - the
+                            // kernel's ASSOCIATE command only takes
+                            // REQUIRED or none.
                             log::info!(
                                 "open-system AUTHENTICATE ok - sending \
                                  WPA2-PSK ASSOCIATE"
                             );
+                            let mfp = self
+                                .bss_info
+                                .ap_mfp_capable()
+                                .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
-                                .associate(elements::wpa2_psk_ie(), false)
+                                .associate(elements::wpa2_psk_ie(), mfp)
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -563,7 +577,7 @@ impl WifiClient {
                                  ASSOCIATE"
                             );
                             if let Err(e) =
-                                self.associate(Vec::new(), false).await
+                                self.associate(Vec::new(), None).await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
@@ -725,7 +739,13 @@ impl WifiClient {
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
-                if let Err(e) = self.associate(elements::sae_ie(), true).await {
+                if let Err(e) = self
+                    .associate(
+                        elements::sae_ie(),
+                        Some(Nl80211UseMfp::Required),
+                    )
+                    .await
+                {
                     log::warn!("ASSOCIATE failed: {e}");
                     self.state = WifiState::Failed;
                 }
@@ -746,12 +766,20 @@ impl WifiClient {
             parsed.replay_counter
         );
 
+        // EAPOL-Key with the Request bit asks the supplicant to start a
+        // handshake; both reference supplicants drop it, and so does
+        // shuli (handshakes here are AP-driven only).
+        if parsed.is_request() {
+            log::debug!("EAPOL-Key with Request bit - dropped");
+            return;
+        }
+
         if !parsed.has_mic() && parsed.has_ack() {
             // 4-way handshake Message 1 (ANonce).
             log::info!("4-way handshake: Message 1 (ANonce)");
 
             if self.fourway.is_none() {
-                let (pmk, pmkid, rsne, mic_alg) = match self.bss_info.security {
+                let (pmk, rsne, mic_alg) = match self.bss_info.security {
                     SecurityType::Owe => {
                         let Some(ref owe_auth) = self.owe else {
                             log::warn!("no OWE state for 4-way handshake");
@@ -763,12 +791,7 @@ impl WifiClient {
                             self.state = WifiState::Failed;
                             return;
                         };
-                        (
-                            pmk,
-                            owe_auth.pmkid().unwrap_or([0u8; 16]),
-                            elements::owe_ie(),
-                            MicAlg::HmacSha256,
-                        )
+                        (pmk, elements::owe_ie(), MicAlg::HmacSha256)
                     }
                     SecurityType::Wpa2Psk => {
                         let Some(pmk) = self.psk_pmk else {
@@ -776,12 +799,7 @@ impl WifiClient {
                             self.state = WifiState::Failed;
                             return;
                         };
-                        (
-                            pmk,
-                            [0u8; 16],
-                            elements::wpa2_psk_ie(),
-                            MicAlg::HmacSha1,
-                        )
+                        (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
                     }
                     _ => {
                         // SAE
@@ -792,24 +810,17 @@ impl WifiClient {
                             self.state = WifiState::Failed;
                             return;
                         };
-                        (
-                            pmk,
-                            self.auth
-                                .as_ref()
-                                .and_then(|a| a.pmkid())
-                                .unwrap_or([0u8; 16]),
-                            elements::sae_ie(),
-                            MicAlg::AesCmac,
-                        )
+                        (pmk, elements::sae_ie(), MicAlg::AesCmac)
                     }
                 };
-                self.fourway = Some(FourWayState::new(
+                self.fourway = Some(FourWayState::new_with_ap_ies(
                     &pmk,
-                    &pmkid,
+                    mic_alg,
                     self.mac,
                     self.bss_info.bssid,
                     rsne,
-                    mic_alg,
+                    self.bss_info.ap_rsne.clone(),
+                    self.bss_info.ap_rsnxe.clone(),
                 ));
             }
 
@@ -844,7 +855,7 @@ impl WifiClient {
             // 4-way handshake Message 3 (GTK + MIC).
             log::info!("4-way handshake: Message 3");
 
-            let (msg4, gtk) = {
+            let (msg4, kdes) = {
                 let fw = match self.fourway.as_mut() {
                     Some(fw) => fw,
                     None => {
@@ -903,16 +914,14 @@ impl WifiClient {
                 log::info!("PTK installed");
             }
 
-            if let Some(ref gtk_data) = gtk {
-                let gtk_idx =
-                    self.fourway.as_ref().map(|fw| fw.gtk_index()).unwrap_or(0);
+            if let Some((gtk_idx, gtk_data)) = &kdes.gtk {
                 if let Err(e) = drain_request(
                     self.conn_handle
                         .new_key(
                             Nl80211Key::new_gtk(
                                 self.if_index,
                                 gtk_data.to_vec(),
-                                gtk_idx,
+                                *gtk_idx,
                             )
                             .build(),
                         )
@@ -926,6 +935,58 @@ impl WifiClient {
                     return;
                 }
                 log::info!("GTK[{gtk_idx}] installed");
+            }
+
+            // G1a: install the IGTK (and BIGTK when the AP delivers one)
+            // from the Message 3 KDEs. Without the IGTK, mac80211 drops
+            // every protected management frame (SA Query, BTM, channel
+            // switch announcements) the AP sends. Failures are logged but
+            // not fatal: the data path works without them.
+            if let Some(ref igtk) = kdes.igtk {
+                match drain_request(
+                    self.conn_handle
+                        .new_key(
+                            Nl80211Key::new_igtk(
+                                self.if_index,
+                                igtk.key.clone(),
+                                igtk.key_index,
+                                igtk.ipn.to_vec(),
+                            )
+                            .build(),
+                        )
+                        .execute()
+                        .await,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        log::info!("IGTK[{}] installed", igtk.key_index)
+                    }
+                    Err(e) => log::warn!("install IGTK failed: {e}"),
+                }
+            }
+            if let Some(ref bigtk) = kdes.bigtk {
+                match drain_request(
+                    self.conn_handle
+                        .new_key(
+                            Nl80211Key::new_bigtk(
+                                self.if_index,
+                                bigtk.key.clone(),
+                                bigtk.key_index,
+                                bigtk.ipn.to_vec(),
+                            )
+                            .build(),
+                        )
+                        .execute()
+                        .await,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        log::info!("BIGTK[{}] installed", bigtk.key_index)
+                    }
+                    Err(e) => log::warn!("install BIGTK failed: {e}"),
+                }
             }
 
             // Try to offload GTK rekey to the driver/firmware.
@@ -1144,11 +1205,12 @@ impl WifiClient {
     ///
     /// `ie` carries the RSN element built for the network's security mode
     /// (plus e.g. the OWE DH Parameter Element); empty for open networks.
-    /// MFP (IEEE 802.11w) is required for SAE and OWE.
+    /// `mfp` requests management frame protection (IEEE 802.11w): required
+    /// for SAE and OWE, optional for WPA2-PSK (MFPC), absent for open.
     async fn associate(
         &mut self,
         ie: Vec<u8>,
-        use_mfp: bool,
+        mfp: Option<Nl80211UseMfp>,
     ) -> Result<(), WifiError> {
         let mut builder = Nl80211Associate::new(self.if_index)
             .ssid(&self.network.ssid)
@@ -1157,8 +1219,8 @@ impl WifiClient {
         if !ie.is_empty() {
             builder = builder.ie(ie);
         }
-        if use_mfp {
-            builder = builder.use_mfp(Nl80211UseMfp::Required);
+        if let Some(mfp) = mfp {
+            builder = builder.use_mfp(mfp);
         }
         // Encrypted networks carry EAPOL over nl80211 and tie the
         // connection's lifetime to this socket; open networks don't.

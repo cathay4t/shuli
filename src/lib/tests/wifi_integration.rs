@@ -143,6 +143,7 @@ channel=1
 ssid=Test-WIFI-NOPASS
 wpa=0
 auth_algs=1
+ctrl_interface=/var/run/hostapd
 ";
 
 const SAE_HOSTAPD_CONF: &str = r"
@@ -157,7 +158,30 @@ rsn_pairwise=CCMP
 ieee80211w=2
 sae_pwe=2
 sae_password=12345678
+ctrl_interface=/var/run/hostapd
 ";
+
+const WPA2_PSK_PMF_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PSK
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ieee80211w=1
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
+/// Run `hostapd_cli` against the test AP inside the test netns.
+fn hostapd_cli(args: &str) {
+    sh_ok(&format!(
+        "ip netns exec {TEST_NS} hostapd_cli -p /var/run/hostapd -i {AP_NIC} \
+         {args}"
+    ));
+}
 
 /// Run [`WifiClient::run()`] in a loop until a connected state is
 /// reached or `max_iters` is exhausted.
@@ -284,6 +308,107 @@ async fn wifi_client_multi_network_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(client.current_ssid(), "Test-WIFI");
+    client.shutdown().await;
+}
+
+/// G1a end-to-end: with PMF (ieee80211w=2) the AP sends an SA Query
+/// request - a protected action frame - to the STA. mac80211 only lets
+/// it through when shuli installed the IGTK from 4-way Message 3 (the
+/// kernel's SA Query responder answers it), and hostapd disassociates a
+/// STA that gives no answer. Surviving the SA Query therefore proves
+/// the IGTK reached the kernel.
+#[tokio::test]
+async fn wifi_client_sae_pmf_sa_query() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_pmf_sa_query: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("SA_QUERY {sta_mac}"));
+
+    // hostapd disassociates a STA that does not answer the SA Query
+    // within ~2s (response timeout + retries). Keep the client pumping
+    // events for longer than that; the connection must survive.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(state)) => {
+                assert!(
+                    matches!(
+                        state,
+                        WifiState::ConnectedWithoutOffloadRekey
+                            | WifiState::ConnectedWithOffloadRekey
+                    ),
+                    "SA Query broke the connection: {state:?}"
+                );
+            }
+            Ok(Err(e)) => panic!("client error during SA Query: {e}"),
+            Err(_) => {} // 500 ms without an event: still connected
+        }
+    }
+    assert!(matches!(
+        client.state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// G1d: WPA2-PSK with optional PMF (MFPC). The AP has ieee80211w=1, so
+/// the MFPC-bit RSNE negotiates PMF and the 4-way Message 3 carries an
+/// IGTK KDE; the connection must complete through PORT_AUTHORIZED.
+#[tokio::test]
+async fn wifi_client_wpa2_psk_pmf_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa2_psk_pmf_connect: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_PMF_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
     client.shutdown().await;
 }
 

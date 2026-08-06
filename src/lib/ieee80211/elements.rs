@@ -55,7 +55,10 @@ pub fn owe_ie() -> Vec<u8> {
     buf
 }
 
-/// Build the RSNE for WPA2-PSK (AKM 00-0F-AC:2, CCMP-128, no MFP).
+/// Build the RSNE for WPA2-PSK (AKM 00-0F-AC:2, CCMP-128). Management
+/// frame protection is negotiated as optional (MFPC without MFPR, iwd's
+/// default `ManagementFrameProtection=1` behaviour): PMF-capable APs then
+/// protect the connection with an IGTK, PMF-less APs still accept it.
 pub fn wpa2_psk_ie() -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
@@ -63,9 +66,9 @@ pub fn wpa2_psk_ie() -> Vec<u8> {
             group_cipher: Some(Nl80211CipherSuite::Ccmp128),
             pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
             akm_suits: vec![Nl80211AkmSuite::Psk],
-            rsn_capbilities: None,
+            rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
             pmkids: vec![],
-            group_mgmt_cipher: None,
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];

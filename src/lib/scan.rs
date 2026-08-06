@@ -30,12 +30,56 @@ pub enum SecurityType {
 }
 
 /// The best BSS candidate for the configured SSID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BssInfo {
     pub bssid: [u8; ETH_ALEN],
     pub freq_mhz: u32,
     pub signal_dbm: i32,
     pub security: SecurityType,
+    /// The AP's RSNE as a full element (ID + length + body) from the
+    /// beacon / probe response; empty on open BSSes. Used to validate
+    /// 4-way handshake Message 3 against downgrade attacks.
+    pub ap_rsne: Vec<u8>,
+    /// The AP's RSNXE as a full element (ID 244), empty when the AP
+    /// advertises none.
+    pub ap_rsnxe: Vec<u8>,
+}
+
+const RSN_CAP_MFPR: u16 = 1 << 6;
+const RSN_CAP_MFPC: u16 = 1 << 7;
+
+impl BssInfo {
+    /// Whether the AP advertises management frame protection (IEEE
+    /// 802.11w) in its RSNE capabilities: MFPC (optional) or MFPR
+    /// (required). When true, shuli requests MFP at association time -
+    /// `NL80211_CMD_ASSOCIATE` only accepts `NL80211_MFP_REQUIRED` or
+    /// no MFP (iwd resolves "optional PMF" the same way).
+    pub(crate) fn ap_mfp_capable(&self) -> bool {
+        rsne_mfp_capable(&self.ap_rsne)
+    }
+}
+
+/// Parse an RSNE element (ID + length + body) and report the MFPC/MFPR
+/// bits of its RSN capabilities field.
+fn rsne_mfp_capable(rsne: &[u8]) -> bool {
+    // Skip element ID + length; need version(2) + group(4) + pcount(2).
+    if rsne.len() < 2 + 8 {
+        return false;
+    }
+    let body = &rsne[2..];
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_offset = 8 + pcount * 4;
+    if body.len() < akm_offset + 2 {
+        return false;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
+    let cap_offset = akm_offset + 2 + acount * 4;
+    if body.len() < cap_offset + 2 {
+        return false;
+    }
+    let capab = u16::from_le_bytes([body[cap_offset], body[cap_offset + 1]]);
+    capab & (RSN_CAP_MFPR | RSN_CAP_MFPC) != 0
 }
 
 // Prefer the strongest signal; break ties by frequency (higher band first),
@@ -114,12 +158,15 @@ impl WifiClient {
                 "candidate BSS: ssid={bss_ssid}, bssid={bssid:02x?}, \
                  freq={freq_mhz} MHz, signal={signal_dbm}"
             );
+            let (security, ap_rsne, ap_rsnxe) = detect_security(ies);
             candidates.push((
                 BssInfo {
                     bssid,
                     freq_mhz,
                     signal_dbm,
-                    security: detect_security(ies),
+                    security,
+                    ap_rsne,
+                    ap_rsnxe,
                 },
                 network,
             ));
@@ -149,23 +196,42 @@ impl WifiClient {
 }
 
 const IE_ID_RSN: u8 = 48;
+const IE_ID_RSNXE: u8 = 244;
 const AKM_PSK: u8 = 2;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
 
 /// Walk an 802.11 IE buffer and determine the security type from the
-/// RSNE's AKM suites.
-fn detect_security(ies: &[u8]) -> SecurityType {
+/// RSNE's AKM suites. Also returns the raw RSNE / RSNXE elements (ID +
+/// length + body) for the 4-way handshake Message 3 downgrade check;
+/// both are empty when absent.
+fn detect_security(ies: &[u8]) -> (SecurityType, Vec<u8>, Vec<u8>) {
+    let mut rsne = Vec::new();
+    let mut rsnxe = Vec::new();
     let mut pos = 0;
     while pos + 2 <= ies.len() {
         let id = ies[pos];
         let len = ies[pos + 1] as usize;
-        if id == IE_ID_RSN && pos + 2 + len <= ies.len() {
-            return security_from_rsne(&ies[pos + 2..pos + 2 + len]);
+        if pos + 2 + len > ies.len() {
+            break;
+        }
+        match id {
+            IE_ID_RSN if rsne.is_empty() => {
+                rsne = ies[pos..pos + 2 + len].to_vec();
+            }
+            IE_ID_RSNXE if rsnxe.is_empty() => {
+                rsnxe = ies[pos..pos + 2 + len].to_vec();
+            }
+            _ => {}
         }
         pos += 2 + len;
     }
-    SecurityType::Open
+    let security = if rsne.len() > 2 {
+        security_from_rsne(&rsne[2..])
+    } else {
+        SecurityType::Open
+    };
+    (security, rsne, rsnxe)
 }
 
 /// Parse the RSNE body (after element ID + length) and check AKM suites.
@@ -234,11 +300,14 @@ pub async fn scan_wifi_with_ies(
         else {
             continue;
         };
+        let (security, ap_rsne, ap_rsnxe) = detect_security(ies);
         let info = BssInfo {
             bssid,
             freq_mhz,
             signal_dbm,
-            security: detect_security(ies),
+            security,
+            ap_rsne,
+            ap_rsnxe,
         };
         results.push((info, ies.to_vec()));
     }
