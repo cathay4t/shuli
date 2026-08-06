@@ -39,6 +39,4 @@ version = "0.21"
 
 [workspace.dependencies.wl-nl80211]
 version = "0.5"
-# Git checkout carries the schedule_stop_all() ifindex fix (not yet in a
-# crates.io release); switch back to crates.io once a release includes it.
-git = "https://github.com/cathay4t/wl-nl80211.git"
+git = "https://github.com/rust-netlink/wl-nl80211.git"
