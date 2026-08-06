@@ -23,11 +23,13 @@
 //! Set `RUST_LOG=info` (or `debug`) to get the client's `log` output while
 //! debugging.
 
-use std::sync::Mutex;
+use std::sync::LazyLock;
+
+use tokio::sync::Mutex;
 
 use crate::{WifiClient, WifiConfig, WifiState};
 
-static WIFI_LOCK: Mutex<()> = Mutex::new(());
+static WIFI_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Initialise `env_logger` once per test process when `RUST_LOG` is set.
 /// Defaults to `trace` so the full client flow is captured and printed by
@@ -164,10 +166,7 @@ async fn wifi_client_open_connect() {
         );
         return;
     }
-    let _guard = WIFI_LOCK
-        .lock()
-        // Recover from a previous test that panicked while holding the lock.
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = WIFI_LOCK.lock().await;
     let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
 
     let config = WifiConfig::new(TEST_NIC, "Test-WIFI-NOPASS");
@@ -192,10 +191,7 @@ async fn wifi_client_sae_connect() {
         );
         return;
     }
-    let _guard = WIFI_LOCK
-        .lock()
-        // Recover from a previous test that panicked while holding the lock.
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = WIFI_LOCK.lock().await;
     let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
 
     let mut config = WifiConfig::new(TEST_NIC, "Test-WIFI");

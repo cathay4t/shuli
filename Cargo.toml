@@ -20,7 +20,7 @@ env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 futures = "0.3"
 netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
@@ -39,3 +39,6 @@ version = "0.21"
 
 [workspace.dependencies.wl-nl80211]
 version = "0.5"
+# Git checkout carries the schedule_stop_all() ifindex fix (not yet in a
+# crates.io release); switch back to crates.io once a release includes it.
+git = "https://github.com/cathay4t/wl-nl80211.git"

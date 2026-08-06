@@ -12,9 +12,10 @@
 use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{
     Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
-    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Event,
-    Nl80211EventCode, Nl80211Handle, Nl80211Key, Nl80211MulticastGroup,
-    Nl80211RekeyOffload, Nl80211UseMfp,
+    Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
+    Nl80211Event, Nl80211EventCode, Nl80211Handle, Nl80211Key,
+    Nl80211MulticastGroup, Nl80211RekeyOffload, Nl80211SchedScanMatch,
+    Nl80211SchedScanPlan, Nl80211UseMfp,
 };
 
 use crate::{
@@ -30,7 +31,25 @@ use crate::{
     scan::{BssInfo, SecurityType},
 };
 
-const RETRY_WAIT_SEC: u64 = 10;
+/// Initial scan-retry backoff (seconds) used while hunting for the
+/// configured SSID. Doubles after each failed scan, capped at
+/// [`RETRY_BACKOFF_MAX_SEC`].
+const RETRY_BACKOFF_INIT_SEC: u64 = 10;
+/// Cap (seconds) for the scan-retry backoff; mirrors iwd's
+/// `MaximumPeriodicScanInterval` default.
+const RETRY_BACKOFF_MAX_SEC: u64 = 300;
+/// Interval (seconds) between hardware scheduled scan (PNO) iterations
+/// while hunting for the configured SSID. The firmware scans this often
+/// while the host sleeps; shuli only wakes on
+/// `NL80211_CMD_SCHED_SCAN_RESULTS`.
+const SCHED_SCAN_INTERVAL_SEC: u32 = 10;
+/// Watchdog (seconds) for [`WifiState::SchedScanWait`]: with an SSID
+/// match set the firmware only reports on a match, so an absent AP
+/// produces no results events at all. If none arrives this long, the
+/// scan is re-armed via the host fallback (the firmware may have
+/// silently stopped). Longer than the firmware's scan interval, so a
+/// match (present AP) always wakes us first.
+const SCHED_SCAN_WATCHDOG_SECS: u64 = 60;
 const RETRY_AUTH_SEC: u64 = 600;
 /// Max time to wait for the next authentication event (SAE frame, association
 /// result, 4-way handshake message) before giving up and retrying.
@@ -43,6 +62,10 @@ pub enum WifiState {
     Init,
     /// Scan in flight / waiting for results.
     Scanning,
+    /// Hardware scheduled scan (PNO) active: the firmware scans
+    /// periodically and the host sleeps until the configured SSID shows
+    /// up (`NL80211_CMD_SCHED_SCAN_RESULTS`).
+    SchedScanWait,
     /// SAE + association + 4-way handshake in progress.
     Authenticating,
     /// Ready for communication, but shuli must stay running to follow up
@@ -65,6 +88,22 @@ pub struct WifiClient {
         netlink_sys::SocketAddr,
     )>,
     pub(crate) state: WifiState,
+    /// Current scan-retry backoff in seconds; doubles after each scan
+    /// that fails to find the SSID (capped at `RETRY_BACKOFF_MAX_SEC`)
+    /// and resets to `RETRY_BACKOFF_INIT_SEC` once the SSID is found or
+    /// a connection is established.
+    pub(crate) scan_retry_interval: u64,
+    /// Whether the driver advertises hardware scheduled scan (PNO)
+    /// support.
+    pub(crate) sched_scan_supported: bool,
+    /// Whether a scheduled scan is currently running in the firmware.
+    pub(crate) sched_scan_active: bool,
+    /// A stop was requested and the kernel's `SCHED_SCAN_STOPPED` echo
+    /// has not been consumed yet. The kernel multicasts that event for
+    /// every stop - including our own - so this flag lets
+    /// [`WifiState::SchedScanWait`] tell our own echo from a genuine
+    /// firmware abort.
+    pub(crate) sched_scan_stop_pending: bool,
     pub(crate) if_index: u32,
     pub(crate) mac: [u8; ETH_ALEN],
     pub(crate) config: WifiConfig,
@@ -97,14 +136,37 @@ impl WifiClient {
             .map_err(|e| WifiError::new(ErrorKind::Config, e.to_string()))?;
         tokio::spawn(conn);
 
-        let (if_index, mac) =
+        let (if_index, mac, wiphy_idx) =
             get_if_index_and_mac(&handle, &config.iface_name).await?;
 
         log::info!(
-            "interface {} if_index={}, mac={mac:02x?}",
+            "interface {} if_index={}, mac={mac:02x?}, wiphy={wiphy_idx}",
             config.iface_name,
             if_index
         );
+
+        // Detect hardware scheduled scan (PNO) support once: when
+        // available, the firmware keeps scanning while the host sleeps.
+        let sched_scan_supported =
+            match wiphy_supports_sched_scan(&handle, wiphy_idx).await {
+                Ok(true) => {
+                    log::info!(
+                        "wiphy {wiphy_idx} supports scheduled scan (PNO)"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    log::info!(
+                        "wiphy {wiphy_idx} has no scheduled scan support; \
+                         using host-side scan backoff"
+                    );
+                    false
+                }
+                Err(e) => {
+                    log::debug!("could not query sched scan support: {e}");
+                    false
+                }
+            };
 
         let conn_handle = handle.connection();
 
@@ -113,6 +175,10 @@ impl WifiClient {
             conn_handle,
             event_receiver,
             state: WifiState::Init,
+            scan_retry_interval: RETRY_BACKOFF_INIT_SEC,
+            sched_scan_supported,
+            sched_scan_active: false,
+            sched_scan_stop_pending: false,
             if_index,
             mac,
             config,
@@ -149,9 +215,91 @@ impl WifiClient {
             }
             WifiState::Scanning => {
                 self.wait_scan_finish().await;
-                self.process_scan_results().await?;
+                if let Err(e) = self.process_scan_results().await {
+                    // SSID not found: hand the periodic scanning over to
+                    // the firmware (PNO) when supported, otherwise fall
+                    // back to host-side scans with exponential backoff.
+                    if e.kind == ErrorKind::SsidNotFound
+                        && self.start_sched_scan().await?
+                    {
+                        log::info!(
+                            "SSID '{}' not found; entering scheduled scan mode",
+                            self.config.ssid
+                        );
+                        self.state = WifiState::SchedScanWait;
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+                // SSID found - reset the scan-retry backoff.
+                self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.send_out_auth_request().await?;
                 self.state = WifiState::Authenticating;
+            }
+            WifiState::SchedScanWait => {
+                // The firmware scans on the configured interval while the
+                // host sleeps here; only sched-scan events wake us. The
+                // watchdog catches a firmware that silently stopped.
+                let timed = tokio::time::timeout(
+                    std::time::Duration::from_secs(SCHED_SCAN_WATCHDOG_SECS),
+                    self.event_receiver.next(),
+                )
+                .await;
+                match timed {
+                    Ok(Some((raw_msg, _addr))) => {
+                        if let Some(event) =
+                            wl_nl80211::Nl80211Event::parse(raw_msg)
+                        {
+                            match event {
+                                Nl80211Event::Unknown {
+                                    cmd: Nl80211Command::SchedScanResults,
+                                } => {
+                                    self.handle_sched_scan_results().await?;
+                                }
+                                Nl80211Event::Unknown {
+                                    cmd: Nl80211Command::SchedScanStopped,
+                                } => {
+                                    if self.sched_scan_stop_pending {
+                                        // Echo of our own stop request
+                                        // (e.g. the watchdog fallback
+                                        // stopped the scan); the firmware
+                                        // scan is already gone, so just
+                                        // keep waiting for a match.
+                                        self.sched_scan_stop_pending = false;
+                                    } else {
+                                        // The kernel/firmware aborted the
+                                        // scan on its own (e.g. regulatory
+                                        // change); restart it or fall back
+                                        // to host-side backoff.
+                                        log::warn!(
+                                            "scheduled scan stopped by \
+                                             kernel; restarting"
+                                        );
+                                        self.sched_scan_active = false;
+                                        if !self.start_sched_scan().await? {
+                                            self.state = WifiState::Failed;
+                                        }
+                                    }
+                                }
+                                other => self.handle_event(other).await,
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        return Err(WifiError::new(
+                            ErrorKind::Nl80211,
+                            "event channel closed",
+                        ));
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "no scheduled scan results for {}s; falling back \
+                             to host scans",
+                            SCHED_SCAN_WATCHDOG_SECS
+                        );
+                        self.state = WifiState::Failed;
+                    }
+                }
             }
             WifiState::Authenticating => {
                 let timed = tokio::time::timeout(
@@ -200,17 +348,141 @@ impl WifiClient {
                 }
             }
             WifiState::Failed | WifiState::FailedAuthentication => {
+                // Ensure no firmware scheduled scan keeps running when we
+                // leave scan-wait mode (e.g. after an error).
+                if self.sched_scan_active {
+                    let _ = self.stop_sched_scan().await;
+                }
                 let secs = if self.state == WifiState::FailedAuthentication {
                     RETRY_AUTH_SEC
                 } else {
-                    RETRY_WAIT_SEC
+                    self.scan_retry_interval
                 };
                 log::info!("{:?}; retrying in {} seconds", self.state, secs);
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                if self.state == WifiState::Failed {
+                    // Exponential backoff: 10 -> 20 -> 40 -> ... -> 300.
+                    self.scan_retry_interval = (self.scan_retry_interval * 2)
+                        .min(RETRY_BACKOFF_MAX_SEC);
+                }
                 self.state = WifiState::Init;
             }
         }
         Ok(())
+    }
+
+    /// Hand the periodic scanning over to the firmware (PNO): ask it to
+    /// scan for the configured SSID on a fixed interval while the host
+    /// sleeps. Returns true when a scheduled scan is now running.
+    async fn start_sched_scan(&mut self) -> Result<bool, WifiError> {
+        if !self.sched_scan_supported {
+            return Ok(false);
+        }
+        let attrs = vec![
+            Nl80211Attr::IfIndex(self.if_index),
+            // Active probe for the configured SSID...
+            Nl80211Attr::ScanSsids(vec![self.config.ssid.clone()]),
+            // ...and only wake us when it shows up.
+            Nl80211Attr::SchedScanMatch(vec![Nl80211SchedScanMatch::Ssid(
+                self.config.ssid.clone(),
+            )]),
+            Nl80211Attr::SchedScanPlans(vec![Nl80211SchedScanPlan::Interval(
+                SCHED_SCAN_INTERVAL_SEC,
+            )]),
+            // Tie the scan to this socket so the kernel stops it if shuli
+            // dies without a chance to clean up.
+            Nl80211Attr::SocketOwner,
+        ];
+        // Drive the request manually so a permanent "not supported"
+        // (-EOPNOTSUPP) can be told apart from transient failures; the
+        // errno is lost once the error is converted into `WifiError`.
+        let mut stream =
+            self.handle.scan().schedule_start(attrs).execute().await;
+        let result = loop {
+            match stream.try_next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.sched_scan_active = true;
+                log::info!(
+                    "scheduled scan started: ssid='{}', interval={}s",
+                    self.config.ssid,
+                    SCHED_SCAN_INTERVAL_SEC
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                if is_eopnotsupp(&e) {
+                    // Driver has no sched_scan_start op: fall back to
+                    // host-side scans with exponential backoff for good.
+                    log::debug!(
+                        "scheduled scan unsupported; using host scan backoff: \
+                         {e}"
+                    );
+                    self.sched_scan_supported = false;
+                } else {
+                    // Transient failure (e.g. -EBUSY): keep PNO enabled
+                    // and retry on the next scan cycle.
+                    log::debug!("scheduled scan start failed: {e}");
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Stop the firmware scheduled scan. Best-effort: failures are only
+    /// logged since a lingering scan is not fatal.
+    async fn stop_sched_scan(&mut self) -> Result<(), WifiError> {
+        if !self.sched_scan_active {
+            return Ok(());
+        }
+        self.sched_scan_active = false;
+        self.sched_scan_stop_pending = true;
+        match drain_request(
+            self.handle
+                .scan()
+                .schedule_stop_all(self.if_index)
+                .execute()
+                .await,
+        )
+        .await
+        {
+            Ok(()) => {
+                log::info!("scheduled scan stopped");
+                Ok(())
+            }
+            Err(e) => {
+                log::debug!("stop scheduled scan failed: {e}");
+                Ok(())
+            }
+        }
+    }
+
+    /// A `NL80211_CMD_SCHED_SCAN_RESULTS` event arrived: dump the
+    /// firmware's results and check whether the configured SSID is there.
+    async fn handle_sched_scan_results(&mut self) -> Result<(), WifiError> {
+        log::debug!("scheduled scan results event");
+        match self.process_scan_results().await {
+            Ok(()) => {
+                // SSID found - stop the firmware scan and connect.
+                self.stop_sched_scan().await?;
+                self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
+                self.send_out_auth_request().await?;
+                self.state = WifiState::Authenticating;
+                Ok(())
+            }
+            Err(e) if e.kind == ErrorKind::SsidNotFound => {
+                // No match in this round; the firmware keeps scanning and
+                // wakes us again with the next results event.
+                log::debug!("SSID not in scheduled scan results; continuing");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn handle_event(&mut self, event: Nl80211Event) {
@@ -292,6 +564,7 @@ impl WifiClient {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
                         );
+                        self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                         self.state = WifiState::ConnectedWithoutOffloadRekey;
                     } else if self.bss_info.security == SecurityType::Owe {
                         if self.process_owe_assoc_response(ies.as_deref()) {
@@ -328,6 +601,7 @@ impl WifiClient {
 
             Nl80211Event::PortAuthorized => {
                 log::info!("PORT_AUTHORIZED - connection ready");
+                self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
 
@@ -343,6 +617,14 @@ impl WifiClient {
                 log::debug!("EXTERNAL_AUTH event (unsupported in this mode)");
             }
             Nl80211Event::Unknown { cmd } => {
+                if cmd == Nl80211Command::SchedScanStopped
+                    && self.sched_scan_stop_pending
+                {
+                    // Consume the echo of our own stop request when it
+                    // lands outside SchedScanWait (e.g. while
+                    // authenticating).
+                    self.sched_scan_stop_pending = false;
+                }
                 log::debug!("event: {cmd:?}");
             }
             // `Nl80211Event` is #[non_exhaustive]; keep future variants
@@ -651,11 +933,13 @@ impl WifiClient {
 
             if offloaded {
                 log::info!("keys installed - connection established");
+                self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithOffloadRekey;
             } else {
                 log::info!(
                     "keys installed - connection established (userspace rekey)"
                 );
+                self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
         } else if parsed.has_mic()
@@ -758,6 +1042,8 @@ impl WifiClient {
     /// Cleanly disconnect from the AP.  Call this before dropping the
     /// client so the AP receives a proper deauthentication.
     pub async fn shutdown(&mut self) {
+        // Stop any running firmware scheduled scan before disconnecting.
+        let _ = self.stop_sched_scan().await;
         if let Err(e) =
             connect::disconnect(&mut self.conn_handle, self.if_index).await
         {
@@ -769,18 +1055,31 @@ impl WifiClient {
 impl Drop for WifiClient {
     fn drop(&mut self) {
         let mut conn_handle = self.conn_handle.clone();
+        let handle = self.handle.clone();
         let if_index = self.if_index;
-        // Best-effort: run the disconnect on a dedicated thread with its
-        // own runtime so we never panic outside a tokio context.  The
-        // thread is detached; if the process exits first the disconnect
-        // is simply lost (same as the old tokio::spawn approach, but
-        // without the panic risk).
+        let sched_scan_active = self.sched_scan_active;
+        // Best-effort: run the cleanup on a dedicated thread with its own
+        // runtime so we never panic outside a tokio context.  The thread
+        // is detached; if the process exits first the cleanup is simply
+        // lost (same as the old tokio::spawn approach, but without the
+        // panic risk).  When the process does exit, the kernel also stops
+        // a socket-owned scheduled scan by itself (nl80211_netlink_notify).
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
             if let Ok(rt) = rt {
                 rt.block_on(async {
+                    if sched_scan_active {
+                        let _ = drain_request(
+                            handle
+                                .scan()
+                                .schedule_stop_all(if_index)
+                                .execute()
+                                .await,
+                        )
+                        .await;
+                    }
                     let _ =
                         connect::disconnect(&mut conn_handle, if_index).await;
                 });
@@ -855,7 +1154,7 @@ where
 async fn get_if_index_and_mac(
     handle: &Nl80211Handle,
     ifname: &str,
-) -> Result<(u32, [u8; ETH_ALEN]), WifiError> {
+) -> Result<(u32, [u8; ETH_ALEN], u32), WifiError> {
     let mut dump = handle.interface().get(vec![]).execute().await;
     while let Some(msg) = dump.try_next().await? {
         if msg.payload.attributes.iter().any(
@@ -863,15 +1162,27 @@ async fn get_if_index_and_mac(
         ) {
             let mut index = 0;
             let mut mac = [0u8; ETH_ALEN];
+            let mut wiphy = None;
             for attr in &msg.payload.attributes {
                 if let Nl80211Attr::IfIndex(idx) = attr {
                     index = *idx;
                 } else if let Nl80211Attr::Mac(mac_addr) = attr {
                     mac.copy_from_slice(mac_addr);
+                } else if let Nl80211Attr::Wiphy(w) = attr {
+                    wiphy = Some(*w);
                 }
             }
             if index != 0 && mac != [0u8; ETH_ALEN] {
-                return Ok((index, mac));
+                return match wiphy {
+                    Some(w) => Ok((index, mac, w)),
+                    None => Err(WifiError::new(
+                        ErrorKind::Nl80211,
+                        format!(
+                            "interface {ifname}: wiphy index missing from \
+                             netlink message: {msg:?}",
+                        ),
+                    )),
+                };
             } else {
                 return Err(WifiError::new(
                     ErrorKind::InterfaceNotFound,
@@ -887,4 +1198,40 @@ async fn get_if_index_and_mac(
         ErrorKind::InterfaceNotFound,
         format!("interface {ifname} not found"),
     ))
+}
+
+/// Whether the netlink error is `-EOPNOTSUPP`, i.e. the driver has no
+/// `sched_scan_start` op. Netlink NACK codes carry the negated errno.
+fn is_eopnotsupp(e: &wl_nl80211::Nl80211Error) -> bool {
+    matches!(
+        e,
+        wl_nl80211::Nl80211Error::NetlinkError(err)
+            if err.code == std::num::NonZeroI32::new(-95)
+    )
+}
+
+/// Whether the wiphy owning `wiphy_idx` advertises hardware scheduled
+/// scan (PNO) support. The kernel omits
+/// `NL80211_ATTR_MAX_NUM_SCHED_SCAN_SSIDS` for drivers without a
+/// `sched_scan_start` op, so its presence means the feature is available.
+async fn wiphy_supports_sched_scan(
+    handle: &Nl80211Handle,
+    wiphy_idx: u32,
+) -> Result<bool, WifiError> {
+    let mut dump = handle.wireless_physic().get().execute().await;
+    while let Some(msg) = dump.try_next().await? {
+        let mut idx = None;
+        let mut max_ssids = 0u8;
+        for attr in &msg.payload.attributes {
+            match attr {
+                Nl80211Attr::Wiphy(i) => idx = Some(*i),
+                Nl80211Attr::MaxNumSchedScanSsids(n) => max_ssids = *n,
+                _ => {}
+            }
+        }
+        if idx == Some(wiphy_idx) {
+            return Ok(max_ssids > 0);
+        }
+    }
+    Ok(false)
 }

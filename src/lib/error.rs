@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
     Config,
     Nl80211,
