@@ -136,6 +136,9 @@ fn process_sae_frame(
 impl WifiClient {
     /// Start authentication with the selected BSS.
     ///
+    /// PMKSA cache hit (Stage 2 G4): send open-system AUTHENTICATE and
+    /// associate with the cached PMKID, skipping the full SAE exchange.
+    ///
     /// Open networks: send open-system AUTHENTICATE (no auth method, no
     /// SAE).  The `Authenticated` event handler proceeds to associate.
     ///
@@ -146,13 +149,37 @@ impl WifiClient {
         self.auth = None;
         self.fourway = None;
         self.psk_pmk = None;
+        self.pmksa_in_use = None;
 
-        if self.bss_info.security != SecurityType::Sae {
-            // Open, OWE, and WPA2-PSK all use open-system
-            // authentication.  OWE's DH exchange happens in the
-            // association request/response; WPA2-PSK derives the
-            // PMK from the passphrase via PBKDF2.
-            if self.bss_info.security == SecurityType::Wpa2Psk {
+        // G4: a cached PMKSA for the selected BSS replaces the full
+        // authentication (SAE) with open-system auth + a PMKID-bearing
+        // RSNE at association time.
+        if matches!(
+            self.bss_info.security,
+            SecurityType::Sae | SecurityType::Wpa2Psk
+        ) && let Some(entry) = self
+            .pmksa_cache
+            .lookup(&self.network.ssid, self.bss_info.bssid)
+        {
+            log::info!(
+                "PMKSA cache hit for BSSID {:02x?} (pmkid {:02x?}); skipping \
+                 full authentication",
+                self.bss_info.bssid,
+                entry.pmkid
+            );
+            self.pmksa_in_use = Some(entry);
+        }
+
+        if self.pmksa_in_use.is_some()
+            || self.bss_info.security != SecurityType::Sae
+        {
+            // Open-system authentication: open, OWE, WPA2-PSK, and
+            // cached-PMKSA connections. OWE's DH exchange happens in the
+            // association request/response; WPA2-PSK derives the PMK from
+            // the passphrase via PBKDF2.
+            if self.pmksa_in_use.is_none()
+                && self.bss_info.security == SecurityType::Wpa2Psk
+            {
                 let password =
                     self.network.password.as_deref().ok_or_else(|| {
                         WifiError::new(

@@ -148,3 +148,28 @@ pub fn pbkdf2_pmk(password: &str, ssid: &str) -> [u8; 32] {
     );
     pmk
 }
+
+/// PMKID for SHA-256 based AKMs (PSK-SHA256, 802.1X-SHA256, ...),
+/// 802.11-2020 §9.4.2.25.3 / §12.7.1.5:
+/// `PMKID = Truncate-128(HMAC-SHA256(PMK, "PMK Name" || AA || SPA))`
+/// with AA = authenticator address (BSSID), SPA = supplicant address.
+/// No SHA-256 AKM is wired up yet (SAE caches the SAE-derived PMKID and
+/// WPA2-PSK the SHA-1 variant), so keep the derivation ready here.
+#[allow(dead_code)]
+pub fn pmkid_sha256(pmk: &[u8], aa: &[u8; 6], spa: &[u8; 6]) -> [u8; 16] {
+    let mut data = Vec::with_capacity(8 + 6 + 6);
+    data.extend_from_slice(b"PMK Name");
+    data.extend_from_slice(aa);
+    data.extend_from_slice(spa);
+    hmac_sha256_mic(pmk, &data)
+}
+
+/// PMKID for the legacy AKMs (WPA2-PSK / 802.1X, AKM 00-0F-AC:1/2):
+/// `PMKID = Truncate-128(HMAC-SHA1(PMK, "PMK Name" || AA || SPA))`.
+pub fn pmkid_sha1(pmk: &[u8], aa: &[u8; 6], spa: &[u8; 6]) -> [u8; 16] {
+    let mut data = Vec::with_capacity(8 + 6 + 6);
+    data.extend_from_slice(b"PMK Name");
+    data.extend_from_slice(aa);
+    data.extend_from_slice(spa);
+    hmac_sha1_mic(pmk, &data)
+}

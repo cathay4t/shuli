@@ -3,7 +3,7 @@
 use netlink_packet_core::Emitable;
 use wl_nl80211::{
     Nl80211AkmSuite, Nl80211CipherSuite, Nl80211Element, Nl80211ElementRsn,
-    Nl80211ElementRsnExt, Nl80211Elements, Nl80211RsnCapbilities,
+    Nl80211ElementRsnExt, Nl80211Elements, Nl80211Pmkid, Nl80211RsnCapbilities,
     Nl80211RsnExtCapbilities,
 };
 
@@ -12,6 +12,12 @@ use wl_nl80211::{
 /// the Association Request and in 4-way handshake Message 2; the AP verifies
 /// they match, so both call sites must use this single builder.
 pub fn sae_ie() -> Vec<u8> {
+    sae_ie_with_pmkid(None)
+}
+
+/// [`sae_ie`] carrying a PMKID (PMKSA caching / roaming: the AP may skip
+/// the full SAE exchange when it recognises the PMKID).
+pub fn sae_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
     let elements = Nl80211Elements(vec![
         Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -21,7 +27,7 @@ pub fn sae_ie() -> Vec<u8> {
             rsn_capbilities: Some(
                 Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
             ),
-            pmkids: vec![],
+            pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
             group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
         }),
         Nl80211Element::RsnExt(Nl80211ElementRsnExt {
@@ -60,6 +66,11 @@ pub fn owe_ie() -> Vec<u8> {
 /// default `ManagementFrameProtection=1` behaviour): PMF-capable APs then
 /// protect the connection with an IGTK, PMF-less APs still accept it.
 pub fn wpa2_psk_ie() -> Vec<u8> {
+    wpa2_psk_ie_with_pmkid(None)
+}
+
+/// [`wpa2_psk_ie`] carrying a PMKID (PMKSA caching / roaming).
+pub fn wpa2_psk_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -67,7 +78,7 @@ pub fn wpa2_psk_ie() -> Vec<u8> {
             pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
             akm_suits: vec![Nl80211AkmSuite::Psk],
             rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
-            pmkids: vec![],
+            pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
             group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
         })]);
 

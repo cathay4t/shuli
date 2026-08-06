@@ -203,6 +203,25 @@ async fn run_until_connected(
     ))
 }
 
+/// Pump events until the socket goes quiet: the kernel delivers a few
+/// trailing events (TX status reports etc.) after a connection settles;
+/// this drains them before a test injects new input.
+async fn drain_pending_events(client: &mut WifiClient) {
+    let mut idle = 0;
+    while idle < 2 {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(_)) => idle = 0,
+            Ok(Err(e)) => panic!("client error while draining events: {e}"),
+            Err(_) => idle += 1, // 400 ms without an event
+        }
+    }
+}
+
 #[tokio::test]
 async fn wifi_client_open_connect() {
     init_logger();
@@ -409,6 +428,76 @@ async fn wifi_client_wpa2_psk_pmf_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
+    client.shutdown().await;
+}
+
+/// G4: after the first SAE connection the PMKSA is cached. When the AP
+/// disconnects the STA, the client must reconnect without a new SAE
+/// exchange: the association carries the cached PMKID and the AP runs
+/// the 4-way handshake directly with the cached PMK.
+#[tokio::test]
+async fn wifi_client_sae_pmksa_reconnect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_pmksa_reconnect: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    // First connection: full SAE exchange, PMKSA cached afterwards.
+    assert!(client.auth.is_some(), "first connect must run full SAE");
+    assert!(
+        client
+            .pmksa_cache
+            .lookup("Test-WIFI", client.bss_info.bssid)
+            .is_some(),
+        "PMKSA must be cached after the first connection"
+    );
+
+    // Drain the trailing events of the first connection (e.g. the
+    // control-port TX status) so the disconnect below is seen cleanly.
+    drain_pending_events(&mut client).await;
+
+    // Force an AP-initiated disconnect; the retry loop must reconnect
+    // through the cached PMKID.
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
+
+    // Disconnect event -> Failed -> 10 s backoff -> scan -> PMKSA-cached
+    // association; allow enough iterations for the whole walk.
+    let state = run_until_connected(&mut client, 40)
+        .await
+        .expect("reconnect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    // No SAE auth state means no commit/confirm exchange happened on
+    // the reconnect - the AP accepted the PMKID.
+    assert!(
+        client.auth.is_none(),
+        "reconnect must skip SAE when the PMKSA cache hits"
+    );
     client.shutdown().await;
 }
 

@@ -8,6 +8,7 @@ mod error;
 mod ieee80211;
 mod mac;
 pub mod nl80211;
+mod pmksa;
 pub mod scan;
 #[cfg(test)]
 mod tests;

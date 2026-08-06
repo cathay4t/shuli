@@ -14,9 +14,9 @@ use wl_nl80211::{
     Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
     Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
     Nl80211Event, Nl80211EventCode, Nl80211Handle, Nl80211Key,
-    Nl80211MulticastGroup, Nl80211RekeyOffload, Nl80211SchedScanMatch,
-    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
-    Nl80211UseMfp,
+    Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
+    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
+    Nl80211SchedScanPlanAttr, Nl80211UseMfp,
 };
 
 use crate::{
@@ -25,10 +25,15 @@ use crate::{
     config::WifiConfig,
     crypto::{
         handshake4::{FourWayState, MicAlg},
+        kdf,
         owe::{self, OweAuth},
     },
     ieee80211::{auth, eapol, elements},
     nl80211::connect,
+    pmksa::{
+        PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
+        PmksaEntry, entry_with_fresh_lifetime,
+    },
     scan::{BssInfo, SecurityType},
 };
 
@@ -121,6 +126,12 @@ pub struct WifiClient {
     pub(crate) psk_pmk: Option<[u8; 32]>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
+    /// PMKSA cache (Stage 2 G4): reconnects and roams to a cached BSS
+    /// skip the full authentication.
+    pub(crate) pmksa_cache: PmksaCache,
+    /// The PMKSA entry of the connection attempt in flight, when the
+    /// association is (to be) done with a cached PMKID.
+    pub(crate) pmksa_in_use: Option<PmksaEntry>,
 }
 
 impl WifiClient {
@@ -199,6 +210,8 @@ impl WifiClient {
             owe: None,
             psk_pmk: None,
             fourway: None,
+            pmksa_cache: PmksaCache::default(),
+            pmksa_in_use: None,
         })
     }
 
@@ -372,7 +385,53 @@ impl WifiClient {
                     self.scan_retry_interval
                 };
                 log::info!("{:?}; retrying in {} seconds", self.state, secs);
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                // Pump events instead of sleeping blindly: the kernel
+                // delivers MLME notifications with considerable lag
+                // (AP deauth/disassoc and the reply to our own
+                // CMD_DISCONNECT can trail seconds behind). Consuming
+                // them here, before the next attempt starts, is what
+                // keeps the reconnect flow from tripping over stale
+                // events.
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(secs);
+                loop {
+                    let remaining = deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        remaining,
+                        self.event_receiver.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some((raw_msg, _addr))) => {
+                            if let Some(event) =
+                                wl_nl80211::Nl80211Event::parse(raw_msg)
+                            {
+                                self.handle_event(event).await;
+                            }
+                            if !matches!(
+                                self.state,
+                                WifiState::Failed
+                                    | WifiState::FailedAuthentication
+                            ) {
+                                // An event advanced the state machine
+                                // (e.g. a scheduled-scan result); honour
+                                // it instead of running the retry path.
+                                return Ok(());
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(WifiError::new(
+                                ErrorKind::Nl80211,
+                                "event channel closed",
+                            ));
+                        }
+                        Err(_) => break, // backoff elapsed
+                    }
+                }
                 if self.state == WifiState::Failed {
                     // Exponential backoff: 10 -> 20 -> 40 -> ... -> 300.
                     self.scan_retry_interval = (self.scan_retry_interval * 2)
@@ -521,7 +580,22 @@ impl WifiClient {
             }
 
             Nl80211Event::Authenticated { status, frame } => {
-                if self.bss_info.security != SecurityType::Sae {
+                if self.pmksa_in_use.is_some() {
+                    // G4 PMKSA caching: the open-system authentication
+                    // already succeeded; associate with the cached PMKID in
+                    // the RSNE. An AP without the matching PMKSA rejects
+                    // the association, which triggers the full-auth
+                    // fallback.
+                    if status == Nl80211EventCode::Success {
+                        self.associate_with_pmksa().await;
+                    } else {
+                        log::warn!(
+                            "AUTHENTICATE failed (cached PMKSA): \
+                             status={status}"
+                        );
+                        self.pmksa_fallback().await;
+                    }
+                } else if self.bss_info.security != SecurityType::Sae {
                     // Open-system auth (open + OWE): no frame, just
                     // a status.
                     if status == Nl80211EventCode::Success {
@@ -619,8 +693,26 @@ impl WifiClient {
                             self.state = WifiState::Failed;
                         }
                     } else {
-                        log::info!("ASSOCIATED - waiting for 4-way handshake");
+                        if self.pmksa_in_use.is_some() {
+                            log::info!(
+                                "ASSOCIATED with cached PMKID - the AP \
+                                 accepted the PMKSA; awaiting 4-way handshake"
+                            );
+                        } else {
+                            log::info!(
+                                "ASSOCIATED - waiting for 4-way handshake"
+                            );
+                        }
                     }
+                } else if self.pmksa_in_use.is_some() {
+                    // The AP rejected the association with the cached
+                    // PMKID (no matching PMKSA on the AP side): fall back
+                    // to full authentication right away.
+                    log::warn!(
+                        "ASSOCIATE with cached PMKID failed: status={status} \
+                         - retrying with full authentication"
+                    );
+                    self.pmksa_fallback().await;
                 } else {
                     log::warn!("ASSOCIATE failed: status={status}");
                     self.state = WifiState::Failed;
@@ -667,8 +759,58 @@ impl WifiClient {
                     // lands outside SchedScanWait (e.g. while
                     // authenticating).
                     self.sched_scan_stop_pending = false;
+                } else if matches!(
+                    cmd,
+                    Nl80211Command::Deauthenticate
+                        | Nl80211Command::Disassociate
+                        | Nl80211Command::UnprotDeauthenticate
+                        | Nl80211Command::UnprotDisassociate
+                        | Nl80211Command::DelStation
+                ) {
+                    // AP-initiated disconnect: mac80211 reports the
+                    // deauth/disassoc (and the station-entry removal)
+                    // rather than CMD_DISCONNECT when userspace drives
+                    // the MLME. The PMKSA cache is kept: if the AP
+                    // still holds the PMKSA the next reconnect skips the
+                    // full authentication; otherwise the association is
+                    // rejected and the fallback kicks in.
+                    //
+                    // Only act while connected: the kernel delivers the
+                    // same disconnect as several events with a long
+                    // delay between them, and acting on a stale one
+                    // would tear down the reconnection already in
+                    // flight (wpa_supplicant drops stale events the
+                    // same way).
+                    if matches!(
+                        self.state,
+                        WifiState::ConnectedWithoutOffloadRekey
+                            | WifiState::ConnectedWithOffloadRekey
+                    ) {
+                        log::warn!("{cmd:?} from the AP; retrying");
+                        // For a socket-owned connection the kernel keeps
+                        // its connection state (wdev->connected) until
+                        // userspace cleans up, and rejects the next
+                        // ASSOCIATE with -EALREADY otherwise.
+                        // wpa_supplicant sends CMD_DEAUTHENTICATE here;
+                        // CMD_DISCONNECT clears the same state.
+                        if let Err(e) = connect::disconnect(
+                            &mut self.conn_handle,
+                            self.if_index,
+                        )
+                        .await
+                        {
+                            log::debug!("disconnect cleanup failed: {e}");
+                        }
+                        self.state = WifiState::Failed;
+                    } else {
+                        log::debug!(
+                            "stale {cmd:?} event in state {:?}; ignored",
+                            self.state
+                        );
+                    }
+                } else {
+                    log::debug!("event: {cmd:?}");
                 }
-                log::debug!("event: {cmd:?}");
             }
             // `Nl80211Event` is #[non_exhaustive]; keep future variants
             // from silently wedging the state machine.
@@ -779,38 +921,48 @@ impl WifiClient {
             log::info!("4-way handshake: Message 1 (ANonce)");
 
             if self.fourway.is_none() {
-                let (pmk, rsne, mic_alg) = match self.bss_info.security {
-                    SecurityType::Owe => {
-                        let Some(ref owe_auth) = self.owe else {
-                            log::warn!("no OWE state for 4-way handshake");
-                            self.state = WifiState::Failed;
-                            return;
-                        };
-                        let Some(pmk) = owe_auth.pmk() else {
-                            log::warn!("OWE PMK not derived");
-                            self.state = WifiState::Failed;
-                            return;
-                        };
-                        (pmk, elements::owe_ie(), MicAlg::HmacSha256)
-                    }
-                    SecurityType::Wpa2Psk => {
-                        let Some(pmk) = self.psk_pmk else {
-                            log::warn!("no PSK PMK for 4-way handshake");
-                            self.state = WifiState::Failed;
-                            return;
-                        };
-                        (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
-                    }
-                    _ => {
-                        // SAE
-                        let Some(pmk) =
-                            self.auth.as_ref().and_then(|a| a.pmk())
-                        else {
-                            log::warn!("no PMK for 4-way handshake");
-                            self.state = WifiState::Failed;
-                            return;
-                        };
-                        (pmk, elements::sae_ie(), MicAlg::AesCmac)
+                let (pmk, rsne, mic_alg) = if let Some(entry) =
+                    self.pmksa_in_use.as_ref()
+                {
+                    // G4: 4-way over a cached PMK. The RSNE must be
+                    // the same one the association request carried
+                    // (with the PMKID) - the AP verifies that.
+                    let rsne = self.rsne_with_pmkid(Some(entry.pmkid));
+                    (entry.pmk, rsne, entry.mic_alg)
+                } else {
+                    match self.bss_info.security {
+                        SecurityType::Owe => {
+                            let Some(ref owe_auth) = self.owe else {
+                                log::warn!("no OWE state for 4-way handshake");
+                                self.state = WifiState::Failed;
+                                return;
+                            };
+                            let Some(pmk) = owe_auth.pmk() else {
+                                log::warn!("OWE PMK not derived");
+                                self.state = WifiState::Failed;
+                                return;
+                            };
+                            (pmk, elements::owe_ie(), MicAlg::HmacSha256)
+                        }
+                        SecurityType::Wpa2Psk => {
+                            let Some(pmk) = self.psk_pmk else {
+                                log::warn!("no PSK PMK for 4-way handshake");
+                                self.state = WifiState::Failed;
+                                return;
+                            };
+                            (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
+                        }
+                        _ => {
+                            // SAE
+                            let Some(pmk) =
+                                self.auth.as_ref().and_then(|a| a.pmk())
+                            else {
+                                log::warn!("no PMK for 4-way handshake");
+                                self.state = WifiState::Failed;
+                                return;
+                            };
+                            (pmk, elements::sae_ie(), MicAlg::AesCmac)
+                        }
                     }
                 };
                 self.fourway = Some(FourWayState::new_with_ap_ies(
@@ -869,9 +1021,15 @@ impl WifiClient {
                     Err(e) => {
                         // SAE already proved the passphrase, so a Message 3
                         // MIC mismatch here is a transient frame/AP issue:
-                        // retry on the short backoff.
+                        // retry on the short backoff. With a cached PMK it
+                        // means the cache entry is stale: drop it and fall
+                        // back to full authentication right away.
                         log::warn!("process_message_3 failed: {e}");
-                        self.state = WifiState::Failed;
+                        if self.pmksa_in_use.is_some() {
+                            self.pmksa_fallback().await;
+                        } else {
+                            self.state = WifiState::Failed;
+                        }
                         return;
                     }
                 }
@@ -988,6 +1146,10 @@ impl WifiClient {
                     Err(e) => log::warn!("install BIGTK failed: {e}"),
                 }
             }
+
+            // G4: the handshake proved the PMK - cache the PMKSA for the
+            // next reconnect/roam (and hand it to the driver's cache).
+            self.cache_pmksa().await;
 
             // Try to offload GTK rekey to the driver/firmware.
             // Falls back to userspace rekey when unsupported
@@ -1230,6 +1392,155 @@ impl WifiClient {
         }
         let attrs = builder.build();
         drain_request(self.conn_handle.associate(attrs).execute().await).await
+    }
+}
+
+impl WifiClient {
+    /// The RSNE sent in the association request / 4-way Message 2 for the
+    /// current security type, optionally carrying a PMKID (PMKSA caching).
+    /// Both sites must stay byte-identical - the AP verifies that.
+    fn rsne_with_pmkid(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
+        match self.bss_info.security {
+            SecurityType::Sae => elements::sae_ie_with_pmkid(pmkid),
+            SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid(pmkid),
+            SecurityType::Owe => elements::owe_ie(),
+            SecurityType::Open => Vec::new(),
+        }
+    }
+
+    /// G4: associate with the cached PMKID in the RSNE so the AP can
+    /// skip the full authentication. MFP stays required for SAE and is
+    /// requested on MFP-capable WPA2-PSK APs, matching the full-auth
+    /// association.
+    async fn associate_with_pmksa(&mut self) {
+        let Some(entry) = self.pmksa_in_use.clone() else {
+            return;
+        };
+        log::info!(
+            "open-system AUTHENTICATE ok - sending ASSOCIATE with cached PMKID"
+        );
+        let ie = self.rsne_with_pmkid(Some(entry.pmkid));
+        let mfp = match self.bss_info.security {
+            SecurityType::Sae => Some(Nl80211UseMfp::Required),
+            _ => self
+                .bss_info
+                .ap_mfp_capable()
+                .then_some(Nl80211UseMfp::Required),
+        };
+        if let Err(e) = self.associate(ie, mfp).await {
+            log::warn!("ASSOCIATE with cached PMKID failed: {e}");
+            self.pmksa_fallback().await;
+        }
+    }
+
+    /// G4 fallback: the AP rejected the cached PMKID (association
+    /// rejected) or the handshake over the cached PMK failed (stale
+    /// entry). Drop the entry from both caches and retry immediately
+    /// with full authentication.
+    async fn pmksa_fallback(&mut self) {
+        if let Some(entry) = self.pmksa_in_use.take() {
+            self.pmksa_cache.invalidate(&entry.ssid, entry.bssid);
+            self.driver_del_pmksa(&entry).await;
+        }
+        if let Err(e) = self.send_out_auth_request().await {
+            log::warn!("PMKSA fallback authentication failed: {e}");
+            self.state = WifiState::Failed;
+        } else {
+            self.state = WifiState::Authenticating;
+        }
+    }
+
+    /// G4: the 4-way handshake proved the PMK - remember the PMKSA for
+    /// the next reconnect/roam and hand it to the driver's PMKSA cache.
+    /// A reused entry simply gets a fresh lifetime.
+    async fn cache_pmksa(&mut self) {
+        let entry = match self.pmksa_in_use.take() {
+            Some(entry) => entry_with_fresh_lifetime(entry),
+            None => {
+                let (pmk, pmkid, mic_alg) = match self.bss_info.security {
+                    // SAE: the PMKID is derived by the SAE exchange
+                    // itself (L(val, 0, 128)); the AP caches that one.
+                    SecurityType::Sae => {
+                        let Some((pmk, pmkid)) = self
+                            .auth
+                            .as_ref()
+                            .and_then(|a| a.pmk().zip(a.pmkid()))
+                        else {
+                            return;
+                        };
+                        (pmk, pmkid, MicAlg::AesCmac)
+                    }
+                    // WPA2-PSK: PMKID = Truncate-128(HMAC-SHA1(PMK,
+                    // "PMK Name" || AA || SPA)), 802.11-2020 §9.4.2.25.3.
+                    SecurityType::Wpa2Psk => {
+                        let Some(pmk) = self.psk_pmk else {
+                            return;
+                        };
+                        (
+                            pmk,
+                            kdf::pmkid_sha1(
+                                &pmk,
+                                &self.bss_info.bssid,
+                                &self.mac,
+                            ),
+                            MicAlg::HmacSha1,
+                        )
+                    }
+                    _ => return,
+                };
+                PmksaEntry {
+                    ssid: self.network.ssid.clone(),
+                    bssid: self.bss_info.bssid,
+                    pmkid,
+                    pmk,
+                    mic_alg,
+                    expires: std::time::Instant::now()
+                        + std::time::Duration::from_secs(PMK_LIFETIME_SECS),
+                }
+            }
+        };
+        self.driver_set_pmksa(&entry).await;
+        log::info!(
+            "PMKSA cached: ssid={}, bssid={:02x?}",
+            entry.ssid,
+            entry.bssid
+        );
+        self.pmksa_cache.insert(entry);
+    }
+
+    /// Hand a PMKSA entry to the driver/firmware cache
+    /// (`NL80211_CMD_SET_PMKSA`). Best effort: mac80211-based drivers
+    /// (including mac80211_hwsim) return `-EOPNOTSUPP`, and the
+    /// userspace cache works without them.
+    async fn driver_set_pmksa(&mut self, entry: &PmksaEntry) {
+        let attrs = Nl80211Pmksa::new(self.if_index)
+            .pmkid(entry.pmkid.to_vec())
+            .mac(entry.bssid)
+            .pmk(entry.pmk.to_vec())
+            .pmk_lifetime(PMK_LIFETIME_SECS as u32)
+            .pmk_reauth_threshold(PMK_REAUTH_THRESHOLD_PERCENT)
+            .build();
+        match drain_request(self.conn_handle.set_pmksa(attrs).execute().await)
+            .await
+        {
+            Ok(()) => log::info!("PMKSA offloaded to driver"),
+            Err(e) => log::debug!("driver PMKSA cache not available: {e}"),
+        }
+    }
+
+    /// Drop a PMKSA entry from the driver/firmware cache
+    /// (`NL80211_CMD_DEL_PMKSA`), best effort.
+    async fn driver_del_pmksa(&mut self, entry: &PmksaEntry) {
+        let attrs = Nl80211Pmksa::new(self.if_index)
+            .pmkid(entry.pmkid.to_vec())
+            .mac(entry.bssid)
+            .build();
+        if let Err(e) =
+            drain_request(self.conn_handle.del_pmksa(attrs).execute().await)
+                .await
+        {
+            log::debug!("driver del_pmksa not available: {e}");
+        }
     }
 }
 
