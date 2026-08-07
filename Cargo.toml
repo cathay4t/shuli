@@ -39,4 +39,4 @@ version = "0.21"
 
 [workspace.dependencies.wl-nl80211]
 version = "0.5"
-path = "../netlink/wl-nl80211"
+git = "https://github.com/rust-netlink/wl-nl80211"
