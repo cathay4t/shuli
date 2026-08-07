@@ -3,16 +3,17 @@
 # of most-common use case: full static and full dynamic.
 ---
 version: 1
-# Roaming: when the current AP's signal (dBm) drops below this
-# threshold while connected, the client scans and roams to a better
+# Roaming (per SSID): when the current AP's signal (dBm) drops below
+# the threshold while connected, the client scans and roams to a better
 # BSS (Fast BSS Transition inside a mobility domain, full
-# reauthentication otherwise). BSS Transition Management (802.11v)
-# requests are honoured regardless. Absent disables signal-triggered
-# roaming.
-# roam-threshold-dbm: -70
+# reauthentication otherwise). Enabled by default with iwd's default
+# threshold of -70 dBm. BSS Transition Management (802.11v) requests
+# are honoured regardless.
 wifis:
   - ssid: Test-WIFI
     password: "12345678"
+    # roaming: true
+    # roaming_threshold: -70
     dns:
       nameservers:
         - 2001:db8:1::254

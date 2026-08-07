@@ -17,7 +17,7 @@ mod tests;
 pub(crate) use self::mac::ETH_ALEN;
 pub use self::{
     client::{WifiClient, WifiState},
-    config::{NetworkConfig, WifiConfig},
+    config::{DEFAULT_ROAM_THRESHOLD_DBM, NetworkConfig, WifiConfig},
     error::{ErrorKind, WifiError},
     scan::{BssInfo, SecurityType},
 };

@@ -36,3 +36,21 @@ fn network_config_builder() {
     assert_eq!(network.ssid, "Test-WIFI");
     assert_eq!(network.password, Some("12345678".to_string()));
 }
+
+#[test]
+fn roaming_defaults_to_enabled_with_default_threshold() {
+    let mut config = WifiConfig::new("wlan0");
+    config.add_network("Home-WIFI", Some("secret"));
+    let network = config.networks.first().expect("network");
+    assert!(network.roaming, "roaming should be on by default");
+    assert_eq!(network.roaming_threshold, -70);
+}
+
+#[test]
+fn roaming_can_be_disabled_and_threshold_adjusted() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    network.roaming_threshold = -80;
+    assert_eq!(network.roaming_threshold, -80);
+    network.roaming = false;
+    assert!(!network.roaming);
+}

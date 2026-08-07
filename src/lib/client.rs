@@ -397,10 +397,11 @@ impl WifiClient {
             | WifiState::ConnectedWithOffloadRekey => {
                 // Keep draining events so group rekeys, disconnects and
                 // BTM Requests are handled while the connection stays up.
-                // With a roam threshold configured, bound the wait so the
-                // signal level gets checked periodically.
+                // With signal-triggered roaming enabled for the connected
+                // network, bound the wait so the signal level gets
+                // checked periodically.
                 const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
-                let next = if self.config.roam_threshold_dbm.is_some() {
+                let next = if self.network.roaming {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(ROAM_SIGNAL_CHECK_SECS),
                         self.event_receiver.next(),

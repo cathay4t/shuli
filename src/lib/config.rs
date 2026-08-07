@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+/// Default roam threshold: matches iwd's `RoamThreshold` (-70 dBm).
+pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
+
 /// WiFi connection configuration for [`WifiClient`](crate::WifiClient).
 ///
 /// No serde — the daemon layer deserializes its own `ShuliConfig` and
@@ -9,20 +12,31 @@ pub struct WifiConfig {
     pub iface_name: String,
     /// Networks to scan for and connect to. A single scan schedule
     /// probes for all of them; the strongest matching BSS wins and its
-    /// network's passphrase is used for authentication.
+    /// network's passphrase is used for authentication. Roaming is
+    /// configured per network (see [`NetworkConfig::roaming`]).
     pub networks: Vec<NetworkConfig>,
-    /// Signal level (dBm) below which the client scans for roam
-    /// candidates while connected. `None` disables signal-triggered
-    /// roaming (BTM Requests are still honoured).
-    pub roam_threshold_dbm: Option<i32>,
 }
 
-/// A single WiFi network: an SSID with an optional passphrase. Open
-/// networks carry `password: None`.
+/// A single WiFi network: an SSID with an optional passphrase and its
+/// own roaming settings. Open networks carry `password: None`.
+///
+/// Signal-triggered roaming is on by default with a -70 dBm threshold
+/// (matching iwd's `RoamThreshold`); the IEEE 802.11 standard (BSS
+/// transition management, 802.11v §11.21.7) leaves client-side roaming
+/// policy to the implementation. The threshold is deliberately
+/// band-agnostic: per-band thresholds are added only if users ask for
+/// them. BTM (802.11v) Requests are honoured regardless of `roaming`.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub ssid: String,
     pub password: Option<String>,
+    /// When `false`, no signal-triggered roam scans are started while
+    /// connected to this SSID. Defaults to `true`.
+    pub roaming: bool,
+    /// Signal level (dBm) below which the client scans for roam
+    /// candidates while connected to this SSID. Defaults to
+    /// [`DEFAULT_ROAM_THRESHOLD_DBM`].
+    pub roaming_threshold: i32,
 }
 
 impl NetworkConfig {
@@ -30,6 +44,8 @@ impl NetworkConfig {
         Self {
             ssid: ssid.to_string(),
             password: None,
+            roaming: true,
+            roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
         }
     }
 
@@ -47,16 +63,7 @@ impl WifiConfig {
         Self {
             iface_name: iface_name.to_string(),
             networks: Vec::new(),
-            roam_threshold_dbm: None,
         }
-    }
-
-    /// Enable signal-triggered roaming: while connected, the client
-    /// polls the AP's signal level and scans for roam candidates when
-    /// it drops below `threshold_dbm`.
-    pub fn set_roam_threshold(&mut self, threshold_dbm: i32) -> &mut Self {
-        self.roam_threshold_dbm = Some(threshold_dbm);
-        self
     }
 
     /// Add a network to scan for and connect to.

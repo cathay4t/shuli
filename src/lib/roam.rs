@@ -86,9 +86,12 @@ impl WifiClient {
         }
     }
 
-    /// Whether signal-threshold roaming is configured.
+    /// The roam threshold, or `None` when signal-triggered roaming is
+    /// disabled for the connected network.
     pub(crate) fn roam_threshold(&self) -> Option<i32> {
-        self.config.roam_threshold_dbm
+        self.network
+            .roaming
+            .then_some(self.network.roaming_threshold)
     }
 
     /// Append the Mobility Domain element to the association request IEs

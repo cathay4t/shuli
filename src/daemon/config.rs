@@ -18,11 +18,6 @@ pub(crate) struct ShuliConfig {
     pub version: u32,
     #[serde(default)]
     pub wifis: Vec<WifiEntry>,
-    /// Signal level (dBm) below which the client scans for roam
-    /// candidates while connected. Absent disables signal-triggered
-    /// roaming (BTM Requests are still honoured).
-    #[serde(default, rename = "roam-threshold-dbm")]
-    pub roam_threshold_dbm: Option<i32>,
 }
 
 /// A single WiFi network entry.
@@ -31,6 +26,16 @@ pub(crate) struct WifiEntry {
     pub ssid: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Signal-triggered roaming while connected to this SSID: `false`
+    /// disables it (BTM / 802.11v Requests are still honoured).
+    /// Defaults to `true`.
+    #[serde(default = "default_roaming")]
+    pub roaming: bool,
+    /// Signal level (dBm) below which the client scans for roam
+    /// candidates while connected. Defaults to -70 (iwd's
+    /// `RoamThreshold`).
+    #[serde(default = "default_roam_threshold")]
+    pub roaming_threshold: i32,
     /// Interface name to bind to.  `"any"` (or absent) picks the
     /// first available wifi interface.
     #[serde(default)]
@@ -86,15 +91,89 @@ impl ShuliConfig {
     }
 
     /// Convert all configured networks into the lib's `WifiConfig`, so
-    /// one scan schedule probes for every SSID.
+    /// one scan schedule probes for every SSID. Each entry keeps its
+    /// own roaming policy.
     pub(crate) fn to_wifi_config(&self, iface_name: &str) -> shuli::WifiConfig {
         let mut config = shuli::WifiConfig::new(iface_name);
         for entry in &self.wifis {
-            config.add_network(&entry.ssid, entry.password.as_deref());
-        }
-        if let Some(threshold) = self.roam_threshold_dbm {
-            config.set_roam_threshold(threshold);
+            let mut network = shuli::NetworkConfig::new(&entry.ssid);
+            if let Some(password) = entry.password.as_deref() {
+                network.set_password(password);
+            }
+            network.roaming = entry.roaming;
+            network.roaming_threshold = entry.roaming_threshold;
+            config.networks.push(network);
         }
         config
+    }
+}
+
+fn default_roaming() -> bool {
+    true
+}
+
+fn default_roam_threshold() -> i32 {
+    shuli::DEFAULT_ROAM_THRESHOLD_DBM
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL_YAML: &str = "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    password: secret
+";
+
+    fn parse(yaml: &str) -> ShuliConfig {
+        serde_yaml::from_str(yaml).expect("valid YAML")
+    }
+
+    #[test]
+    fn roaming_defaults_to_enabled_with_default_threshold() {
+        let config = parse(MINIMAL_YAML);
+        let entry = &config.wifis[0];
+        assert!(entry.roaming);
+        assert_eq!(entry.roaming_threshold, -70);
+
+        let wifi = config.to_wifi_config("wlan0");
+        let network = &wifi.networks[0];
+        assert!(network.roaming);
+        assert_eq!(network.roaming_threshold, -70);
+    }
+
+    #[test]
+    fn roaming_false_disables_signal_roam() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    roaming: false
+",
+        );
+        let wifi = config.to_wifi_config("wlan0");
+        assert!(!wifi.networks[0].roaming);
+    }
+
+    #[test]
+    fn roaming_threshold_override() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    roaming_threshold: -80
+",
+        );
+        let wifi = config.to_wifi_config("wlan0");
+        let network = &wifi.networks[0];
+        assert!(network.roaming);
+        assert_eq!(network.roaming_threshold, -80);
     }
 }

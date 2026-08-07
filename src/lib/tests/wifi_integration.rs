@@ -747,7 +747,7 @@ async fn wifi_client_ft_psk_signal_roam() {
     config.add_network("Test-WIFI-FT", Some("12345678"));
     // hwsim reports a fixed (weak) signal; any threshold above it starts
     // the roam engine.
-    config.set_roam_threshold(-10);
+    config.networks[0].roaming_threshold = -10;
     let mut client = WifiClient::init(config).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
