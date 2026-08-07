@@ -33,16 +33,6 @@ pub(crate) enum MicAlg {
     HmacSha1,
 }
 
-impl MicAlg {
-    /// EAPOL-Key descriptor version (key_info bits 0-2).
-    pub(crate) fn descriptor_version(self) -> u16 {
-        match self {
-            MicAlg::AesCmac | MicAlg::HmacSha256 => 0,
-            MicAlg::HmacSha1 => 2,
-        }
-    }
-}
-
 /// 4-Way Handshake state (supplicant side).
 #[derive(Clone, Debug)]
 pub struct FourWayState {
@@ -64,6 +54,13 @@ pub struct FourWayState {
     gtk: Option<Vec<u8>>,
     gtk_index: u8,
     mic_alg: MicAlg,
+    /// Key Descriptor Version echoed from Message 1 (0 = AKM-defined,
+    /// 2 = HMAC-SHA1 MIC, 3 = AES-128-CMAC MIC).
+    desc_version: u16,
+    /// FT key hierarchy input: when set (initial association with an FT
+    /// AKM), the PTK comes from PMK-R1 instead of the PMK
+    /// (802.11-2020 §12.8.2.3).
+    ft_pmk_r1: Option<super::ft::PmkR1>,
 }
 
 impl FourWayState {
@@ -99,11 +96,60 @@ impl FourWayState {
             gtk: None,
             gtk_index: 0,
             mic_alg,
+            desc_version: 0,
+            ft_pmk_r1: None,
+        }
+    }
+
+    /// 4-way state for an initial association with an FT AKM (FT-PSK /
+    /// FT-SAE): the PTK is derived from PMK-R1 (which itself comes from
+    /// PMK-R0 over the R1KH of the associated AP), and the MIC uses
+    /// AES-CMAC regardless of the underlying PSK (802.11-2020 §12.8).
+    pub fn new_ft(
+        ft_pmk_r1: super::ft::PmkR1,
+        mac_sta: [u8; 6],
+        mac_ap: [u8; 6],
+        rsne: Vec<u8>,
+        ap_rsne: Vec<u8>,
+        ap_rsnxe: Vec<u8>,
+    ) -> Self {
+        let mut snonce = [0u8; 32];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut snonce)
+            .expect("RNG");
+        Self {
+            pmk: [0u8; 32],
+            mac_sta,
+            mac_ap,
+            anonce: None,
+            snonce,
+            ptk: None,
+            replay_counter: 0,
+            rsne,
+            ap_rsne,
+            ap_rsnxe,
+            gtk: None,
+            gtk_index: 0,
+            mic_alg: MicAlg::AesCmac,
+            desc_version: 0,
+            ft_pmk_r1: Some(ft_pmk_r1),
         }
     }
 
     pub(crate) fn derive_ptk(&self) -> [u8; PTK_LEN] {
         let anonce = self.anonce.expect("ANonce must be set");
+
+        // FT: PTK = KDF-SHA256(PMK-R1, "FT-PTK", SNonce || ANonce ||
+        // BSSID || STA-ADDR); the operand order is fixed by the spec.
+        if let Some(ref pmk_r1) = self.ft_pmk_r1 {
+            return super::ft::derive_ft_ptk(
+                pmk_r1,
+                &self.snonce,
+                &anonce,
+                self.mac_ap,
+                self.mac_sta,
+            );
+        }
 
         let (mac1, mac2) =
             if u64_from_mac(&self.mac_ap) < u64_from_mac(&self.mac_sta) {
@@ -201,12 +247,18 @@ impl FourWayState {
         &mut self,
         anonce: &[u8; 32],
         replay_counter: u64,
+        key_info: u16,
     ) -> Result<Vec<u8>, WifiError> {
         aws_lc_rs::rand::SystemRandom::new()
             .fill(&mut self.snonce)
             .expect("RNG");
         self.anonce = Some(*anonce);
         self.replay_counter = replay_counter;
+        // Echo the Key Descriptor Version the AP negotiated in Message 1:
+        // 0 (AKM-defined) for SAE/OWE, 2 (HMAC-SHA1) for WPA2-PSK and
+        // 3 (AES-128-CMAC) for FT-PSK (802.11-2020 §12.7.2); hostapd
+        // rejects a Message 2 that uses another version.
+        self.desc_version = eapol::desc_version(key_info);
         self.ptk = Some(self.derive_ptk());
 
         let kck = self.kck().unwrap();
@@ -217,7 +269,7 @@ impl FourWayState {
             &self.snonce,
             self.replay_counter,
             &self.rsne,
-            self.mic_alg.descriptor_version(),
+            self.desc_version,
         );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);
@@ -287,7 +339,7 @@ impl FourWayState {
         let mut msg4 = eapol::build_message_4(
             &self.snonce,
             self.replay_counter,
-            self.mic_alg.descriptor_version(),
+            self.desc_version,
         );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg4))?;
         eapol::set_mic(&mut msg4, &mic);
@@ -307,7 +359,18 @@ impl FourWayState {
                 "Message 3 key data carries no RSNE",
             ));
         };
-        if rsne != &self.ap_rsne {
+        // FT AKMs append PMKR1Name as the RSNE's PMKID in Message 3,
+        // which the beacon RSNE lacks; compare while ignoring the PMKID
+        // list there (wpa_supplicant compares strictly otherwise).
+        let rsne_ok = if self.ft_pmk_r1.is_some() {
+            crate::ieee80211::elements::rsne_match_ignore_pmkid(
+                rsne,
+                &self.ap_rsne,
+            )
+        } else {
+            rsne == &self.ap_rsne
+        };
+        if !rsne_ok {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!(
@@ -395,7 +458,7 @@ impl FourWayState {
         let mut msg2 = eapol::build_group_message_2(
             self.replay_counter,
             &frame.key_rsc,
-            self.mic_alg.descriptor_version(),
+            eapol::desc_version(frame.key_info),
         );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
         eapol::set_mic(&mut msg2, &mic);

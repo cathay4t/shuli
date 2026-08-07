@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::crypto::ft::{
+    PmkR1, derive_ft_ptk, derive_pmk_r0, derive_pmk_r1, ft_mic,
+};
+
+// Known-answer vectors computed independently from the 802.11-2020
+// §12.8.2 formulas with KDF-Hash-Length (SHA-256).
+const XXKEY: [u8; 32] = [0x11; 32];
+const SSID: &str = "Test-WIFI";
+const MDID: [u8; 2] = [0xa1, 0xb2];
+const R0KH_ID: &[u8] = b"r0kh-ap1";
+const S0KH_ID: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
+const R1KH_ID: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x02, 0x00];
+const S1KH_ID: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+const EXPECTED_PMK_R0: [u8; 32] = [
+    0x56, 0x59, 0x87, 0xc7, 0xb1, 0x3b, 0x62, 0xc8, 0x69, 0x6a, 0xad, 0xa8,
+    0x75, 0xd4, 0xfd, 0x48, 0x3e, 0xd0, 0xa8, 0x77, 0x3c, 0x43, 0xc7, 0xeb,
+    0x75, 0xb6, 0x78, 0x4a, 0x6b, 0x0c, 0xa5, 0x8b,
+];
+const EXPECTED_PMKR0_NAME: [u8; 16] = [
+    0xe6, 0x2a, 0x51, 0xfe, 0xff, 0xd4, 0x74, 0x2d, 0xac, 0x30, 0xeb, 0x9d,
+    0x4f, 0x6a, 0x34, 0x69,
+];
+const EXPECTED_PMK_R1: [u8; 32] = [
+    0x07, 0x75, 0x91, 0x4b, 0x12, 0xba, 0x8f, 0x5b, 0x22, 0xa0, 0xc3, 0x4a,
+    0x09, 0xa3, 0xa3, 0x07, 0x66, 0xbe, 0x15, 0x41, 0xb4, 0x64, 0x56, 0x1a,
+    0xce, 0xb8, 0xc1, 0x61, 0xfd, 0xa4, 0x08, 0x79,
+];
+const EXPECTED_PMKR1_NAME: [u8; 16] = [
+    0xf1, 0x7b, 0x75, 0xe0, 0x81, 0xa9, 0x10, 0x1e, 0xf4, 0x24, 0x8f, 0xc4,
+    0xb9, 0x39, 0x06, 0x9b,
+];
+const SNONCE: [u8; 32] = [0x33; 32];
+const ANONCE: [u8; 32] = [0x44; 32];
+const EXPECTED_PTK: [u8; 48] = [
+    0x7c, 0x44, 0x34, 0x5e, 0xb9, 0xee, 0x7b, 0x95, 0xf8, 0x31, 0xad, 0x9b,
+    0x8b, 0x52, 0x8a, 0xcf, 0x78, 0x4a, 0x3a, 0xa5, 0x52, 0x0c, 0xde, 0xb6,
+    0xc1, 0x6f, 0x37, 0x77, 0xbf, 0x70, 0xac, 0x1f, 0x93, 0x3c, 0x23, 0x82,
+    0x5d, 0x1c, 0xe2, 0x6e, 0x86, 0x0e, 0x45, 0xe2, 0x27, 0x65, 0xd1, 0xab,
+];
+
+#[test]
+fn test_ft_key_hierarchy_kats() {
+    let pmk_r0 = derive_pmk_r0(&XXKEY, SSID, MDID, R0KH_ID, S0KH_ID);
+    assert_eq!(pmk_r0.key, EXPECTED_PMK_R0);
+    assert_eq!(pmk_r0.name, EXPECTED_PMKR0_NAME);
+
+    let pmk_r1 = derive_pmk_r1(&pmk_r0, R1KH_ID, S1KH_ID);
+    assert_eq!(pmk_r1.key, EXPECTED_PMK_R1);
+    assert_eq!(pmk_r1.name, EXPECTED_PMKR1_NAME);
+
+    // PTK context order is fixed: SNonce || ANonce || BSSID || STA-ADDR.
+    let ptk = derive_ft_ptk(&pmk_r1, &SNONCE, &ANONCE, R1KH_ID, S1KH_ID);
+    assert_eq!(ptk, EXPECTED_PTK);
+
+    // Swapping the nonces must change the PTK.
+    let ptk_swapped =
+        derive_ft_ptk(&pmk_r1, &ANONCE, &SNONCE, R1KH_ID, S1KH_ID);
+    assert_ne!(ptk_swapped, EXPECTED_PTK);
+}
+
+#[test]
+fn test_ft_mic_deterministic() {
+    let kck = [0x55u8; 16];
+    let elements = [
+        // pseudo RSNE + MDIE + FTIE(MIC=0) content
+        0x30, 0x02, 0x01, 0x00, //
+        0x36, 0x03, 0xa1, 0xb2, 0x01, //
+        0x37, 0x04, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mic1 = ft_mic(&kck, S1KH_ID, R1KH_ID, 5, &elements).expect("mic");
+    let mic2 = ft_mic(&kck, S1KH_ID, R1KH_ID, 5, &elements).expect("mic");
+    assert_eq!(mic1, mic2);
+
+    // A different transaction sequence number changes the MIC.
+    let mic_seq6 = ft_mic(&kck, S1KH_ID, R1KH_ID, 6, &elements).expect("mic");
+    assert_ne!(mic1, mic_seq6);
+}
+
+#[test]
+fn test_ft_pmk_r1_clone() {
+    // PmkR1 is carried across the roam state machine; a clone must keep
+    // the derivation reproducible.
+    let pmk_r0 = derive_pmk_r0(&XXKEY, SSID, MDID, R0KH_ID, S0KH_ID);
+    let pmk_r1 = derive_pmk_r1(&pmk_r0, R1KH_ID, S1KH_ID);
+    let cloned: PmkR1 = pmk_r1.clone();
+    assert_eq!(
+        derive_ft_ptk(&cloned, &SNONCE, &ANONCE, R1KH_ID, S1KH_ID),
+        EXPECTED_PTK
+    );
+}

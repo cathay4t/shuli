@@ -27,6 +27,34 @@ pub enum SecurityType {
     Owe,
     /// RSNE with AKM 00-0F-AC:8 — WPA3-SAE.
     Sae,
+    /// RSNE with AKM 00-0F-AC:4 — FT over WPA2-PSK (802.11r).
+    FtPsk,
+    /// RSNE with AKM 00-0F-AC:9 — FT over WPA3-SAE (802.11r).
+    FtSae,
+}
+
+impl SecurityType {
+    /// Whether this security type supports Fast BSS Transition.
+    pub(crate) fn is_ft(&self) -> bool {
+        matches!(self, SecurityType::FtPsk | SecurityType::FtSae)
+    }
+
+    /// The non-FT counterpart of an FT AKM (used to match a roam
+    /// candidate against the network's authentication method).
+    pub(crate) fn base(&self) -> SecurityType {
+        match self {
+            SecurityType::FtPsk => SecurityType::Wpa2Psk,
+            SecurityType::FtSae => SecurityType::Sae,
+            other => *other,
+        }
+    }
+}
+
+/// Mobility Domain element contents (802.11-2020 §9.4.2.47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MdieInfo {
+    pub mdid: [u8; 2],
+    pub ft_capab: u8,
 }
 
 /// The best BSS candidate for the configured SSID.
@@ -43,6 +71,8 @@ pub struct BssInfo {
     /// The AP's RSNXE as a full element (ID 244), empty when the AP
     /// advertises none.
     pub ap_rsnxe: Vec<u8>,
+    /// Mobility Domain (present only on FT-capable BSSes).
+    pub mdie: Option<MdieInfo>,
 }
 
 const RSN_CAP_MFPR: u16 = 1 << 6;
@@ -128,6 +158,77 @@ impl WifiClient {
     pub(crate) async fn process_scan_results(
         &mut self,
     ) -> Result<(), WifiError> {
+        self.collect_scan_candidates().await?;
+
+        // A roam that fell back to full reconnection steers the retry
+        // loop to its target BSSID; otherwise the strongest BSS wins.
+        let hinted = self.roam_target.take().and_then(|hint| {
+            self.last_scan_candidates
+                .iter()
+                .find(|(bss, _)| bss.bssid == hint)
+                .cloned()
+        });
+        let best = hinted.or_else(|| {
+            self.last_scan_candidates
+                .iter()
+                .max_by(|a, b| a.0.cmp(&b.0))
+                .cloned()
+        });
+        let Some((bss_info, network)) = best else {
+            return Err(WifiError::new(
+                ErrorKind::SsidNotFound,
+                format!(
+                    "no configured SSID ([{}]) found in scan results",
+                    self.config.ssids().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        };
+        self.bss_info = bss_info;
+        self.network = network;
+        log::info!(
+            "selected BSS: ssid={}, bssid={:02x?}, freq={} MHz, signal={} dBm",
+            self.network.ssid,
+            self.bss_info.bssid,
+            self.bss_info.freq_mhz,
+            self.bss_info.signal_dbm
+        );
+        Ok(())
+    }
+
+    /// Roam scan results: pick the best roam candidate (a different BSS
+    /// of the same security family) and start roaming to it; stay put
+    /// when no candidate qualifies.
+    pub(crate) async fn process_roam_scan_results(&mut self) {
+        if let Err(e) = self.collect_scan_candidates().await {
+            log::warn!("roam scan failed: {e}");
+            return;
+        }
+        let current_base = self.bss_info.security.base();
+        let best = self
+            .last_scan_candidates
+            .iter()
+            .map(|(bss, _)| bss)
+            .filter(|bss| {
+                bss.bssid != self.bss_info.bssid
+                    && bss.security.base() == current_base
+            })
+            .max();
+        let Some(target) = best.cloned() else {
+            log::info!("roam scan found no better BSS; staying");
+            return;
+        };
+        log::info!(
+            "roam scan selected bssid={:02x?}, freq={} MHz, signal={} dBm",
+            target.bssid,
+            target.freq_mhz,
+            target.signal_dbm
+        );
+        self.start_roam(target).await;
+    }
+
+    /// Dump the scan results and record every BSS whose SSID matches a
+    /// configured network in `last_scan_candidates`.
+    async fn collect_scan_candidates(&mut self) -> Result<(), WifiError> {
         let bss_list = get_scan_results(&self.handle, self.if_index).await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
@@ -158,56 +259,51 @@ impl WifiClient {
                 "candidate BSS: ssid={bss_ssid}, bssid={bssid:02x?}, \
                  freq={freq_mhz} MHz, signal={signal_dbm}"
             );
-            let (security, ap_rsne, ap_rsnxe) = detect_security(ies);
+            let bss_security = detect_security(ies);
             candidates.push((
                 BssInfo {
                     bssid,
                     freq_mhz,
                     signal_dbm,
-                    security,
-                    ap_rsne,
-                    ap_rsnxe,
+                    security: bss_security.security,
+                    ap_rsne: bss_security.ap_rsne,
+                    ap_rsnxe: bss_security.ap_rsnxe,
+                    mdie: bss_security.mdie,
                 },
                 network,
             ));
         }
 
-        let best = candidates.into_iter().max_by(|a, b| a.0.cmp(&b.0));
-        let Some((bss_info, network)) = best else {
-            return Err(WifiError::new(
-                ErrorKind::SsidNotFound,
-                format!(
-                    "no configured SSID ([{}]) found in scan results",
-                    self.config.ssids().collect::<Vec<_>>().join(", ")
-                ),
-            ));
-        };
-        self.bss_info = bss_info;
-        self.network = network;
-        log::info!(
-            "selected BSS: ssid={}, bssid={:02x?}, freq={} MHz, signal={} dBm",
-            self.network.ssid,
-            self.bss_info.bssid,
-            self.bss_info.freq_mhz,
-            self.bss_info.signal_dbm
-        );
+        self.last_scan_candidates = candidates;
         Ok(())
     }
 }
 
 const IE_ID_RSN: u8 = 48;
 const IE_ID_RSNXE: u8 = 244;
+const IE_ID_MDIE: u8 = 54;
 const AKM_PSK: u8 = 2;
+const AKM_FT_PSK: u8 = 4;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
+const AKM_FT_SAE: u8 = 9;
+
+/// Security facts about a BSS collected from its scan IEs.
+struct BssScanSecurity {
+    security: SecurityType,
+    ap_rsne: Vec<u8>,
+    ap_rsnxe: Vec<u8>,
+    mdie: Option<MdieInfo>,
+}
 
 /// Walk an 802.11 IE buffer and determine the security type from the
-/// RSNE's AKM suites. Also returns the raw RSNE / RSNXE elements (ID +
-/// length + body) for the 4-way handshake Message 3 downgrade check;
-/// both are empty when absent.
-fn detect_security(ies: &[u8]) -> (SecurityType, Vec<u8>, Vec<u8>) {
+/// RSNE's AKM suites. Also collects the raw RSNE / RSNXE elements (ID +
+/// length + body) for the 4-way handshake Message 3 downgrade check and
+/// the Mobility Domain element for FT; all are empty/None when absent.
+fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let mut rsne = Vec::new();
     let mut rsnxe = Vec::new();
+    let mut mdie = None;
     let mut pos = 0;
     while pos + 2 <= ies.len() {
         let id = ies[pos];
@@ -222,6 +318,12 @@ fn detect_security(ies: &[u8]) -> (SecurityType, Vec<u8>, Vec<u8>) {
             IE_ID_RSNXE if rsnxe.is_empty() => {
                 rsnxe = ies[pos..pos + 2 + len].to_vec();
             }
+            IE_ID_MDIE if mdie.is_none() => {
+                mdie = crate::ieee80211::elements::parse_mdie(
+                    &ies[pos + 2..pos + 2 + len],
+                )
+                .map(|(mdid, ft_capab)| MdieInfo { mdid, ft_capab });
+            }
             _ => {}
         }
         pos += 2 + len;
@@ -231,7 +333,25 @@ fn detect_security(ies: &[u8]) -> (SecurityType, Vec<u8>, Vec<u8>) {
     } else {
         SecurityType::Open
     };
-    (security, rsne, rsnxe)
+    BssScanSecurity {
+        security,
+        ap_rsne: rsne,
+        ap_rsnxe: rsnxe,
+        mdie,
+    }
+}
+
+/// Rank for choosing among several advertised AKMs: FT variants win so
+/// shuli can roam within the mobility domain, then SAE, OWE, PSK.
+fn akm_rank(security: SecurityType) -> u8 {
+    match security {
+        SecurityType::FtSae => 5,
+        SecurityType::FtPsk => 4,
+        SecurityType::Sae => 3,
+        SecurityType::Owe => 2,
+        SecurityType::Wpa2Psk => 1,
+        SecurityType::Open => 0,
+    }
 }
 
 /// Parse the RSNE body (after element ID + length) and check AKM suites.
@@ -251,24 +371,28 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
     let acount =
         u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
     let mut off = akm_offset + 2;
+    let mut best = SecurityType::Open;
     for _ in 0..acount {
         if body.len() < off + 4 {
             break;
         }
         // AKM suite: OUI(3) + type(1).  We only care about 00-0F-AC.
         if body[off] == 0x00 && body[off + 1] == 0x0F && body[off + 2] == 0xAC {
-            match body[off + 3] {
-                AKM_SAE => return SecurityType::Sae,
-                AKM_OWE => return SecurityType::Owe,
-                AKM_PSK => return SecurityType::Wpa2Psk,
-                _ => {}
+            let candidate = match body[off + 3] {
+                AKM_FT_SAE => SecurityType::FtSae,
+                AKM_FT_PSK => SecurityType::FtPsk,
+                AKM_SAE => SecurityType::Sae,
+                AKM_OWE => SecurityType::Owe,
+                AKM_PSK => SecurityType::Wpa2Psk,
+                _ => SecurityType::Open,
+            };
+            if akm_rank(candidate) > akm_rank(best) {
+                best = candidate;
             }
         }
         off += 4;
     }
-    // RSNE present but no SAE/OWE AKM — treat as open for now
-    // (WPA2-PSK etc. will be added later).
-    SecurityType::Open
+    best
 }
 
 /// Standalone scan: create a nl80211 handle, trigger a scan on the
@@ -300,14 +424,15 @@ pub async fn scan_wifi_with_ies(
         else {
             continue;
         };
-        let (security, ap_rsne, ap_rsnxe) = detect_security(ies);
+        let bss_security = detect_security(ies);
         let info = BssInfo {
             bssid,
             freq_mhz,
             signal_dbm,
-            security,
-            ap_rsne,
-            ap_rsnxe,
+            security: bss_security.security,
+            ap_rsne: bss_security.ap_rsne,
+            ap_rsnxe: bss_security.ap_rsnxe,
+            mdie: bss_security.mdie,
         };
         results.push((info, ies.to_vec()));
     }

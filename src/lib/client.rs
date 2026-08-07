@@ -132,6 +132,27 @@ pub struct WifiClient {
     /// The PMKSA entry of the connection attempt in flight, when the
     /// association is (to be) done with a cached PMKID.
     pub(crate) pmksa_in_use: Option<PmksaEntry>,
+    /// FT key context of the current connection (802.11r roaming).
+    pub(crate) ft: Option<crate::roam::FtContext>,
+    /// FT roam in flight (target BSS, nonces, derived keys).
+    pub(crate) ft_roam: Option<crate::roam::FtRoam>,
+    /// The scan in progress was triggered to find roam candidates (not
+    /// to connect); its results go through the roam decision instead of
+    /// the normal authentication flow.
+    pub(crate) roam_scan: bool,
+    /// BSSID the next connection attempt should prefer (set before a
+    /// roam-induced disconnect steers the retry loop to the target).
+    pub(crate) roam_target: Option<[u8; ETH_ALEN]>,
+    /// Every BSS matching a configured network from the last scan (with
+    /// the matched network) - the roam decision picks among these.
+    pub(crate) last_scan_candidates: Vec<(BssInfo, NetworkConfig)>,
+    /// A 4-way Message 1 that arrived before the FT context could be
+    /// built from the association response event (the two can race).
+    pub(crate) pending_ft_msg1: Option<Vec<u8>>,
+    /// When the last roam finished: signal-triggered roaming pauses for
+    /// `ROAM_COOLDOWN_SECS` afterwards so equal-signal BSSes do not
+    /// ping-pong the client.
+    pub(crate) last_roam: Option<std::time::Instant>,
 }
 
 impl WifiClient {
@@ -192,7 +213,7 @@ impl WifiClient {
             )
         })?;
 
-        Ok(WifiClient {
+        let mut client = WifiClient {
             handle,
             conn_handle,
             event_receiver,
@@ -212,7 +233,19 @@ impl WifiClient {
             fourway: None,
             pmksa_cache: PmksaCache::default(),
             pmksa_in_use: None,
-        })
+            ft: None,
+            ft_roam: None,
+            roam_scan: false,
+            roam_target: None,
+            last_scan_candidates: Vec::new(),
+            pending_ft_msg1: None,
+            last_roam: None,
+        };
+
+        // Receive WNM action frames (BTM Requests) for roaming.
+        client.register_roam_frames().await;
+
+        Ok(client)
     }
 
     /// Advance the connection flow by one step and return the current state.
@@ -240,6 +273,13 @@ impl WifiClient {
             }
             WifiState::Scanning => {
                 self.wait_scan_finish().await;
+                if self.roam_scan {
+                    // Roam scan: evaluate candidates while staying on the
+                    // current BSS.
+                    self.roam_scan = false;
+                    self.process_roam_scan_results().await;
+                    return Ok(());
+                }
                 if let Err(e) = self.process_scan_results().await {
                     // SSID not found: hand the periodic scanning over to
                     // the firmware (PNO) when supported, otherwise fall
@@ -355,22 +395,37 @@ impl WifiClient {
             }
             WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey => {
-                // Keep draining events so group rekeys and disconnects are
-                // handled while the connection stays up.
-                match self.event_receiver.next().await {
-                    Some((raw_msg, _addr)) => {
+                // Keep draining events so group rekeys, disconnects and
+                // BTM Requests are handled while the connection stays up.
+                // With a roam threshold configured, bound the wait so the
+                // signal level gets checked periodically.
+                const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
+                let next = if self.config.roam_threshold_dbm.is_some() {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(ROAM_SIGNAL_CHECK_SECS),
+                        self.event_receiver.next(),
+                    )
+                    .await
+                } else {
+                    Ok(self.event_receiver.next().await)
+                };
+                match next {
+                    Ok(Some((raw_msg, _addr))) => {
                         if let Some(event) =
                             wl_nl80211::Nl80211Event::parse(raw_msg)
                         {
                             self.handle_event(event).await;
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(WifiError::new(
                             ErrorKind::Nl80211,
                             "event channel closed",
                         ));
                     }
+                    // No event within the interval: check whether the
+                    // signal dropped below the roam threshold.
+                    Err(_) => self.check_roam_conditions().await,
                 }
             }
             WifiState::Failed | WifiState::FailedAuthentication => {
@@ -576,11 +631,27 @@ impl WifiClient {
     async fn handle_event(&mut self, event: Nl80211Event) {
         match event {
             Nl80211Event::Frame { frame } => {
-                self.handle_auth_frame(&frame).await;
+                // Registered management frames reach us here: SAE auth
+                // frames during authentication, and WNM action frames
+                // (BTM Requests) while connected.
+                if frame.len() > 24
+                    && frame[24] == crate::ieee80211::wnm::WNM_ACTION_CATEGORY
+                {
+                    self.handle_wnm_frame(&frame).await;
+                } else {
+                    self.handle_auth_frame(&frame).await;
+                }
             }
 
             Nl80211Event::Authenticated { status, frame } => {
-                if self.pmksa_in_use.is_some() {
+                if self.ft_roam.is_some() {
+                    // FT roam: the target AP's FT Authentication response
+                    // (transaction 2).
+                    self.handle_ft_auth_response(
+                        frame.as_deref().unwrap_or(&[]),
+                    )
+                    .await;
+                } else if self.pmksa_in_use.is_some() {
                     // G4 PMKSA caching: the open-system authentication
                     // already succeeded; associate with the cached PMKID in
                     // the RSNE. An AP without the matching PMKSA rejects
@@ -595,7 +666,10 @@ impl WifiClient {
                         );
                         self.pmksa_fallback().await;
                     }
-                } else if self.bss_info.security != SecurityType::Sae {
+                } else if !matches!(
+                    self.bss_info.security,
+                    SecurityType::Sae | SecurityType::FtSae
+                ) {
                     // Open-system auth (open + OWE): no frame, just
                     // a status.
                     if status == Nl80211EventCode::Success {
@@ -644,6 +718,28 @@ impl WifiClient {
                                 log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
                             }
+                        } else if self.bss_info.security == SecurityType::FtPsk
+                        {
+                            // FT-PSK: open-system auth, then associate
+                            // with the FT-PSK RSNE and the MDIE.
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending FT-PSK \
+                                 ASSOCIATE"
+                            );
+                            let mut ies = elements::ft_psk_ie(None);
+                            if let Err(e) = self.append_ft_mdie(&mut ies) {
+                                log::warn!("FT-PSK ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                                return;
+                            }
+                            let mfp = self
+                                .bss_info
+                                .ap_mfp_capable()
+                                .then_some(Nl80211UseMfp::Required);
+                            if let Err(e) = self.associate(ies, mfp).await {
+                                log::warn!("FT-PSK ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                            }
                         } else {
                             // Plain open: associate without DH.
                             log::info!(
@@ -676,7 +772,31 @@ impl WifiClient {
             }
 
             Nl80211Event::Associated { status, ies } => {
-                if status == Nl80211EventCode::Success {
+                if self.ft_roam.is_some() {
+                    // FT roam: (Re)Association Response from the target
+                    // AP - validate the FTIE MIC and install the keys.
+                    // On failure the old AP is already disconnected
+                    // (CMD_AUTHENTICATE did that), so the retry loop
+                    // reconnects.
+                    if status == Nl80211EventCode::Success {
+                        if let Err(e) = self
+                            .handle_ft_assoc_response(
+                                ies.as_deref().unwrap_or(&[]),
+                            )
+                            .await
+                        {
+                            log::warn!("FT roam aborted: {e}; reconnecting");
+                            self.state = WifiState::Failed;
+                        }
+                    } else {
+                        log::warn!(
+                            "FT REASSOCIATE rejected: status={status}; \
+                             reconnecting"
+                        );
+                        self.ft_roam = None;
+                        self.state = WifiState::Failed;
+                    }
+                } else if status == Nl80211EventCode::Success {
                     if self.bss_info.security == SecurityType::Open {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
@@ -691,6 +811,28 @@ impl WifiClient {
                             );
                         } else {
                             self.state = WifiState::Failed;
+                        }
+                    } else if self.bss_info.security.is_ft() {
+                        // Initial association with an FT AKM: record the
+                        // mobility domain and R0/R1 key holders from the
+                        // response IEs and derive the FT key hierarchy;
+                        // the 4-way handshake that follows runs with the
+                        // PMK-R1-derived PTK.
+                        if let Err(e) = self
+                            .setup_ft_context(ies.as_deref().unwrap_or(&[]))
+                            .await
+                        {
+                            log::warn!("FT setup failed: {e}");
+                            self.state = WifiState::Failed;
+                        } else {
+                            log::info!(
+                                "ASSOCIATED (FT) - waiting for 4-way handshake"
+                            );
+                            // A Message 1 may have raced ahead of this
+                            // association event; feed it now.
+                            if let Some(frame) = self.pending_ft_msg1.take() {
+                                self.handle_control_port_frame(&frame).await;
+                            }
                         }
                     } else {
                         if self.pmksa_in_use.is_some() {
@@ -741,8 +883,15 @@ impl WifiClient {
             }
 
             Nl80211Event::Disconnect { reason } => {
-                log::warn!("DISCONNECT: reason={reason}");
-                self.state = WifiState::Failed;
+                // During an FT roam this is the expected side effect of
+                // CMD_AUTHENTICATE disconnecting the old AP - the roam
+                // continues; acting on it would tear the roam down.
+                if self.ft_roam.is_some() {
+                    log::debug!("DISCONNECT during FT roam ignored (expected)");
+                } else {
+                    log::warn!("DISCONNECT: reason={reason}");
+                    self.state = WifiState::Failed;
+                }
             }
 
             Nl80211Event::ScanStart | Nl80211Event::NewScanResults => {
@@ -780,8 +929,14 @@ impl WifiClient {
                     // delay between them, and acting on a stale one
                     // would tear down the reconnection already in
                     // flight (wpa_supplicant drops stale events the
-                    // same way).
-                    if matches!(
+                    // same way). During an FT roam these events are the
+                    // expected consequence of CMD_AUTHENTICATE
+                    // disconnecting the old AP - let the roam continue.
+                    if self.ft_roam.is_some() {
+                        log::debug!(
+                            "{cmd:?} during FT roam ignored (expected)"
+                        );
+                    } else if matches!(
                         self.state,
                         WifiState::ConnectedWithoutOffloadRekey
                             | WifiState::ConnectedWithOffloadRekey
@@ -881,12 +1036,23 @@ impl WifiClient {
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
-                if let Err(e) = self
-                    .associate(
-                        elements::sae_ie(),
-                        Some(Nl80211UseMfp::Required),
-                    )
-                    .await
+                let rsne = match self.bss_info.security {
+                    SecurityType::FtSae => elements::ft_sae_ie(None),
+                    _ => elements::sae_ie(),
+                };
+                let mut ies = rsne;
+                // FT initial mobility domain association: the request
+                // carries the MDIE, which prompts the AP to answer with
+                // MDIE + FTIE (R0KH-ID / R1KH-ID).
+                if self.bss_info.security == SecurityType::FtSae
+                    && let Err(e) = self.append_ft_mdie(&mut ies)
+                {
+                    log::warn!("FT ASSOCIATE failed: {e}");
+                    self.state = WifiState::Failed;
+                    return;
+                }
+                if let Err(e) =
+                    self.associate(ies, Some(Nl80211UseMfp::Required)).await
                 {
                     log::warn!("ASSOCIATE failed: {e}");
                     self.state = WifiState::Failed;
@@ -920,67 +1086,116 @@ impl WifiClient {
             // 4-way handshake Message 1 (ANonce).
             log::info!("4-way handshake: Message 1 (ANonce)");
 
+            // With an FT AKM the PTK comes from the FT key hierarchy,
+            // whose parameters (R0KH-ID / R1KH-ID) only become known
+            // through the association response event - which can race
+            // behind this first EAPOL frame. Buffer the frame until the
+            // FT context exists.
+            if self.bss_info.security.is_ft() && self.ft.is_none() {
+                log::debug!(
+                    "buffered 4-way Message 1 until the FT context exists"
+                );
+                self.pending_ft_msg1 = Some(frame.to_vec());
+                return;
+            }
+
             if self.fourway.is_none() {
-                let (pmk, rsne, mic_alg) = if let Some(entry) =
-                    self.pmksa_in_use.as_ref()
-                {
-                    // G4: 4-way over a cached PMK. The RSNE must be
-                    // the same one the association request carried
-                    // (with the PMKID) - the AP verifies that.
-                    let rsne = self.rsne_with_pmkid(Some(entry.pmkid));
-                    (entry.pmk, rsne, entry.mic_alg)
+                if self.bss_info.security.is_ft() {
+                    // Initial association with an FT AKM: the 4-way
+                    // handshake runs with the PTK derived from PMK-R1
+                    // (802.11-2020 §12.8); Message 2's RSNE must carry
+                    // PMKR1Name as its PMKID (the AP verifies that for
+                    // FT AKMs), matching the association's FT context.
+                    let Some(ft) = self.ft.as_ref() else {
+                        log::warn!("no FT context for 4-way handshake");
+                        self.state = WifiState::Failed;
+                        return;
+                    };
+                    let mut rsne = match self.bss_info.security {
+                        SecurityType::FtSae => {
+                            elements::ft_sae_ie(Some(ft.pmk_r1.name))
+                        }
+                        _ => elements::ft_psk_ie(Some(ft.pmk_r1.name)),
+                    };
+                    // MDIE + FTIE from the association response join the
+                    // RSNE in the Message 2 key data.
+                    rsne.extend_from_slice(&ft.assoc_resp_ft_ies);
+                    self.fourway = Some(FourWayState::new_ft(
+                        ft.pmk_r1.clone(),
+                        self.mac,
+                        self.bss_info.bssid,
+                        rsne,
+                        self.bss_info.ap_rsne.clone(),
+                        self.bss_info.ap_rsnxe.clone(),
+                    ));
                 } else {
-                    match self.bss_info.security {
-                        SecurityType::Owe => {
-                            let Some(ref owe_auth) = self.owe else {
-                                log::warn!("no OWE state for 4-way handshake");
-                                self.state = WifiState::Failed;
-                                return;
-                            };
-                            let Some(pmk) = owe_auth.pmk() else {
-                                log::warn!("OWE PMK not derived");
-                                self.state = WifiState::Failed;
-                                return;
-                            };
-                            (pmk, elements::owe_ie(), MicAlg::HmacSha256)
+                    let (pmk, rsne, mic_alg) = if let Some(entry) =
+                        self.pmksa_in_use.as_ref()
+                    {
+                        // G4: 4-way over a cached PMK. The RSNE must be
+                        // the same one the association request carried
+                        // (with the PMKID) - the AP verifies that.
+                        let rsne = self.rsne_with_pmkid(Some(entry.pmkid));
+                        (entry.pmk, rsne, entry.mic_alg)
+                    } else {
+                        match self.bss_info.security {
+                            SecurityType::Owe => {
+                                let Some(ref owe_auth) = self.owe else {
+                                    log::warn!(
+                                        "no OWE state for 4-way handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                let Some(pmk) = owe_auth.pmk() else {
+                                    log::warn!("OWE PMK not derived");
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (pmk, elements::owe_ie(), MicAlg::HmacSha256)
+                            }
+                            SecurityType::Wpa2Psk => {
+                                let Some(pmk) = self.psk_pmk else {
+                                    log::warn!(
+                                        "no PSK PMK for 4-way handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
+                            }
+                            _ => {
+                                // SAE
+                                let Some(pmk) =
+                                    self.auth.as_ref().and_then(|a| a.pmk())
+                                else {
+                                    log::warn!("no PMK for 4-way handshake");
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (pmk, elements::sae_ie(), MicAlg::AesCmac)
+                            }
                         }
-                        SecurityType::Wpa2Psk => {
-                            let Some(pmk) = self.psk_pmk else {
-                                log::warn!("no PSK PMK for 4-way handshake");
-                                self.state = WifiState::Failed;
-                                return;
-                            };
-                            (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
-                        }
-                        _ => {
-                            // SAE
-                            let Some(pmk) =
-                                self.auth.as_ref().and_then(|a| a.pmk())
-                            else {
-                                log::warn!("no PMK for 4-way handshake");
-                                self.state = WifiState::Failed;
-                                return;
-                            };
-                            (pmk, elements::sae_ie(), MicAlg::AesCmac)
-                        }
-                    }
-                };
-                self.fourway = Some(FourWayState::new_with_ap_ies(
-                    &pmk,
-                    mic_alg,
-                    self.mac,
-                    self.bss_info.bssid,
-                    rsne,
-                    self.bss_info.ap_rsne.clone(),
-                    self.bss_info.ap_rsnxe.clone(),
-                ));
+                    };
+                    self.fourway = Some(FourWayState::new_with_ap_ies(
+                        &pmk,
+                        mic_alg,
+                        self.mac,
+                        self.bss_info.bssid,
+                        rsne,
+                        self.bss_info.ap_rsne.clone(),
+                        self.bss_info.ap_rsnxe.clone(),
+                    ));
+                }
             }
 
             let msg2 = {
                 let fw = self.fourway.as_mut().unwrap();
-                match fw
-                    .process_message_1(&parsed.key_nonce, parsed.replay_counter)
-                {
+                match fw.process_message_1(
+                    &parsed.key_nonce,
+                    parsed.replay_counter,
+                    parsed.key_info,
+                ) {
                     Ok(msg2) => msg2,
                     Err(e) => {
                         log::warn!("process_message_1 failed: {e}");
@@ -1402,7 +1617,9 @@ impl WifiClient {
     fn rsne_with_pmkid(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
         match self.bss_info.security {
             SecurityType::Sae => elements::sae_ie_with_pmkid(pmkid),
+            SecurityType::FtSae => elements::ft_sae_ie(pmkid),
             SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid(pmkid),
+            SecurityType::FtPsk => elements::ft_psk_ie(pmkid),
             SecurityType::Owe => elements::owe_ie(),
             SecurityType::Open => Vec::new(),
         }

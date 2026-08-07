@@ -3,6 +3,13 @@
 # of most-common use case: full static and full dynamic.
 ---
 version: 1
+# Roaming: when the current AP's signal (dBm) drops below this
+# threshold while connected, the client scans and roams to a better
+# BSS (Fast BSS Transition inside a mobility domain, full
+# reauthentication otherwise). BSS Transition Management (802.11v)
+# requests are honoured regardless. Absent disables signal-triggered
+# roaming.
+# roam-threshold-dbm: -70
 wifis:
   - ssid: Test-WIFI
     password: "12345678"

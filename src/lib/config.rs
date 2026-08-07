@@ -11,6 +11,10 @@ pub struct WifiConfig {
     /// probes for all of them; the strongest matching BSS wins and its
     /// network's passphrase is used for authentication.
     pub networks: Vec<NetworkConfig>,
+    /// Signal level (dBm) below which the client scans for roam
+    /// candidates while connected. `None` disables signal-triggered
+    /// roaming (BTM Requests are still honoured).
+    pub roam_threshold_dbm: Option<i32>,
 }
 
 /// A single WiFi network: an SSID with an optional passphrase. Open
@@ -43,7 +47,16 @@ impl WifiConfig {
         Self {
             iface_name: iface_name.to_string(),
             networks: Vec::new(),
+            roam_threshold_dbm: None,
         }
+    }
+
+    /// Enable signal-triggered roaming: while connected, the client
+    /// polls the AP's signal level and scans for roam candidates when
+    /// it drops below `threshold_dbm`.
+    pub fn set_roam_threshold(&mut self, threshold_dbm: i32) -> &mut Self {
+        self.roam_threshold_dbm = Some(threshold_dbm);
+        self
     }
 
     /// Add a network to scan for and connect to.

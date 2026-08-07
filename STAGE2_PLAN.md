@@ -160,6 +160,13 @@ wpa_supplicant model:
   (still stubbed out there; the `SetPmksa`/`DelPmksa`/`FlushPmksa`
   commands already exist).
 
+Status (2026-08-06): done - userspace cache with the cached PMKID in
+the (Re)Association RSNE and full-auth fallback; driver cache fed via
+`SET_PMKSA`/`DEL_PMKSA` best-effort (`wl-nl80211` gained
+`NL80211_ATTR_PMK`/`NL80211_ATTR_PMKID` and request builders; the
+shipped kernel's `SET_PMK`/`DEL_PMK` are unused since mac80211 returns
+EOPNOTSUPP for both paths anyway).
+
 ### G5 - Robustness
 
 * **Security classification:** BSSes whose RSNE carries only
@@ -221,6 +228,13 @@ roaming currency).  References: 802.11-2020 §12.8 (FT), §11.24
 (WNM/BTM); wpa_supplicant `src/rsn_supp/wpa_ft.c` + `wnm_sta.c`, iwd
 `src/ft.c` + `src/station.c`.
 
+Status (2026-08-06): implemented over-the-Air FT-PSK/FT-SAE (PMK-R0/R1
+hierarchy, FTIE MIC validation, PTK/GTK/IGTK install from the
+Reassociation Response), 802.11v BTM Request handling with Neighbor
+Report candidate parsing and BTM Response, and signal-threshold roam
+scans with a post-roam cooldown; non-FT roams fall back to PMKSA/OKC
+then full authentication.  Over-the-DS remains stretch.
+
 ### G9 - Suspend / WoWLAN
 
 GTK rekey offload (Stage 1) was built as this feature's prerequisite;
@@ -272,7 +286,9 @@ multi-interface and packaging.
   hostapd `ieee80211w=2` Message 3 (test asserts key install);
   protected action frames reach the kernel (SA Query round-trip or
   equivalent); RSNE-mismatch and Request-bit cases covered by unit
-  tests.
+  tests.  **Done 2026-08-06** (IGTK/BIGTK install + SA Query survival
+  test; msg3 RSNE/RSNXE downgrade checks; Request-bit drop; PTK rekey
+  coverage; optional PMF on WPA2-PSK).
 * **M2** WPA2-PSK test closure (G3): PBKDF2/PRF-384/HMAC-SHA1 KATs
   plus a WPA2-PSK integration test, all green.
 * **M3** SAE interop (G2): connects to hostapd `sae_pwe=0/1` (HnP)
@@ -280,10 +296,16 @@ multi-interface and packaging.
 * **M4** PMKSA caching (G4): reconnect to the same AP completes
   without a fresh SAE exchange (cache hit observable in logs/AP);
   driver offload path exercised when the wiphy supports it.
+  **Done 2026-08-06** (userspace cache keyed by (SSID, BSSID), 43200 s
+  lifetime, cached PMKID in (Re)Assoc RSNE with fallback; SET_PMKSA /
+  DEL_PMKSA best-effort - mac80211 answers EOPNOTSUPP).
 * **M5** Roaming (G8): in a two-BSS test netns, an FT-PSK or FT-SAE
   over-the-Air transition and a BTM-directed roam both complete;
   PMKSA/OKC-assisted reassociation verified before full-auth
-  fallback.  (Requires M1 and M4.)
+  fallback.  (Requires M1 and M4.)  **Done 2026-08-06** (FT-PSK +
+  FT-SAE over-the-Air with PMK-R0/R1 hierarchy; BTM Request/Response
+  with Neighbor Report candidates; signal-threshold roam scan with
+  cooldown; OKC PMKID cloning attempted before full-auth fallback).
 * **M6** Suspend / WoWLAN (G9): WoWLAN triggers armed on suspend;
   wake path (GTK-rekey failure -> disconnect + reconnect) covered
   where the driver supports it.
@@ -313,19 +335,19 @@ the Stage 2/3 scope is derived from.
 | SAE-PK | ✗ (Stage 3) | ✗ | ✓ |
 | WPA2-PSK (AKM 2) | ✓ | ✓ | ✓ |
 | PSK-SHA256 (AKM 6) | ✗ (Stage 3) | ✓ | ✓ |
-| FT-PSK / FT-SAE (802.11r) | ✗ (G8) | ✓ | ✓ |
+| FT-PSK / FT-SAE (802.11r) | ✓ (over-the-Air) | ✓ | ✓ |
 | 4-way GTK delivery + rekey | ✓ | ✓ | ✓ |
 | GTK rekey offload | ✓ | ✓ | ✓ |
-| IGTK (PMF mgmt key) | ✗ (G1a) | ✓ | ✓ |
-| BIGTK (beacon protection) | ✗ (G1a) | ✗ | ✓ |
-| AP-initiated PTK rekey | ✓ (untested, G1c) | ✓ | ✓ |
-| RSNE validation in msg3 | ✗ (G1b) | ✓ | ✓ |
-| PMKSA cache (userspace) | ✗ (G4) | ✗ | ✓ |
-| PMKSA cache (driver) | ✗ (G4) | ✗ | ✓ |
-| OKC (proactive key caching) | ✗ (G8) | ✗ | ✓ |
-| Optional PMF on WPA2-PSK | ✗ (G1d) | ✓ (default) | ✓ (config) |
-| 802.11v BTM / neighbor rpt | ✗ (G8) | ✓ | ✓ |
-| Signal-triggered roaming | ✗ (G8) | ✓ | ✓ |
+| IGTK (PMF mgmt key) | ✓ | ✓ | ✓ |
+| BIGTK (beacon protection) | ✓ (when AP sends it) | ✗ | ✓ |
+| AP-initiated PTK rekey | ✓ | ✓ | ✓ |
+| RSNE validation in msg3 | ✓ | ✓ | ✓ |
+| PMKSA cache (userspace) | ✓ | ✗ | ✓ |
+| PMKSA cache (driver) | ✓ (best-effort) | ✗ | ✓ |
+| OKC (proactive key caching) | ✓ (attempt + fallback) | ✗ | ✓ |
+| Optional PMF on WPA2-PSK | ✓ | ✓ (default) | ✓ (config) |
+| 802.11v BTM / neighbor rpt | ✓ | ✓ | ✓ |
+| Signal-triggered roaming | ✓ | ✓ | ✓ |
 | OCV | ✗ (Stage 3) | ✓ (non-FT) | ✓ |
 | Extended key ID | ✗ (Stage 3) | ✓ | ✓ |
 | Transition Disable KDE | ✗ (Stage 3) | ✓ | ✓ |

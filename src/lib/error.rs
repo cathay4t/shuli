@@ -19,6 +19,7 @@ pub enum ErrorKind {
     InvalidConfig,
     NetlinkDecode,
     Deprecated,
+    Roaming,
 }
 
 impl fmt::Display for ErrorKind {
@@ -39,6 +40,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidConfig => "invalid-config",
             ErrorKind::NetlinkDecode => "netlink-decode",
             ErrorKind::Deprecated => "deprecated",
+            ErrorKind::Roaming => "roaming",
         };
         write!(f, "{s}")
     }

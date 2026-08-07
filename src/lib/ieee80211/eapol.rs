@@ -28,6 +28,13 @@ const KEY_DESC_HDR_LEN: usize = OFF_DATA_LEN + 2 - EAPOL_HDR_LEN; // 95
 // Key Information bit positions (16-bit field, big-endian on the wire)
 const KEY_INFO_DESC_TYPE_MASK: u16 = 0x0007;
 const KEY_INFO_PAIRWISE: u16 = 0x0008;
+
+/// Key Descriptor Version (bits 0-2 of Key Information): 0 = AKM-defined,
+/// 2 = HMAC-SHA1 MIC, 3 = AES-128-CMAC MIC. The supplicant echoes the
+/// version negotiated by the AP's Message 1.
+pub fn desc_version(key_info: u16) -> u16 {
+    key_info & KEY_INFO_DESC_TYPE_MASK
+}
 const KEY_INFO_INSTALL: u16 = 0x0040;
 const KEY_INFO_ACK: u16 = 0x0080;
 const KEY_INFO_MIC: u16 = 0x0100;

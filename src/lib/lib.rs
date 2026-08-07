@@ -9,6 +9,7 @@ mod ieee80211;
 mod mac;
 pub mod nl80211;
 mod pmksa;
+mod roam;
 pub mod scan;
 #[cfg(test)]
 mod tests;

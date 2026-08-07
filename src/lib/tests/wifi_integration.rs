@@ -102,13 +102,16 @@ impl WifiTestEnv {
 
     /// Start hostapd with `hostapd_conf` in the test netns. Idempotent
     /// only in the sense of being callable once; a second call would
-    /// start a second instance.
+    /// start a second instance. Debug output goes to a log file so
+    /// failures can be inspected afterwards.
     fn start_hostapd(&mut self, hostapd_conf: &str) {
         let conf_path = "/tmp/shuli_rs_test_hostapd.conf";
         std::fs::write(conf_path, hostapd_conf).expect("write hostapd conf");
         let pid_path = "/tmp/shuli_rs_test_hostapd.pid";
+        let bin = hostapd_bin("hostapd");
         sh_ok(&format!(
-            "ip netns exec {TEST_NS} hostapd -B -P {pid_path} {conf_path}"
+            "ip netns exec {TEST_NS} {bin} -B -dd -t -f \
+             /tmp/shuli_rs_test_hostapd.log -P {pid_path} {conf_path}"
         ));
         std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -177,24 +180,65 @@ ctrl_interface=/var/run/hostapd
 
 /// Run `hostapd_cli` against the test AP inside the test netns.
 fn hostapd_cli(args: &str) {
+    hostapd_cli_if(AP_NIC, args);
+}
+
+/// The hostapd/hostapd_cli binaries to use: prefer a locally built
+/// copy in /usr/local/bin (the tests need CONFIG_WNM_AP + CONFIG_IEEE80211R
+/// for the roaming tests, which distro packages may lack), and fall
+/// back to whatever is on PATH.
+fn hostapd_bin(name: &str) -> String {
+    let local = format!("/usr/local/bin/{name}");
+    if std::path::Path::new(&local).exists() {
+        local
+    } else {
+        name.to_string()
+    }
+}
+
+/// Run `hostapd_cli` against a specific BSS interface (multi-BSS setups).
+fn hostapd_cli_if(iface: &str, args: &str) {
+    let bin = hostapd_bin("hostapd_cli");
     sh_ok(&format!(
-        "ip netns exec {TEST_NS} hostapd_cli -p /var/run/hostapd -i {AP_NIC} \
-         {args}"
+        "ip netns exec {TEST_NS} {bin} -p /var/run/hostapd -i {iface} {args}"
     ));
 }
 
+/// hostapd interface name serving a given BSSID in the two-BSS FT tests.
+fn ft_ap_iface(bssid: [u8; 6]) -> &'static str {
+    if bssid == [0x02, 0x00, 0x00, 0x00, 0x01, 0x00] {
+        "wifi_ap"
+    } else {
+        "wifi_ap_2"
+    }
+}
+
 /// Run [`WifiClient::run()`] in a loop until a connected state is
-/// reached or `max_iters` is exhausted.
+/// reached or `max_iters` is exhausted. Each call is bounded so a
+/// client stuck waiting for events fails the test instead of hanging.
 async fn run_until_connected(
     client: &mut WifiClient,
     max_iters: u32,
 ) -> Result<WifiState, crate::WifiError> {
     for _ in 0..max_iters {
-        let state = client.run().await?;
-        match state {
-            WifiState::ConnectedWithoutOffloadRekey
-            | WifiState::ConnectedWithOffloadRekey => return Ok(state),
-            _ => {}
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(state)) => match state {
+                WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey => return Ok(state),
+                _ => {}
+            },
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(crate::WifiError::new(
+                    crate::ErrorKind::ConnectFailed,
+                    "client.run() made no progress within 20 s",
+                ));
+            }
         }
     }
     Err(crate::WifiError::new(
@@ -498,6 +542,285 @@ async fn wifi_client_sae_pmksa_reconnect() {
         client.auth.is_none(),
         "reconnect must skip SAE when the PMKSA cache hits"
     );
+    client.shutdown().await;
+}
+
+/// Two-BSS FT-SAE topology on a single radio: both BSSes share the
+/// SSID and mobility domain, and r0kh/r1kh entries cross-connect them
+/// so PMK-R1 is available on both (pmk_r1_push=1).
+const FT_SAE_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-FT
+wpa=2
+wpa_key_mgmt=FT-SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+sae_password=12345678
+nas_identifier=ap1
+mobility_domain=a1b2
+r0_key_lifetime=10000
+pmk_r1_push=1
+r0kh=02:00:00:00:03:00 ap2 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+r1kh=02:00:00:00:03:00 02:00:00:00:03:00 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+ctrl_interface=/var/run/hostapd
+
+bss=wifi_ap_2
+bssid=02:00:00:00:03:00
+ssid=Test-WIFI-FT
+wpa=2
+wpa_key_mgmt=FT-SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+sae_password=12345678
+nas_identifier=ap2
+mobility_domain=a1b2
+r0_key_lifetime=10000
+pmk_r1_push=1
+r0kh=02:00:00:00:01:00 ap1 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+r1kh=02:00:00:00:01:00 02:00:00:00:01:00 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+ctrl_interface=/var/run/hostapd
+";
+
+/// Same topology with FT-PSK (WPA2, optional PMF).
+const FT_PSK_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-FT
+wpa=2
+wpa_key_mgmt=FT-PSK
+rsn_pairwise=CCMP
+ieee80211w=1
+wpa_passphrase=12345678
+nas_identifier=ap1
+mobility_domain=a1b2
+r0_key_lifetime=10000
+pmk_r1_push=1
+r0kh=02:00:00:00:03:00 ap2 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+r1kh=02:00:00:00:03:00 02:00:00:00:03:00 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+ctrl_interface=/var/run/hostapd
+
+bss=wifi_ap_2
+bssid=02:00:00:00:03:00
+ssid=Test-WIFI-FT
+wpa=2
+wpa_key_mgmt=FT-PSK
+rsn_pairwise=CCMP
+ieee80211w=1
+wpa_passphrase=12345678
+nas_identifier=ap2
+mobility_domain=a1b2
+r0_key_lifetime=10000
+pmk_r1_push=1
+r0kh=02:00:00:00:01:00 ap1 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+r1kh=02:00:00:00:01:00 02:00:00:00:01:00 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
+ctrl_interface=/var/run/hostapd
+";
+
+/// G8: connect to a two-BSS FT-SAE ESS, then let a BSS Transition
+/// Management Request steer the client to the other BSS - an
+/// over-the-air Fast BSS Transition, no new SAE exchange.
+#[tokio::test]
+async fn wifi_client_ft_sae_btm_roam() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_ft_sae_btm_roam: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(FT_SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-FT", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    // Initial connection: full SAE (FT-SAE), FT context established.
+    assert!(client.auth.is_some(), "first connect must run full SAE");
+    assert!(client.ft.is_some(), "FT context expected after connecting");
+    let start_bssid = client.bss_info.bssid;
+
+    drain_pending_events(&mut client).await;
+
+    // The roam target is the other BSS of the ESS.
+    let target = client
+        .last_scan_candidates
+        .iter()
+        .map(|(bss, _)| bss)
+        .find(|bss| bss.bssid != start_bssid)
+        .expect("two BSSes in scan results")
+        .clone();
+    let target_bssid_str = target
+        .bssid
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+
+    // BTM Request with a preferred candidate list pointing at the
+    // target BSS (Neighbor Report entry), issued on the BSS the STA is
+    // currently associated with.
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli_if(
+        ft_ap_iface(start_bssid),
+        &format!(
+            "BSS_TM_REQ {sta_mac} pref=1 neighbor={target_bssid_str},0,81,1,10"
+        ),
+    );
+
+    // BTM accept + FT authentication + reassociation + key install.
+    let state = run_until_connected(&mut client, 20).await.expect("roam");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.bss_info.bssid, target.bssid,
+        "the roam must land on the BTM candidate BSS"
+    );
+    assert!(
+        client.auth.is_none(),
+        "an FT roam must not run a new SAE exchange"
+    );
+    assert!(client.ft_roam.is_none(), "the FT roam must be complete");
+
+    // Stability: no BTM is outstanding, so the client must stay on the
+    // target BSS (the roam cooldown suppresses immediate re-roaming).
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.run(),
+        )
+        .await;
+        if let Ok(Err(e)) = step {
+            panic!("client error after the BTM roam: {e}");
+        }
+        assert_eq!(
+            client.bss_info.bssid, target.bssid,
+            "the client must stay on the BTM candidate BSS"
+        );
+    }
+    client.shutdown().await;
+}
+
+/// G8: with a roam threshold configured, a weak signal triggers a scan
+/// and the client FT-roams to the stronger/other BSS of the ESS on its
+/// own (no BTM Request involved). The threshold is set high so hwsim's
+/// fixed signal always qualifies.
+#[tokio::test]
+async fn wifi_client_ft_psk_signal_roam() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_ft_psk_signal_roam: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(FT_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-FT", Some("12345678"));
+    // hwsim reports a fixed (weak) signal; any threshold above it starts
+    // the roam engine.
+    config.set_roam_threshold(-10);
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    let start_bssid = client.bss_info.bssid;
+
+    drain_pending_events(&mut client).await;
+
+    let target = client
+        .last_scan_candidates
+        .iter()
+        .map(|(bss, _)| bss)
+        .find(|bss| bss.bssid != start_bssid)
+        .expect("two BSSes in scan results")
+        .clone();
+
+    // Signal check interval is 5 s; give the roam engine a few rounds.
+    // The per-run timeout must exceed the client's internal 5 s signal
+    // check interval, or the check never gets a chance to run.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("client error during signal roam: {e}"),
+            Err(_) => {} // 15 s without a state change
+        }
+        if client.bss_info.bssid == target.bssid {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "signal-triggered FT roam did not happen in time (still on \
+             {:02x?})",
+            client.bss_info.bssid
+        );
+    }
+    assert!(matches!(
+        client.state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert!(
+        client.auth.is_none(),
+        "an FT roam must not run a new PSK/4-way full authentication"
+    );
+
+    // Stability: the signal is still "weak", but the roam cooldown must
+    // keep the client on the target BSS instead of roaming right back.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.run(),
+        )
+        .await;
+        if let Ok(Err(e)) = step {
+            panic!("client error after the signal roam: {e}");
+        }
+        assert_eq!(
+            client.bss_info.bssid, target.bssid,
+            "the roam cooldown must keep the client on the target BSS"
+        );
+    }
     client.shutdown().await;
 }
 

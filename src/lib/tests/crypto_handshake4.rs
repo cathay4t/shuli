@@ -224,7 +224,11 @@ fn run_msg1_msg3(
         b"",
     );
     let msg1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
-    state.process_message_1(&msg1.key_nonce, msg1.replay_counter)?;
+    state.process_message_1(
+        &msg1.key_nonce,
+        msg1.replay_counter,
+        msg1.key_info,
+    )?;
 
     let kck = state.kck().unwrap();
     let kek = state.kek().unwrap();
@@ -341,11 +345,11 @@ fn test_ptk_rekey_fresh_snonce() {
     );
 
     // Initial handshake Message 1.
-    let msg2_1 = state.process_message_1(&[0x11u8; 32], 1).unwrap();
+    let msg2_1 = state.process_message_1(&[0x11u8; 32], 1, 0).unwrap();
     let ptk_1 = state.ptk.unwrap();
 
     // PTK rekey: new ANonce, new replay counter.
-    let msg2_2 = state.process_message_1(&[0x22u8; 32], 2).unwrap();
+    let msg2_2 = state.process_message_1(&[0x22u8; 32], 2, 0).unwrap();
     let ptk_2 = state.ptk.unwrap();
 
     assert_ne!(ptk_1, ptk_2, "rekey must derive a fresh PTK");

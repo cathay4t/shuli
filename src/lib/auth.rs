@@ -150,13 +150,18 @@ impl WifiClient {
         self.fourway = None;
         self.psk_pmk = None;
         self.pmksa_in_use = None;
+        self.pending_ft_msg1 = None;
+        self.ft_roam = None;
 
         // G4: a cached PMKSA for the selected BSS replaces the full
         // authentication (SAE) with open-system auth + a PMKID-bearing
         // RSNE at association time.
         if matches!(
             self.bss_info.security,
-            SecurityType::Sae | SecurityType::Wpa2Psk
+            SecurityType::Sae
+                | SecurityType::Wpa2Psk
+                | SecurityType::FtSae
+                | SecurityType::FtPsk
         ) && let Some(entry) = self
             .pmksa_cache
             .lookup(&self.network.ssid, self.bss_info.bssid)
@@ -171,14 +176,20 @@ impl WifiClient {
         }
 
         if self.pmksa_in_use.is_some()
-            || self.bss_info.security != SecurityType::Sae
+            || !matches!(
+                self.bss_info.security,
+                SecurityType::Sae | SecurityType::FtSae
+            )
         {
-            // Open-system authentication: open, OWE, WPA2-PSK, and
-            // cached-PMKSA connections. OWE's DH exchange happens in the
-            // association request/response; WPA2-PSK derives the PMK from
-            // the passphrase via PBKDF2.
+            // Open-system authentication: open, OWE, WPA2-PSK, FT-PSK,
+            // and cached-PMKSA connections. OWE's DH exchange happens in
+            // the association request/response; the PSK AKMs derive the
+            // PMK from the passphrase via PBKDF2.
             if self.pmksa_in_use.is_none()
-                && self.bss_info.security == SecurityType::Wpa2Psk
+                && matches!(
+                    self.bss_info.security,
+                    SecurityType::Wpa2Psk | SecurityType::FtPsk
+                )
             {
                 let password =
                     self.network.password.as_deref().ok_or_else(|| {

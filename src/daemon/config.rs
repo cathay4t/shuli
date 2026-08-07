@@ -18,6 +18,11 @@ pub(crate) struct ShuliConfig {
     pub version: u32,
     #[serde(default)]
     pub wifis: Vec<WifiEntry>,
+    /// Signal level (dBm) below which the client scans for roam
+    /// candidates while connected. Absent disables signal-triggered
+    /// roaming (BTM Requests are still honoured).
+    #[serde(default, rename = "roam-threshold-dbm")]
+    pub roam_threshold_dbm: Option<i32>,
 }
 
 /// A single WiFi network entry.
@@ -86,6 +91,9 @@ impl ShuliConfig {
         let mut config = shuli::WifiConfig::new(iface_name);
         for entry in &self.wifis {
             config.add_network(&entry.ssid, entry.password.as_deref());
+        }
+        if let Some(threshold) = self.roam_threshold_dbm {
+            config.set_roam_threshold(threshold);
         }
         config
     }
