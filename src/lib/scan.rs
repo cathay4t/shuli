@@ -3,7 +3,8 @@
 //! Scan flow: trigger a scan, wait for results, then pick the strongest BSS
 //! matching the configured SSID.
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use wl_nl80211::Nl80211Event;
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
@@ -14,6 +15,12 @@ use crate::{
 };
 
 const SCAN_SLEEP_SECS: u64 = 3;
+/// Bounds how long [`WifiClient::wait_scan_finish`] waits for the
+/// `NL80211_CMD_NEW_SCAN_RESULTS` completion event before giving up and
+/// dumping the scan results anyway.  Generous on purpose: the event is the
+/// completion signal (a busy environment can keep a scan running for
+/// several seconds), the timeout only guards against a missed event.
+const SCAN_COMPLETE_TIMEOUT_SECS: u64 = 15;
 
 /// Security type detected from the BSS's RSNE in scan results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -144,12 +151,52 @@ impl WifiClient {
         trigger_scan(&self.handle, self.if_index, Some(&ssids)).await
     }
 
-    // TODO: use multicast to wait for scan completion instead of a fixed
-    // sleep: https://github.com/rust-netlink/wl-nl80211/pull/36
+    // Wait for the kernel's `NL80211_CMD_NEW_SCAN_RESULTS` multicast event
+    // instead of a fixed sleep: a scan can finish in well under a second in
+    // a quiet environment and take several in a busy one, and the client is
+    // already subscribed to the `Scan` group.  The wait is bounded by
+    // `SCAN_COMPLETE_TIMEOUT_SECS` (generous: the event is the completion
+    // signal, the timeout only guards against a missed event) and falls
+    // back to dumping the results when the event never arrives.  Other
+    // events observed while scanning (e.g. a disconnect during a roam
+    // scan) are fed to the state machine so they are not lost.
     pub(crate) async fn wait_scan_finish(&mut self) {
         log::trace!("Waiting for scan to finish");
-        tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
-            .await;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(SCAN_COMPLETE_TIMEOUT_SECS);
+        loop {
+            let remaining =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.event_receiver.next())
+                .await
+            {
+                Ok(Some((raw_msg, _addr))) => {
+                    if let Some(event) =
+                        wl_nl80211::Nl80211Event::parse(raw_msg)
+                    {
+                        match event {
+                            Nl80211Event::NewScanResults => {
+                                log::debug!("scan finished");
+                                return;
+                            }
+                            other => {
+                                self.handle_event(other).await;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Event channel closed; proceed to the results dump
+                    // (the state machine will surface the error if the
+                    // channel is truly gone).
+                    break;
+                }
+                Err(_) => break, // event timeout; proceed to the results dump
+            }
+        }
     }
 
     /// Dump the scan results and keep the strongest BSS matching any of

@@ -273,6 +273,13 @@ impl WifiClient {
             }
             WifiState::Scanning => {
                 self.wait_scan_finish().await;
+                if self.state != WifiState::Scanning {
+                    // An event observed while the scan was running (e.g. a
+                    // disconnect during a roam scan) advanced the state
+                    // machine; honor it instead of running the scan-results
+                    // flow on top.
+                    return Ok(());
+                }
                 if self.roam_scan {
                     // Roam scan: evaluate candidates while staying on the
                     // current BSS.
@@ -629,7 +636,7 @@ impl WifiClient {
         }
     }
 
-    async fn handle_event(&mut self, event: Nl80211Event) {
+    pub(crate) async fn handle_event(&mut self, event: Nl80211Event) {
         match event {
             Nl80211Event::Frame { frame } => {
                 // Registered management frames reach us here: SAE auth
