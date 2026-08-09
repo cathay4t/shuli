@@ -38,6 +38,25 @@ as Stage 2 work):
 * **Tests:** SAE/KDF/EAPOL unit tests + `mac80211_hwsim` + hostapd
   integration tests (open, WPA3-SAE H2E, scheduled-scan wake-up).
 
+### Stage 2 status (2026-08-09)
+
+| Milestone | Status |
+|---|---|
+| M1 PMF & handshake correctness (G1) | **Done 2026-08-06** (`959ce70`) |
+| M2 WPA2-PSK test closure (G3) | **Done 2026-08-09** (`e63bee0`) |
+| M3 SAE interop (G2) | **Done 2026-08-09** (`5aae947`) |
+| M4 PMKSA caching (G4) | **Done 2026-08-06** (`60e7404`) |
+| M5 Roaming (G8) | **Done 2026-08-06** (`afb4278`; follow-ups `40fba35`, `eea56d1`) |
+| M6 Suspend / WoWLAN (G9) | **In progress.** The `wl-nl80211` set-side WoWLAN work (triggers attr, wake-report attr/event, `set_wowlan` builder) is applied in `/home/fge/Source/netlink/wl-nl80211` but **uncommitted and not yet compiling** (2 `attr.rs` match-arm errors; fix + tests + M7 reason events are itemized in `wl-nl80211_change_plan.md`). The shuli side (`arm_wowlan()`, wake handling) is not started. |
+| M7 Robustness (G5) | **Not started.** Reason-aware retry needs `wl-nl80211` `Deauthenticated`/`Disassociated { reason }` events (in `wl-nl80211_change_plan.md`); unsupported-AKM skip and daemon multi-interface are shuli-side. |
+| M8 Packaging (G6) | **Not started** (systemd unit, `/etc/shuli/` layout, docs). |
+| M9 nipart decision (G7) | **Not started.** §1/§3 imply option (a) embed the `shuli` crate; to be recorded here when decided. |
+
+Catch-up entry point: run `git log --oneline` in this repo for the
+milestone commits, and read `wl-nl80211_change_plan.md` before touching
+`/home/fge/Source/netlink/wl-nl80211` (that repo currently has
+uncommitted, non-compiling WoWLAN changes from 2026-08-09).
+
 ## 1. Design decision: no IPC
 
 The original Stage 2 primary goals - a UNIX abstract-socket control
@@ -180,10 +199,12 @@ EOPNOTSUPP for both paths anyway).
 * **Disconnect handling:** surface deauth/disassoc reason codes and
   use reason-aware retry behaviour instead of one generic backoff.
   iwd's policy (`station_retry_with_reason`) is a good model: reasons
-  2 (`PREV_AUTH_NOT_VALID`) and 16 (`802.1X_FAILED`) abort retries
-  (wrong-passphrase protection), other reasons blacklist the BSS and
-  try the next candidate.  shuli's single 10-minute auth backoff
-  conflates all causes today.
+  2 (`PREV_AUTH_NOT_VALID`) and 23 (`IEEE_802_1X_AUTH_FAILED`) abort
+  retries (wrong-passphrase protection), other reasons blacklist the
+  BSS and try the next candidate.  shuli's single 10-minute auth
+  backoff conflates all causes today.  (The 2026-08 audit text said
+  "reason 16"; the correct constant is **23** - 16 is
+  `GROUP_KEY_HANDSHAKE_TIMEOUT`.)
 
 ### G6 - Packaging
 
@@ -319,14 +340,22 @@ multi-interface and packaging.
   cooldown; OKC PMKID cloning attempted before full-auth fallback).
 * **M6** Suspend / WoWLAN (G9): WoWLAN triggers armed on suspend;
   wake path (GTK-rekey failure -> disconnect + reconnect) covered
-  where the driver supports it.
+  where the driver supports it.  **In progress (2026-08-09):** the
+  `wl-nl80211` set-side work is applied but uncommitted/non-compiling
+  there; shuli side (`arm_wowlan()`, wake handling, tests) open.  See
+  `wl-nl80211_change_plan.md`.
 * **M7** Robustness (G5): unsupported-AKM BSS skipped (unit test),
   two interfaces connected concurrently (integration), reason-code
-  aware retry.
+  aware retry.  **Not started (2026-08-09).**  Reason parsing needs
+  `wl-nl80211` `Deauthenticated`/`Disassociated { reason }` events
+  (see `wl-nl80211_change_plan.md`); the rest is shuli-side
+  (`SecurityType::Unsupported` in `scan.rs`, one `WifiClient` per
+  interface in `shulid`).
 * **M8** Packaging (G6): systemd unit + docs; daemon runs from the
-  unit with `CAP_NET_ADMIN`.
+  unit with `CAP_NET_ADMIN`.  **Not started (2026-08-09).**
 * **M9** nipart decision (G7): decision recorded; if (a), nipart
-  drives `shuli` in its wifi flow.
+  drives `shuli` in its wifi flow.  **Not started (2026-08-09)**;
+  §1/§3 imply option (a) embed.
 
 ## 5. Feature comparison: shuli vs iwd vs wpa_supplicant
 
@@ -399,13 +428,19 @@ Notes from the deep-dive:
 ## 7. Stage 2 exit criteria
 
 1. All G1 correctness fixes landed and covered by tests (unit +
-   hostapd `ieee80211w=2`).
+   hostapd `ieee80211w=2`).  **Met 2026-08-06 (M1).**
 2. WPA2-PSK has KAT unit tests and an integration test; SAE interop
    (HnP fallback, anti-clogging) demonstrated against hostapd.
+   **Met 2026-08-09 (M2, M3).**
 3. PMKSA caching works for reconnects on both WPA2-PSK and WPA3-SAE.
+   **Partially met (M4):** the SAE reconnect integration test is
+   green; a WPA2-PSK PMKSA-reconnect integration test is still open.
 4. Roaming works in a two-BSS test netns: FT transition and
-   BTM-directed roam both land (G8).
+   BTM-directed roam both land (G8).  **Met 2026-08-06 (M5).**
 5. WoWLAN triggers armed on suspend; wake path handled (G9).
+   **Open (M6):** wl-nl80211 set-side work in progress.
 6. Unsupported-AKM BSSes are skipped cleanly; multi-interface works.
+   **Open (M7).**
 7. systemd unit shipped; fmt/clippy/test + integration suite green.
-8. nipart decision (G7) recorded.
+   **Open (M8; suite is green at 2026-08-09).**
+8. nipart decision (G7) recorded.  **Open (M9).**

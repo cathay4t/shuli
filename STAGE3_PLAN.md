@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> Stage 3 extends shuli beyond WPA3-Personal. **No development plan yet** — this
-> document records goals, protocol names, and authentication workflows in
-> enough detail to produce a good plan after Stage 1 lands. Spec references are
-> to `~/Source/wifi_docs/` (`802.11-2020.pdf`, `802.11-2024.pdf`,
-> `wpa2.pdf`, `wpa3_v3.3.pdf`).
+> **Status: NOT STARTED (2026-08-09).** Stage 2 is incomplete (M6-M9
+> open; see `STAGE2_PLAN.md` §0 for the current state) and Stage 3 has
+> no plan yet - this document records goals, protocol names, and
+> authentication workflows in enough detail to produce a good plan
+> after Stage 2 lands. Spec references are to `~/Source/wifi_docs/`
+> (`802.11-2020.pdf`, `802.11-2024.pdf`, `wpa2.pdf`, `wpa3_v3.3.pdf`).
 >
 > **Design note (2026-08):** `shulid` provides no IPC interface for
 > live configuration; Stage 3 features land as engine work +
