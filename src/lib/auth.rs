@@ -19,6 +19,13 @@ pub(crate) enum AuthAction {
     Continue,
     /// Send this confirmation frame back to the AP.
     SendConfirm(Vec<u8>),
+    /// The AP demanded an anti-clogging token (status 76): re-send the
+    /// SAE commit with the carried token bytes.
+    SendCommitWithToken(Vec<u8>),
+    /// The H2E commit was rejected (e.g. by an HnP-only AP) and the
+    /// network allows it: restart the SAE exchange with
+    /// hunting-and-pecking.
+    RetryWithHnp,
     /// Authentication succeeded; proceed to association.
     Complete,
 }
@@ -36,9 +43,16 @@ impl AuthMethod {
         ssid: &str,
         sta_mac: [u8; ETH_ALEN],
         bssid: [u8; ETH_ALEN],
+        h2e: bool,
+        hnp_fallback: bool,
     ) -> Result<Self, WifiError> {
         Ok(AuthMethod::Sae(SaeAuth::new(
-            password, ssid, sta_mac, bssid,
+            password,
+            ssid,
+            sta_mac,
+            bssid,
+            h2e,
+            hnp_fallback,
         )?))
     }
 
@@ -46,6 +60,17 @@ impl AuthMethod {
     pub(crate) fn initial_frame(&mut self) -> Result<Vec<u8>, WifiError> {
         match self {
             AuthMethod::Sae(sae) => Ok(sae.build_init_auth_msg()),
+        }
+    }
+
+    /// Re-run the SAE commit with the AP's anti-clogging token appended
+    /// (status 76 retry).
+    pub(crate) fn commit_with_token(
+        &mut self,
+        token: &[u8],
+    ) -> Result<Vec<u8>, WifiError> {
+        match self {
+            AuthMethod::Sae(sae) => sae.build_commit_with_token(token),
         }
     }
 
@@ -92,12 +117,32 @@ fn process_sae_frame(
         return Ok(AuthAction::Continue);
     }
 
+    // G2a: anti-clogging token required (status 76): re-send the commit
+    // with the token, which sits after the group in the payload (in the
+    // Anti-Clogging Token Container element for H2E).
+    if auth_seq == 1 && status == crate::crypto::sae::SAE_STATUS_ANTI_CLOGGING {
+        let token = crate::crypto::sae::parse_anti_clogging_token(
+            sae.is_h2e(),
+            payload,
+        )?;
+        return Ok(AuthAction::SendCommitWithToken(token));
+    }
+
     const SAE_STATUS_H2E: u16 = 126;
     let status_ok = match auth_seq {
         1 => status == 0 || status == SAE_STATUS_H2E,
         _ => status == 0,
     };
     if !status_ok {
+        // G2b: an HnP-only AP rejects the H2E commit with a failure
+        // status; fall back to hunting-and-pecking when allowed.
+        if auth_seq == 1 && sae.is_h2e() && sae.hnp_fallback_allowed() {
+            log::info!(
+                "SAE H2E commit rejected (status {status}); retrying with \
+                 hunting-and-pecking"
+            );
+            return Ok(AuthAction::RetryWithHnp);
+        }
         return Err(WifiError::new(
             ErrorKind::AuthFailed,
             format!("SAE auth failed: seq={auth_seq} status={status}"),
@@ -152,6 +197,10 @@ impl WifiClient {
         self.pmksa_in_use = None;
         self.pending_ft_msg1 = None;
         self.ft_roam = None;
+        self.sae_commit_sent = false;
+        self.sae_sync = 0;
+        self.sae_commit_auth_data.clear();
+        self.sae_hnp_attempted = false;
 
         // G4: a cached PMKSA for the selected BSS replaces the full
         // authentication (SAE) with open-system auth + a PMKID-bearing
@@ -230,6 +279,8 @@ impl WifiClient {
             &self.network.ssid,
             self.mac,
             self.bss_info.bssid,
+            self.network.sae_pwe.starts_h2e(),
+            self.network.sae_pwe.allows_hnp_fallback(),
         )?);
 
         let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
@@ -239,11 +290,17 @@ impl WifiClient {
             .frequency(self.bss_info.freq_mhz)
             .auth_type(wl_nl80211::Nl80211AuthType::Sae)
             // NL80211_ATTR_AUTH_DATA: SAE commit (trans||status||body)
-            .auth_data(auth_data)
+            .auth_data(auth_data.clone())
             .build();
         crate::client::drain_request(
             self.conn_handle.authenticate(attrs).execute().await,
         )
-        .await
+        .await?;
+        // G2c: remember the commit so a lost frame is answered with a
+        // retransmission (SAE Sync) instead of a full rescan cycle.
+        self.sae_commit_sent = true;
+        self.sae_sync = 0;
+        self.sae_commit_auth_data = auth_data;
+        Ok(())
     }
 }

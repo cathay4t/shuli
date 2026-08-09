@@ -60,6 +60,13 @@ const RETRY_AUTH_SEC: u64 = 600;
 /// Max time to wait for the next authentication event (SAE frame, association
 /// result, 4-way handshake message) before giving up and retrying.
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
+/// G2c: while the SAE commit is in flight (before the AP's commit
+/// arrives) a lost frame is answered with a retransmission after this
+/// many seconds instead of the full `AUTH_EVENT_TIMEOUT_SECS` + rescan.
+const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 5;
+/// G2c: maximum SAE Sync counter (commit retransmissions), matching
+/// iwd's `SAE_SYNC_MAX` of 3.
+const SAE_SYNC_MAX: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WifiState {
@@ -153,6 +160,18 @@ pub struct WifiClient {
     /// `ROAM_COOLDOWN_SECS` afterwards so equal-signal BSSes do not
     /// ping-pong the client.
     pub(crate) last_roam: Option<std::time::Instant>,
+    /// G2c: SAE commit retransmission state. `sae_commit_sent` is true
+    /// while we await the AP's commit; on a timeout the same commit is
+    /// re-sent (the 802.11 SAE Sync counter, max 3) instead of paying a
+    /// full rescan cycle for one lost frame.
+    pub(crate) sae_commit_sent: bool,
+    /// SAE Sync counter: number of commit retransmissions so far.
+    pub(crate) sae_sync: u8,
+    /// The last SAE commit auth_data, re-sent verbatim on a timeout.
+    pub(crate) sae_commit_auth_data: Vec<u8>,
+    /// G2b: an H2E commit was rejected and the exchange restarted with
+    /// hunting-and-pecking (never retried a second time).
+    pub(crate) sae_hnp_attempted: bool,
 }
 
 impl WifiClient {
@@ -240,6 +259,10 @@ impl WifiClient {
             last_scan_candidates: Vec::new(),
             pending_ft_msg1: None,
             last_roam: None,
+            sae_commit_sent: false,
+            sae_sync: 0,
+            sae_commit_auth_data: Vec::new(),
+            sae_hnp_attempted: false,
         };
 
         // Receive WNM action frames (BTM Requests) for roaming.
@@ -375,28 +398,60 @@ impl WifiClient {
                 }
             }
             WifiState::Authenticating => {
-                let timed = tokio::time::timeout(
-                    std::time::Duration::from_secs(AUTH_EVENT_TIMEOUT_SECS),
-                    self.event_receiver.next(),
-                )
-                .await;
-                match timed {
-                    Ok(Some((raw_msg, _addr))) => {
-                        if let Some(event) =
-                            wl_nl80211::Nl80211Event::parse(raw_msg)
-                        {
-                            self.handle_event(event).await;
+                // Wait for the next authentication event. While the SAE
+                // commit is in flight a timeout means the frame was
+                // lost: re-send the same commit (SAE Sync counter, max 3)
+                // instead of failing over to a full rescan cycle.
+                loop {
+                    let wait_secs = if self.sae_commit_sent
+                        && self.sae_sync < SAE_SYNC_MAX
+                    {
+                        SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS
+                    } else {
+                        AUTH_EVENT_TIMEOUT_SECS
+                    };
+                    let timed = tokio::time::timeout(
+                        std::time::Duration::from_secs(wait_secs),
+                        self.event_receiver.next(),
+                    )
+                    .await;
+                    match timed {
+                        Ok(Some((raw_msg, _addr))) => {
+                            if let Some(event) =
+                                wl_nl80211::Nl80211Event::parse(raw_msg)
+                            {
+                                self.handle_event(event).await;
+                            }
+                            break;
                         }
-                    }
-                    Ok(None) => {
-                        return Err(WifiError::new(
-                            ErrorKind::Nl80211,
-                            "event channel closed",
-                        ));
-                    }
-                    Err(_) => {
-                        log::warn!("authentication timed out; will retry");
-                        self.state = WifiState::Failed;
+                        Ok(None) => {
+                            return Err(WifiError::new(
+                                ErrorKind::Nl80211,
+                                "event channel closed",
+                            ));
+                        }
+                        Err(_) => {
+                            if self.sae_commit_sent
+                                && self.sae_sync < SAE_SYNC_MAX
+                            {
+                                // G2c: retransmit the pending SAE commit.
+                                self.sae_sync += 1;
+                                log::info!(
+                                    "SAE commit timed out - retransmitting \
+                                     (sync {}/{})",
+                                    self.sae_sync,
+                                    SAE_SYNC_MAX
+                                );
+                                self.send_sae_commit(
+                                    &self.sae_commit_auth_data.clone(),
+                                )
+                                .await;
+                                continue;
+                            }
+                            log::warn!("authentication timed out; will retry");
+                            self.state = WifiState::Failed;
+                            break;
+                        }
                     }
                 }
             }
@@ -1040,7 +1095,34 @@ impl WifiClient {
                     self.state = WifiState::Failed;
                 } else {
                     log::info!("SAE confirm sent");
+                    // The commit exchange is done; only the confirm wait
+                    // remains, which is not retransmitted.
+                    self.sae_commit_sent = false;
                 }
+            }
+            AuthAction::SendCommitWithToken(token) => {
+                // G2a: the AP demanded an anti-clogging token - re-send
+                // the commit (fresh scalar/element) with the token.
+                let auth_data = match self.auth.as_mut() {
+                    Some(auth) => match auth.commit_with_token(&token) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::warn!("SAE token commit failed: {e}");
+                            self.state = WifiState::FailedAuthentication;
+                            return;
+                        }
+                    },
+                    None => {
+                        log::warn!("no SAE auth for token retry");
+                        return;
+                    }
+                };
+                self.send_sae_commit(&auth_data).await;
+            }
+            AuthAction::RetryWithHnp => {
+                // G2b: the AP rejected the H2E commit; restart the
+                // exchange with hunting-and-pecking.
+                self.restart_sae_with_hnp().await;
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
@@ -1067,6 +1149,69 @@ impl WifiClient {
                 }
             }
         }
+    }
+
+    /// Send an SAE commit auth_data via `NL80211_CMD_AUTHENTICATE` and
+    /// record it for G2c retransmission (SAE Sync). The commit being
+    /// (re)sent stays in flight until the AP's commit arrives.
+    async fn send_sae_commit(&mut self, auth_data: &[u8]) {
+        let attrs = Nl80211Authenticate::new(self.if_index)
+            .ssid(&self.network.ssid)
+            .mac(self.bss_info.bssid)
+            .frequency(self.bss_info.freq_mhz)
+            .auth_type(Nl80211AuthType::Sae)
+            .auth_data(auth_data.to_vec())
+            .build();
+        if let Err(e) =
+            drain_request(self.conn_handle.authenticate(attrs).execute().await)
+                .await
+        {
+            log::warn!("send SAE commit failed: {e}");
+            self.state = WifiState::Failed;
+            return;
+        }
+        self.sae_commit_sent = true;
+        self.sae_sync = 0;
+        self.sae_commit_auth_data = auth_data.to_vec();
+        log::info!("SAE commit sent");
+    }
+
+    /// G2b: the AP rejected the H2E commit (an HnP-only AP); restart the
+    /// SAE exchange with a hunting-and-pecking commit. Only attempted
+    /// once per connection attempt (`sae_hnp_attempted`).
+    async fn restart_sae_with_hnp(&mut self) {
+        let Some(password) = self.network.password.as_deref() else {
+            log::warn!("no password for HnP SAE restart");
+            self.state = WifiState::FailedAuthentication;
+            return;
+        };
+        let auth = match AuthMethod::new_sae(
+            password,
+            &self.network.ssid,
+            self.mac,
+            self.bss_info.bssid,
+            false, // h2e
+            false, // no further fallback
+        ) {
+            Ok(auth) => auth,
+            Err(e) => {
+                log::warn!("HnP SAE restart failed: {e}");
+                self.state = WifiState::FailedAuthentication;
+                return;
+            }
+        };
+        self.auth = Some(auth);
+        self.sae_hnp_attempted = true;
+        let auth_data = match self.auth.as_mut().unwrap().initial_frame() {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!("HnP SAE commit failed: {e}");
+                self.state = WifiState::FailedAuthentication;
+                return;
+            }
+        };
+        log::info!("SAE restarted with hunting-and-pecking");
+        self.send_sae_commit(&auth_data).await;
     }
 
     /// Handle an EAPOL-Key frame (4-way handshake / group rekey).

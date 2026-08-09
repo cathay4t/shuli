@@ -20,6 +20,31 @@ pub(crate) struct ShuliConfig {
     pub wifis: Vec<WifiEntry>,
 }
 
+/// SAE PWE derivation mode as configured in the YAML file. Kept as its
+/// own serde type (the `shuli` library does not depend on serde); maps
+/// onto `shuli::SaePwe`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SaePweConfig {
+    /// H2E first, hunting-and-pecking fallback when the AP rejects it.
+    #[default]
+    Auto,
+    /// Hash-to-element only.
+    H2e,
+    /// Hunting-and-pecking only (RFC 7664).
+    Hnp,
+}
+
+impl SaePweConfig {
+    fn to_lib(self) -> shuli::SaePwe {
+        match self {
+            SaePweConfig::Auto => shuli::SaePwe::Auto,
+            SaePweConfig::H2e => shuli::SaePwe::H2E,
+            SaePweConfig::Hnp => shuli::SaePwe::HnP,
+        }
+    }
+}
+
 /// A single WiFi network entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WifiEntry {
@@ -36,6 +61,10 @@ pub(crate) struct WifiEntry {
     /// `RoamThreshold`).
     #[serde(default = "default_roam_threshold")]
     pub roaming_threshold: i32,
+    /// SAE PWE derivation for WPA3-Personal networks: `auto` (default,
+    /// H2E with hunting-and-pecking fallback), `h2e`, or `hnp`.
+    #[serde(default)]
+    pub sae_pwe: SaePweConfig,
     /// Interface name to bind to.  `"any"` (or absent) picks the
     /// first available wifi interface.
     #[serde(default)]
@@ -102,6 +131,7 @@ impl ShuliConfig {
             }
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
+            network.sae_pwe = entry.sae_pwe.to_lib();
             config.networks.push(network);
         }
         config

@@ -296,7 +296,14 @@ multi-interface and packaging.
   full 4-way + encrypted data path against hostapd `wpa=2`,
   `wpa_key_mgmt=WPA-PSK` without PMF).
 * **M3** SAE interop (G2): connects to hostapd `sae_pwe=0/1` (HnP)
-  and survives an anti-clogging token exchange.
+  and survives an anti-clogging token exchange.  **Done 2026-08-09**
+  (G2a: status-76 token echo in the H2E Anti-Clogging Token Container
+  element, integration-tested with hostapd `anti_clogging_threshold=0`;
+  G2b: RFC 7664 hunting-and-pecking PWE for group 19 with per-network
+  `sae_pwe: auto|h2e|hnp` - default `auto` = H2E first, HnP fallback -
+  tested against hostapd `sae_pwe=0`, `sae_pwe=1` is H2E-only;
+  G2c: SAE commit retransmission with an 802.11 Sync counter of 3
+  instead of a full rescan cycle on a lost frame).
 * **M4** PMKSA caching (G4): reconnect to the same AP completes
   without a fresh SAE exchange (cache hit observable in logs/AP);
   driver offload path exercised when the wiphy supports it.

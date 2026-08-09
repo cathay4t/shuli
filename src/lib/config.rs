@@ -3,6 +3,37 @@
 /// Default roam threshold: matches iwd's `RoamThreshold` (-70 dBm).
 pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
 
+/// SAE PWE derivation mode for a WPA3-Personal network (Stage 2 G2b).
+///
+/// WPA3 APs derive the SAE password element either with hash-to-element
+/// (H2E, RFC 9380) or with hunting-and-pecking (HnP, RFC 7664); an
+/// H2E-only STA cannot connect to an HnP-only AP. `Auto` (the default)
+/// sends an H2E commit and falls back to HnP when the AP rejects it,
+/// which keeps existing H2E APs on the fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaePwe {
+    /// Hash-to-element only (the Stage-1 behaviour).
+    H2E,
+    /// Hunting-and-pecking only (RFC 7664), for HnP-only APs.
+    HnP,
+    /// Try hash-to-element first, fall back to hunting-and-pecking when
+    /// the H2E commit is rejected.
+    #[default]
+    Auto,
+}
+
+impl SaePwe {
+    /// Whether the initial commit should use hash-to-element.
+    pub(crate) fn starts_h2e(self) -> bool {
+        !matches!(self, SaePwe::HnP)
+    }
+
+    /// Whether a rejected H2E commit may fall back to hunting-and-pecking.
+    pub(crate) fn allows_hnp_fallback(self) -> bool {
+        matches!(self, SaePwe::Auto)
+    }
+}
+
 /// WiFi connection configuration for [`WifiClient`](crate::WifiClient).
 ///
 /// No serde — the daemon layer deserializes its own `ShuliConfig` and
@@ -37,6 +68,10 @@ pub struct NetworkConfig {
     /// candidates while connected to this SSID. Defaults to
     /// [`DEFAULT_ROAM_THRESHOLD_DBM`].
     pub roaming_threshold: i32,
+    /// SAE PWE derivation mode (WPA3-Personal only). Defaults to
+    /// [`SaePwe::Auto`]: hash-to-element first, hunting-and-pecking
+    /// fallback for HnP-only APs.
+    pub sae_pwe: SaePwe,
 }
 
 impl NetworkConfig {
@@ -46,6 +81,7 @@ impl NetworkConfig {
             password: None,
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
+            sae_pwe: SaePwe::Auto,
         }
     }
 

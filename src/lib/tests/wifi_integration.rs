@@ -164,6 +164,41 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// G2a: `anti_clogging_threshold=0` makes hostapd require an
+/// anti-clogging token for every SAE commit.
+const SAE_ANTI_CLOGGING_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+anti_clogging_threshold=0
+sae_password=12345678
+ctrl_interface=/var/run/hostapd
+";
+
+/// G2b: `sae_pwe=0` restricts hostapd to hunting-and-pecking commits,
+/// so an H2E commit is rejected with UNSPECIFIED_FAILURE.
+const SAE_HNP_ONLY_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=0
+sae_password=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 const WPA2_PSK_PMF_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
 driver=nl80211
@@ -331,6 +366,86 @@ async fn wifi_client_sae_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
+    client.shutdown().await;
+}
+
+/// G2a: anti-clogging token. `anti_clogging_threshold=0` makes hostapd
+/// demand a token on every SAE commit (`use_anti_clogging()` returns 1
+/// unconditionally), so a successful connection proves the client
+/// re-sends its commit with the echoed token.
+#[tokio::test]
+async fn wifi_client_sae_anti_clogging() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_anti_clogging: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_ANTI_CLOGGING_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// G2b: hunting-and-pecking fallback. `sae_pwe=0` makes hostapd accept
+/// only HnP commits (`sae_status_success()` rejects the H2E status 126
+/// with UNSPECIFIED_FAILURE). With the default `SaePwe::Auto` the client
+/// must detect the rejection, restart with HnP and connect; with an
+/// H2E-only network it must fail instead.
+#[tokio::test]
+async fn wifi_client_sae_hnp_fallback() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_hnp_fallback: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HNP_ONLY_HOSTAPD_CONF);
+
+    // Auto (default): H2E commit is rejected, the exchange restarts with
+    // hunting-and-pecking and the connection succeeds.
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert!(
+        client.sae_hnp_attempted,
+        "expected the H2E commit to be rejected and the exchange restarted \
+         with hunting-and-pecking"
+    );
+    client.shutdown().await;
+
+    // H2E-only: the same AP must defeat an H2E-only network.
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    config.networks[0].sae_pwe = crate::SaePwe::H2E;
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await;
+    assert!(
+        state.is_err(),
+        "H2E-only network must not connect to an HnP-only AP"
+    );
     client.shutdown().await;
 }
 
