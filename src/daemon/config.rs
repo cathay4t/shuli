@@ -119,12 +119,15 @@ impl ShuliConfig {
         Ok(config)
     }
 
-    /// Convert all configured networks into the lib's `WifiConfig`, so
-    /// one scan schedule probes for every SSID. Each entry keeps its
-    /// own roaming policy.
-    pub(crate) fn to_wifi_config(&self, iface_name: &str) -> shuli::WifiConfig {
+    /// Convert `entries` - the configured networks bound to
+    /// `iface_name` (M7: one interface can carry several SSIDs) - into
+    /// the lib's `WifiConfig`. Each entry keeps its own roaming policy.
+    pub(crate) fn wifi_config_for_entries(
+        iface_name: &str,
+        entries: &[WifiEntry],
+    ) -> shuli::WifiConfig {
         let mut config = shuli::WifiConfig::new(iface_name);
-        for entry in &self.wifis {
+        for entry in entries {
             let mut network = shuli::NetworkConfig::new(&entry.ssid);
             if let Some(password) = entry.password.as_deref() {
                 network.set_password(password);
@@ -169,7 +172,7 @@ wifis:
         assert!(entry.roaming);
         assert_eq!(entry.roaming_threshold, -70);
 
-        let wifi = config.to_wifi_config("wlan0");
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         let network = &wifi.networks[0];
         assert!(network.roaming);
         assert_eq!(network.roaming_threshold, -70);
@@ -186,7 +189,7 @@ wifis:
     roaming: false
 ",
         );
-        let wifi = config.to_wifi_config("wlan0");
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(!wifi.networks[0].roaming);
     }
 
@@ -201,7 +204,7 @@ wifis:
     roaming_threshold: -80
 ",
         );
-        let wifi = config.to_wifi_config("wlan0");
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         let network = &wifi.networks[0];
         assert!(network.roaming);
         assert_eq!(network.roaming_threshold, -80);

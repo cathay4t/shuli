@@ -13,8 +13,8 @@ use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{
     Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
     Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
-    Nl80211Event, Nl80211EventCode, Nl80211Handle, Nl80211Key,
-    Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
+    Nl80211Event, Nl80211EventCode, Nl80211EventReason, Nl80211Handle,
+    Nl80211Key, Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
     Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
     Nl80211SchedScanPlanAttr, Nl80211UseMfp,
 };
@@ -951,10 +951,43 @@ impl WifiClient {
                 // continues; acting on it would tear the roam down.
                 if self.ft_roam.is_some() {
                     log::debug!("DISCONNECT during FT roam ignored (expected)");
-                } else {
+                } else if matches!(
+                    self.state,
+                    WifiState::ConnectedWithoutOffloadRekey
+                        | WifiState::ConnectedWithOffloadRekey
+                ) {
+                    // cfg80211-style drivers (e.g. brcmfmac) report the
+                    // AP-initiated disconnect through CMD_DISCONNECT
+                    // with the same IEEE 802.11 reason code; classify
+                    // it like the deauth/disassoc events (M7).
                     log::warn!("DISCONNECT: reason={reason}");
-                    self.state = WifiState::Failed;
+                    self.state = if is_fatal_disconnect_reason(Some(reason)) {
+                        WifiState::FailedAuthentication
+                    } else {
+                        WifiState::Failed
+                    };
+                } else {
+                    // The kernel can trail a CMD_DISCONNECT behind the
+                    // deauth/disassoc event (or a previous disconnect)
+                    // by seconds; acting on a stale one would tear down
+                    // the reconnection already in flight - and would
+                    // downgrade a fatal backoff back to a short one.
+                    log::debug!(
+                        "stale DISCONNECT (reason={reason}) in state {:?}; \
+                         ignored",
+                        self.state
+                    );
                 }
+            }
+
+            // M7 (G5): AP-initiated deauth/disassoc with the IEEE 802.11
+            // reason code parsed out of the management frame by
+            // wl-nl80211. The reason tells a fatal credential problem
+            // (retry with the long authentication backoff) apart from a
+            // transient disconnect (short backoff).
+            Nl80211Event::Deauthenticated { reason }
+            | Nl80211Event::Disassociated { reason } => {
+                self.handle_ap_disconnect(Some(reason)).await;
             }
 
             Nl80211Event::ScanStart | Nl80211Event::NewScanResults => {
@@ -975,57 +1008,22 @@ impl WifiClient {
                     cmd,
                     Nl80211Command::Deauthenticate
                         | Nl80211Command::Disassociate
-                        | Nl80211Command::UnprotDeauthenticate
+                ) {
+                    // Fallback: the kernel did not deliver a parseable
+                    // management frame, so no reason code is available.
+                    // Treat it like any transient AP disconnect.
+                    self.handle_ap_disconnect(None).await;
+                } else if matches!(
+                    cmd,
+                    Nl80211Command::UnprotDeauthenticate
                         | Nl80211Command::UnprotDisassociate
                         | Nl80211Command::DelStation
                 ) {
-                    // AP-initiated disconnect: mac80211 reports the
-                    // deauth/disassoc (and the station-entry removal)
-                    // rather than CMD_DISCONNECT when userspace drives
-                    // the MLME. The PMKSA cache is kept: if the AP
-                    // still holds the PMKSA the next reconnect skips the
-                    // full authentication; otherwise the association is
-                    // rejected and the fallback kicks in.
-                    //
-                    // Only act while connected: the kernel delivers the
-                    // same disconnect as several events with a long
-                    // delay between them, and acting on a stale one
-                    // would tear down the reconnection already in
-                    // flight (wpa_supplicant drops stale events the
-                    // same way). During an FT roam these events are the
-                    // expected consequence of CMD_AUTHENTICATE
-                    // disconnecting the old AP - let the roam continue.
-                    if self.ft_roam.is_some() {
-                        log::debug!(
-                            "{cmd:?} during FT roam ignored (expected)"
-                        );
-                    } else if matches!(
-                        self.state,
-                        WifiState::ConnectedWithoutOffloadRekey
-                            | WifiState::ConnectedWithOffloadRekey
-                    ) {
-                        log::warn!("{cmd:?} from the AP; retrying");
-                        // For a socket-owned connection the kernel keeps
-                        // its connection state (wdev->connected) until
-                        // userspace cleans up, and rejects the next
-                        // ASSOCIATE with -EALREADY otherwise.
-                        // wpa_supplicant sends CMD_DEAUTHENTICATE here;
-                        // CMD_DISCONNECT clears the same state.
-                        if let Err(e) = connect::disconnect(
-                            &mut self.conn_handle,
-                            self.if_index,
-                        )
-                        .await
-                        {
-                            log::debug!("disconnect cleanup failed: {e}");
-                        }
-                        self.state = WifiState::Failed;
-                    } else {
-                        log::debug!(
-                            "stale {cmd:?} event in state {:?}; ignored",
-                            self.state
-                        );
-                    }
+                    // AP-initiated disconnect without a reason: mac80211
+                    // reports the un-protected deauth/disassoc (and the
+                    // station-entry removal) rather than CMD_DISCONNECT
+                    // when userspace drives the MLME.
+                    self.handle_ap_disconnect(None).await;
                 } else {
                     log::debug!("event: {cmd:?}");
                 }
@@ -1038,9 +1036,85 @@ impl WifiClient {
         }
     }
 
+    /// An AP-initiated disconnect (deauth/disassoc, protected or not)
+    /// while connected: clean up the kernel connection state and
+    /// schedule a reconnect.
+    ///
+    /// Reason codes 2 (`PrevAuthNotValid`) and 23 (`Ieee8021xFailed`)
+    /// mean the AP no longer accepts the current credentials/PMKSA -
+    /// retrying soon is futile, so the client backs off for the long
+    /// authentication-retry interval (`FailedAuthentication`). Every
+    /// other reason is transient (`Failed`, short backoff). `None`
+    /// means no reason was available (missing frame); treat it as
+    /// transient.
+    async fn handle_ap_disconnect(
+        &mut self,
+        reason: Option<Nl80211EventReason>,
+    ) {
+        // Only act while connected: the kernel delivers the same
+        // disconnect as several events with a long delay between them,
+        // and acting on a stale one would tear down the reconnection
+        // already in flight (wpa_supplicant drops stale events the same
+        // way). During an FT roam these events are the expected
+        // consequence of CMD_AUTHENTICATE disconnecting the old AP -
+        // let the roam continue.
+        if self.ft_roam.is_some() {
+            log::debug!("AP disconnect during FT roam ignored (expected)");
+        } else if matches!(
+            self.state,
+            WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        ) {
+            let fatal = is_fatal_disconnect_reason(reason);
+            log::warn!(
+                "AP disconnect (reason={reason:?}); retrying{}",
+                if fatal {
+                    " with long authentication backoff"
+                } else {
+                    ""
+                }
+            );
+            // For a socket-owned connection the kernel keeps its
+            // connection state (wdev->connected) until userspace cleans
+            // up, and rejects the next ASSOCIATE with -EALREADY
+            // otherwise. wpa_supplicant sends CMD_DEAUTHENTICATE here;
+            // CMD_DISCONNECT clears the same state.
+            if let Err(e) =
+                connect::disconnect(&mut self.conn_handle, self.if_index).await
+            {
+                log::debug!("disconnect cleanup failed: {e}");
+            }
+            self.state = if fatal {
+                WifiState::FailedAuthentication
+            } else {
+                WifiState::Failed
+            };
+        } else {
+            log::debug!(
+                "stale AP disconnect (reason={reason:?}) in state {:?}; \
+                 ignored",
+                self.state
+            );
+        }
+    }
+
     /// Feed an 802.11 management frame (or the auth frame embedded in an
     /// AUTHENTICATE event) into the active auth method.
     async fn handle_auth_frame(&mut self, frame: &[u8]) {
+        // Only frames from the AP we are authenticating with belong to
+        // this exchange. On a shared medium (and in the wild: two STAs
+        // of neighbouring APs hear each other) the SAE frames of a
+        // parallel exchange would otherwise corrupt ours - e.g. the
+        // peer's confirm fails its own send-confirm check and the
+        // handshake aborts. wpa_supplicant filters the same way.
+        if frame.len() >= 16 && frame[10..16] != self.bss_info.bssid {
+            log::debug!(
+                "ignoring auth frame from {:02x?} (expecting {:02x?})",
+                &frame[10..16],
+                self.bss_info.bssid
+            );
+            return;
+        }
         let Some((auth_seq, status_code, payload)) =
             auth::parse_sae_auth_frame(frame)
         else {
@@ -1716,6 +1790,18 @@ impl Drop for WifiClient {
     }
 }
 
+/// Whether an AP-initiated disconnect reason means a fatal
+/// credential/PMKSA problem (retry with the long authentication
+/// backoff) instead of a transient failure (short backoff). `None`
+/// (no reason was available) is transient.
+fn is_fatal_disconnect_reason(reason: Option<Nl80211EventReason>) -> bool {
+    matches!(
+        reason,
+        Some(Nl80211EventReason::PrevAuthNotValid)
+            | Some(Nl80211EventReason::Ieee8021xFailed)
+    )
+}
+
 async fn send_ctrl_port_frame(
     conn_handle: &mut Nl80211ConnectionHandle,
     if_index: u32,
@@ -1774,7 +1860,7 @@ impl WifiClient {
             SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid(pmkid),
             SecurityType::FtPsk => elements::ft_psk_ie(pmkid),
             SecurityType::Owe => elements::owe_ie(),
-            SecurityType::Open => Vec::new(),
+            SecurityType::Open | SecurityType::Unsupported => Vec::new(),
         }
     }
 
@@ -2014,4 +2100,43 @@ async fn wiphy_supports_sched_scan(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use wl_nl80211::Nl80211EventReason;
+
+    use super::is_fatal_disconnect_reason;
+
+    /// M7 (G5): reasons 2 (PREV_AUTH_NOT_VALID) and 23
+    /// (IEEE_802_1X_AUTH_FAILED) mean a fatal credential/PMKSA problem
+    /// and must use the long authentication backoff; every other
+    /// reason (and a missing one) is transient.
+    #[test]
+    fn fatal_disconnect_reasons_are_2_and_23() {
+        assert!(is_fatal_disconnect_reason(Some(
+            Nl80211EventReason::PrevAuthNotValid
+        )));
+        assert!(is_fatal_disconnect_reason(Some(
+            Nl80211EventReason::Ieee8021xFailed
+        )));
+    }
+
+    #[test]
+    fn transient_disconnect_reasons() {
+        for reason in [
+            Nl80211EventReason::Unspecified,
+            Nl80211EventReason::DeauthLeaving,
+            Nl80211EventReason::DisassocDueToInactivity,
+            Nl80211EventReason::MicFailure,
+            Nl80211EventReason::GroupKeyHandshakeTimeout,
+        ] {
+            assert!(
+                !is_fatal_disconnect_reason(Some(reason)),
+                "{reason:?} must be transient"
+            );
+        }
+        // A disconnect without a parseable reason is transient.
+        assert!(!is_fatal_disconnect_reason(None));
+    }
 }

@@ -38,6 +38,10 @@ pub enum SecurityType {
     FtPsk,
     /// RSNE with AKM 00-0F-AC:9 — FT over WPA3-SAE (802.11r).
     FtSae,
+    /// Encrypted with a security mode shuli does not support (e.g.
+    /// WPA-Enterprise / 802.1X, PSK-SHA256, WPA1/TKIP). Never connect
+    /// to such a BSS: it must not be treated as open.
+    Unsupported,
 }
 
 impl SecurityType {
@@ -307,6 +311,17 @@ impl WifiClient {
                  freq={freq_mhz} MHz, signal={signal_dbm}"
             );
             let bss_security = detect_security(ies);
+            // M7 (G5): never present an AP shuli cannot actually join
+            // (WPA-Enterprise, PSK-SHA256, WPA1/TKIP, ...) as a
+            // connection candidate - classifying it open would make the
+            // client associate without encryption.
+            if bss_security.security == SecurityType::Unsupported {
+                log::info!(
+                    "BSS {bssid:02x?} (ssid={bss_ssid}) has no supported \
+                     security mode; skipping"
+                );
+                continue;
+            }
             candidates.push((
                 BssInfo {
                     bssid,
@@ -329,28 +344,41 @@ impl WifiClient {
 const IE_ID_RSN: u8 = 48;
 const IE_ID_RSNXE: u8 = 244;
 const IE_ID_MDIE: u8 = 54;
+const IE_ID_VENDOR: u8 = 0xDD;
 const AKM_PSK: u8 = 2;
 const AKM_FT_PSK: u8 = 4;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
 const AKM_FT_SAE: u8 = 9;
+/// WPA vendor IE OUI (Microsoft): 00:50:F2, type 1 = WPA (WPA1/TKIP).
+const WPA_IE_OUI: [u8; 3] = [0x00, 0x50, 0xF2];
+const WPA_IE_TYPE: u8 = 1;
+/// Cipher suite 00:50:F2:2 = TKIP (WPA1 default; rejected by shuli).
+const CIPHER_TKIP: u8 = 2;
 
 /// Security facts about a BSS collected from its scan IEs.
-struct BssScanSecurity {
-    security: SecurityType,
-    ap_rsne: Vec<u8>,
-    ap_rsnxe: Vec<u8>,
-    mdie: Option<MdieInfo>,
+pub(crate) struct BssScanSecurity {
+    pub(crate) security: SecurityType,
+    pub(crate) ap_rsne: Vec<u8>,
+    pub(crate) ap_rsnxe: Vec<u8>,
+    pub(crate) mdie: Option<MdieInfo>,
 }
 
 /// Walk an 802.11 IE buffer and determine the security type from the
 /// RSNE's AKM suites. Also collects the raw RSNE / RSNXE elements (ID +
 /// length + body) for the 4-way handshake Message 3 downgrade check and
 /// the Mobility Domain element for FT; all are empty/None when absent.
-fn detect_security(ies: &[u8]) -> BssScanSecurity {
+///
+/// A BSS is `Unsupported` when it is encrypted in a way shuli cannot
+/// join - an RSNE whose AKMs are all unknown (WPA-Enterprise / 802.1X,
+/// PSK-SHA256, ...), an RSNE with a TKIP group cipher, or a WPA1 AP
+/// (vendor WPA IE, no RSNE). Such a BSS must never fall through to
+/// `Open`, which would make the client associate without encryption.
+pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let mut rsne = Vec::new();
     let mut rsnxe = Vec::new();
     let mut mdie = None;
+    let mut wpa_ie = false;
     let mut pos = 0;
     while pos + 2 <= ies.len() {
         let id = ies[pos];
@@ -371,12 +399,22 @@ fn detect_security(ies: &[u8]) -> BssScanSecurity {
                 )
                 .map(|(mdid, ft_capab)| MdieInfo { mdid, ft_capab });
             }
+            IE_ID_VENDOR if !wpa_ie => {
+                // Vendor-specific: WPA (OUI 00:50:F2, type 1) marks a
+                // WPA1/TKIP AP - encrypted, but not joinable by shuli.
+                let body = &ies[pos + 2..pos + 2 + len];
+                wpa_ie = body.len() >= 4
+                    && body[..3] == WPA_IE_OUI
+                    && body[3] == WPA_IE_TYPE;
+            }
             _ => {}
         }
         pos += 2 + len;
     }
     let security = if rsne.len() > 2 {
         security_from_rsne(&rsne[2..])
+    } else if wpa_ie {
+        SecurityType::Unsupported
     } else {
         SecurityType::Open
     };
@@ -397,23 +435,40 @@ fn akm_rank(security: SecurityType) -> u8 {
         SecurityType::Sae => 3,
         SecurityType::Owe => 2,
         SecurityType::Wpa2Psk => 1,
-        SecurityType::Open => 0,
+        SecurityType::Open | SecurityType::Unsupported => 0,
     }
 }
 
 /// Parse the RSNE body (after element ID + length) and check AKM suites.
 /// RSNE layout: version(2) | group(4) | pcount(2) | pciphers(4*n) |
 ///              acount(2) | akms(4*m) | ...
+///
+/// The caller only passes a body from an actual RSNE element, so a
+/// result of `Open` would mean "no usable security information": every
+/// parse failure and every all-unsupported AKM list maps to
+/// `Unsupported` instead (an encrypted AP shuli cannot join must not be
+/// treated as open).
 fn security_from_rsne(body: &[u8]) -> SecurityType {
     // Minimum: version(2) + group(4) + pcount(2) = 8 bytes before
     // pairwise ciphers.
     if body.len() < 8 {
-        return SecurityType::Open;
+        return SecurityType::Unsupported;
+    }
+    // TKIP as the group cipher means a WPA1/WPA2 hybrid or TKIP-only
+    // AP - shuli does not implement TKIP and must not connect. The
+    // group cipher suite (RSN OUI 00-0F-AC) sits at body[2..6].
+    if body.len() >= 6
+        && body[2] == 0x00
+        && body[3] == 0x0F
+        && body[4] == 0xAC
+        && body[5] == CIPHER_TKIP
+    {
+        return SecurityType::Unsupported;
     }
     let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
     let akm_offset = 8 + pcount * 4;
     if body.len() < akm_offset + 2 {
-        return SecurityType::Open;
+        return SecurityType::Unsupported;
     }
     let acount =
         u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
@@ -431,7 +486,7 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
                 AKM_SAE => SecurityType::Sae,
                 AKM_OWE => SecurityType::Owe,
                 AKM_PSK => SecurityType::Wpa2Psk,
-                _ => SecurityType::Open,
+                _ => SecurityType::Unsupported,
             };
             if akm_rank(candidate) > akm_rank(best) {
                 best = candidate;
@@ -439,7 +494,13 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
         }
         off += 4;
     }
-    best
+    // No supported AKM suite among the advertised ones: an encrypted
+    // AP shuli cannot join.
+    if best == SecurityType::Open {
+        SecurityType::Unsupported
+    } else {
+        best
+    }
 }
 
 /// Standalone scan: create a nl80211 handle, trigger a scan on the

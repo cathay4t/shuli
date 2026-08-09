@@ -182,7 +182,7 @@ def _read_log():
 
 
 def ping_ap():
-    rc, _, _ = exec_cmd(f"ping {AP_IP} -c 1 -w 2".split(), check=False)
+    rc, _, _ = exec_cmd(f"ping -I {TEST_NIC} {AP_IP} -c 1 -w 2".split(), check=False)
     return rc == 0
 
 

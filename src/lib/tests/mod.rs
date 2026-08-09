@@ -8,5 +8,6 @@ mod crypto_sae;
 mod ieee80211_auth;
 mod ieee80211_eapol;
 mod pmksa;
+mod scan;
 mod wifi_integration;
 mod wnm;

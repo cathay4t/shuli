@@ -101,22 +101,8 @@ async fn apply_dhcpv4_lease(
     if let Some(ref gateways) = lease.gateways
         && let Some(gw) = gateways.first()
     {
-        let route_msg =
-            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
-                .destination_prefix(std::net::Ipv4Addr::UNSPECIFIED, 0)
-                .gateway(*gw)
-                .output_interface(if_index)
-                .build();
-        if let Err(e) = handle.route().add(route_msg).execute().await {
-            // EEXIST is fine (route may already exist).
-            if !e.to_string().contains("File exists") {
-                return Err(WifiError::new(
-                    ErrorKind::Nl80211,
-                    format!("DHCP route add via {gw}: {e}"),
-                ));
-            }
-        }
-        log::info!("Applied DHCP default route via {gw}");
+        crate::ip::add_default_route(&handle, if_index, IpAddr::V4(*gw))
+            .await?;
     }
 
     Ok(())

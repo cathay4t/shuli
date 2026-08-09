@@ -47,8 +47,8 @@ as Stage 2 work):
 | M3 SAE interop (G2) | **Done 2026-08-09** (`5aae947`) |
 | M4 PMKSA caching (G4) | **Done 2026-08-06** (`60e7404`) |
 | M5 Roaming (G8) | **Done 2026-08-06** (`afb4278`; follow-ups `40fba35`, `eea56d1`) |
-| M6 Suspend / WoWLAN (G9) | **In progress.** The `wl-nl80211` set-side WoWLAN work (triggers attr, wake-report attr/event, `set_wowlan` builder) is applied in `/home/fge/Source/netlink/wl-nl80211` but **uncommitted and not yet compiling** (2 `attr.rs` match-arm errors; fix + tests + M7 reason events are itemized in `wl-nl80211_change_plan.md`). The shuli side (`arm_wowlan()`, wake handling) is not started. |
-| M7 Robustness (G5) | **Not started.** Reason-aware retry needs `wl-nl80211` `Deauthenticated`/`Disassociated { reason }` events (in `wl-nl80211_change_plan.md`); unsupported-AKM skip and daemon multi-interface are shuli-side. |
+| M6 Suspend / WoWLAN (G9) | **In progress.** The `wl-nl80211` set-side work (SET_WOWLAN triggers builder, wake notification via `NL80211_ATTR_WOWLAN_TRIGGERS`, deauth/disassoc reason events) is committed in the `cathay4t/wl-nl80211` fork (`8bfd419`, not yet upstream; shuli consumes it via a `[patch]` to the local checkout). The shuli side (`arm_wowlan()`, wake handling) is not started. |
+| M7 Robustness (G5) | **Done 2026-08-09.** Unsupported-AKM BSSes (`SecurityType::Unsupported`: 802.1X, PSK-SHA256, TKIP, WPA1) are skipped with a clear log (unit tests); the daemon runs one `WifiClient` per configured interface (unit tests + 2-radio-pair integration test); deauth/disassoc events carry the IEEE 802.11 reason (reason 2/23 -> long auth backoff, others -> short). Also fixed: SAE auth frames from a foreign peer are filtered by BSSID (two STAs on one hwsim air no longer corrupt each other's SAE exchange). |
 | M8 Packaging (G6) | **Not started** (systemd unit, `/etc/shuli/` layout, docs). |
 | M9 nipart decision (G7) | **Not started.** §1/§3 imply option (a) embed the `shuli` crate; to be recorded here when decided. |
 
@@ -346,11 +346,22 @@ multi-interface and packaging.
   `wl-nl80211_change_plan.md`.
 * **M7** Robustness (G5): unsupported-AKM BSS skipped (unit test),
   two interfaces connected concurrently (integration), reason-code
-  aware retry.  **Not started (2026-08-09).**  Reason parsing needs
+  aware retry.  **Done 2026-08-09.**  `SecurityType::Unsupported`
+  (802.1X, PSK-SHA256, TKIP group cipher, WPA1 IE) never falls through
+  to `Open`; such BSSes are skipped in `scan.rs` with a clear log (7
+  unit tests).  `shulid` groups `wifis` entries by resolved interface
+  (`interface: any` / absent -> first WiFi NIC) and runs one
+  `WifiClient` per interface concurrently (`group_by_interface` unit
+  tests + a 4-radio `multi_interface_test.py`: two STAs connect to two
+  APs at once, both static IPs applied, both data paths ping).  The
   `wl-nl80211` `Deauthenticated`/`Disassociated { reason }` events
-  (see `wl-nl80211_change_plan.md`); the rest is shuli-side
-  (`SecurityType::Unsupported` in `scan.rs`, one `WifiClient` per
-  interface in `shulid`).
+  (reason parsed from the 802.11 frame, `8bfd419`) drive reason-aware
+  retry: reasons 2 (`PrevAuthNotValid`) and 23 (`Ieee8021xFailed`)
+  -> `FailedAuthentication` (10-minute backoff), all other reasons and
+  unprotected/missing-frame disconnects -> `Failed` (short backoff).
+  The hwsim 4-radio run also exposed and fixed a real bug: SAE auth
+  frames are now filtered by the peer BSSID, so a second STA on the
+  same medium cannot corrupt an in-flight SAE exchange.
 * **M8** Packaging (G6): systemd unit + docs; daemon runs from the
   unit with `CAP_NET_ADMIN`.  **Not started (2026-08-09).**
 * **M9** nipart decision (G7): decision recorded; if (a), nipart
@@ -440,7 +451,7 @@ Notes from the deep-dive:
 5. WoWLAN triggers armed on suspend; wake path handled (G9).
    **Open (M6):** wl-nl80211 set-side work in progress.
 6. Unsupported-AKM BSSes are skipped cleanly; multi-interface works.
-   **Open (M7).**
+   **Met 2026-08-09 (M7).**
 7. systemd unit shipped; fmt/clippy/test + integration suite green.
    **Open (M8; suite is green at 2026-08-09).**
 8. nipart decision (G7) recorded.  **Open (M9).**
