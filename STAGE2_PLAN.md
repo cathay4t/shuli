@@ -290,7 +290,11 @@ multi-interface and packaging.
   test; msg3 RSNE/RSNXE downgrade checks; Request-bit drop; PTK rekey
   coverage; optional PMF on WPA2-PSK).
 * **M2** WPA2-PSK test closure (G3): PBKDF2/PRF-384/HMAC-SHA1 KATs
-  plus a WPA2-PSK integration test, all green.
+  plus a WPA2-PSK integration test, all green.  **Done 2026-08-09**
+  (published-vector PBKDF2 PMK, PRF-384 PTK and HMAC-SHA1-128 MIC KATs
+  in `tests/crypto_kdf.rs`; `wifi_client_wpa2_psk_connect` covers the
+  full 4-way + encrypted data path against hostapd `wpa=2`,
+  `wpa_key_mgmt=WPA-PSK` without PMF).
 * **M3** SAE interop (G2): connects to hostapd `sae_pwe=0/1` (HnP)
   and survives an anti-clogging token exchange.
 * **M4** PMKSA caching (G4): reconnect to the same AP completes

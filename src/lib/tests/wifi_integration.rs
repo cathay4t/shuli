@@ -178,6 +178,22 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Plain WPA2-PSK (no PMF) - the M2/G3 "full 4-way + data path" case.
+/// `ieee80211w` defaults to 0 here, so the handshake is the classic
+/// WPA2-PSK 4-way (PRF-384 PTK + HMAC-SHA1 MIC, no IGTK KDE).
+const WPA2_PSK_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PSK
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 /// Run `hostapd_cli` against the test AP inside the test netns.
 fn hostapd_cli(args: &str) {
     hostapd_cli_if(AP_NIC, args);
@@ -472,6 +488,69 @@ async fn wifi_client_wpa2_psk_pmf_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
+    client.shutdown().await;
+}
+
+/// M2/G3: WPA2-PSK (AKM 00-0F-AC:2) full 4-way handshake against hostapd
+/// without PMF - the classic WPA2 setup. Mirrors the SAE connect test and
+/// additionally pushes traffic over the encrypted data path: with the STA
+/// and AP on the same 192.0.2.0/24, an ICMP echo must round-trip through
+/// the installed PTK/GTK.
+#[tokio::test]
+async fn wifi_client_wpa2_psk_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa2_psk_connect: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+
+    // Data path: give the STA an address on the AP's subnet and ping the
+    // AP through the encrypted link. The first ping after association can
+    // lose a packet to ARP/first-encryption latency, so retry a few times.
+    // `-I test-wlan0` pins the source interface: the test net 192.0.2.0/24
+    // may also exist on the host's own NICs (RFC 5737), which would make a
+    // plain ping route its ARP out the wrong device.
+    sh_ok("ip addr add 192.0.2.100/24 dev test-wlan0");
+    let mut ponged = false;
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("ping -I test-wlan0 -c 1 -W 1 192.0.2.1")
+            .output()
+            .expect("spawn ping");
+        if out.status.success() {
+            ponged = true;
+            break;
+        }
+        last_err = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sh_allow_fail("ip addr del 192.0.2.100/24 dev test-wlan0");
+    assert!(
+        ponged,
+        "ICMP echo through the WPA2-PSK data path never succeeded:\n{last_err}"
+    );
     client.shutdown().await;
 }
 
