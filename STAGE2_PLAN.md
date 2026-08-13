@@ -45,7 +45,7 @@ as Stage 2 work):
 | M1 PMF & handshake correctness (G1) | **Done 2026-08-06** (`959ce70`) |
 | M2 WPA2-PSK test closure (G3) | **Done 2026-08-09** (`e63bee0`) |
 | M3 SAE interop (G2) | **Done 2026-08-09** (`5aae947`) |
-| M4 PMKSA caching (G4) | **Done 2026-08-06** (`60e7404`) |
+| M4 PMKSA caching (G4) | **Done 2026-08-06** (`60e7404`); WPA2-PSK PMKSA-reconnect integration test added **2026-08-13** (closes exit criterion 3). |
 | M5 Roaming (G8) | **Done 2026-08-06** (`afb4278`; follow-ups `40fba35`, `eea56d1`) |
 | M6 Suspend / WoWLAN (G9) | **Done 2026-08-13.** The `wl-nl80211` set-side work (SET_WOWLAN triggers builder, wake notification via `NL80211_ATTR_WOWLAN_TRIGGERS`, deauth/disassoc reason events) is committed (`61a51b8`). The shuli side adds `WifiClient::arm_wowlan()` / `disarm_wowlan()` with wiphy trigger-support detection, and per-network `wowlan: true` config (default off, like wpa_supplicant's `wowlan_triggers`) arms the supported Disconnect / GtkRekeyFailure triggers while connected, leaving them set for the kernel to use on suspend (wpa_supplicant model - no logind/zbus needed). `WowlanWakeup` handling: GTK-rekey-failure / disconnect wakes tear down the connection for a clean reconnect, other wakes only clear the triggers. Unit tests cover trigger filtering + wake classification and config default/mapping; a hwsim integration test proves the graceful unsupported path. |
 | M7 Robustness (G5) | **Done 2026-08-09.** Unsupported-AKM BSSes (`SecurityType::Unsupported`: 802.1X, PSK-SHA256, TKIP, WPA1) are skipped with a clear log (unit tests); the daemon runs one `WifiClient` per configured interface (unit tests + 2-radio-pair integration test); deauth/disassoc events carry the IEEE 802.11 reason (reason 2/23 -> long auth backoff, others -> short). Also fixed: SAE auth frames from a foreign peer are filtered by BSSID (two STAs on one hwsim air no longer corrupt each other's SAE exchange). |
@@ -323,7 +323,10 @@ multi-interface and packaging.
   driver offload path exercised when the wiphy supports it.
   **Done 2026-08-06** (userspace cache keyed by (SSID, BSSID), 43200 s
   lifetime, cached PMKID in (Re)Assoc RSNE with fallback; SET_PMKSA /
-  DEL_PMKSA best-effort - mac80211 answers EOPNOTSUPP).
+  DEL_PMKSA best-effort - mac80211 answers EOPNOTSUPP; WPA2-PSK
+  PMKSA-reconnect integration test added 2026-08-13 - the reconnect
+  skips PBKDF2 (`psk_pmk` stays `None`), proving the cached PMK is
+  used).
 * **M5** Roaming (G8): in a two-BSS test netns, an FT-PSK or FT-SAE
   over-the-Air transition and a BTM-directed roam both complete;
   PMKSA/OKC-assisted reassociation verified before full-auth
@@ -444,8 +447,8 @@ Notes from the deep-dive:
    (HnP fallback, anti-clogging) demonstrated against hostapd.
    **Met 2026-08-09 (M2, M3).**
 3. PMKSA caching works for reconnects on both WPA2-PSK and WPA3-SAE.
-   **Partially met (M4):** the SAE reconnect integration test is
-   green; a WPA2-PSK PMKSA-reconnect integration test is still open.
+   **Met 2026-08-13 (M4):** both the SAE and WPA2-PSK reconnect
+   integration tests are green.
 4. Roaming works in a two-BSS test netns: FT transition and
    BTM-directed roam both land (G8).  **Met 2026-08-06 (M5).**
 5. WoWLAN triggers armed while connected when enabled (`wowlan: true`);

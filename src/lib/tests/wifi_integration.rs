@@ -777,6 +777,78 @@ async fn wifi_client_sae_pmksa_reconnect() {
     client.shutdown().await;
 }
 
+/// G4 exit criterion 3: after the first WPA2-PSK connection the PMKSA
+/// is cached. When the AP disconnects the STA, the client must
+/// reconnect through the cached PMK: `psk_pmk` stays `None` on the
+/// cache-hit path (PBKDF2 is skipped), unlike the first connection
+/// which derives it from the passphrase.
+#[tokio::test]
+async fn wifi_client_wpa2_psk_pmksa_reconnect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa2_psk_pmksa_reconnect: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    // First connection: PMK derived via PBKDF2, then cached.
+    assert!(
+        client.psk_pmk.is_some(),
+        "first connect must derive the PSK PMK"
+    );
+    assert!(
+        client
+            .pmksa_cache
+            .lookup("Test-WIFI-PSK", client.bss_info.bssid)
+            .is_some(),
+        "PMKSA must be cached after the first connection"
+    );
+
+    // Drain the trailing events of the first connection so the
+    // disconnect below is seen cleanly.
+    drain_pending_events(&mut client).await;
+
+    // Force an AP-initiated disconnect; the retry loop must reconnect
+    // through the cached PMKID.
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
+
+    let state = run_until_connected(&mut client, 40)
+        .await
+        .expect("reconnect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    // Cache hit: PBKDF2 was skipped, so the PSK PMK was never derived
+    // for the reconnect (the 4-way runs with the cached PMK).
+    assert!(
+        client.psk_pmk.is_none(),
+        "reconnect must use the cached PMKSA instead of re-deriving the PMK"
+    );
+    client.shutdown().await;
+}
+
 /// Two-BSS FT-SAE topology on a single radio: both BSSes share the
 /// SSID and mobility domain, and r0kh/r1kh entries cross-connect them
 /// so PMK-R1 is available on both (pmk_r1_push=1).
