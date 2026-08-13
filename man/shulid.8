@@ -8,41 +8,117 @@ shulid \- WiFi authentication daemon
 .SH DESCRIPTION
 .B shulid
 is a pure-Rust WiFi authentication daemon implementing
-WPA3-Personal (SAE), OWE (RFC 8110), and open
-authentication.  It performs the full authentication flow
-in userspace: scan, authentication, association, 4-way
-handshake, and key installation via nl80211.  Data-frame
-encryption (CCMP) is handled by the kernel once keys are
-installed.
+WPA3-Personal (SAE), WPA2-Personal (PSK), OWE (RFC 8110),
+and open authentication, including 802.11r/802.11v roaming.
+It performs the full authentication flow in userspace: scan,
+authentication, association, 4-way handshake, and key
+installation via nl80211.  Data-frame encryption (CCMP) is
+handled by the kernel once keys are installed.
 .PP
-On successful authentication the link is brought up and
+On successful authentication the link is brought up with the
+configured IP settings (static, DHCPv4, IPv6 SLAAC), and
 .B shulid
-holds the connection, handling group rekey (in userspace or
-offloaded to the driver when supported).  An external DHCP
-client can be used to obtain an address.
+holds the connection, handling group rekeys (in userspace or
+offloaded to the driver when supported) and roaming.
 .SH OPTIONS
 .TP
 .I config
-Path to the YAML configuration file.
-Default:
+Path to the YAML configuration file.  Default:
 .IR /etc/shuli/config.yml .
 .SH CONFIGURATION
-The configuration file is YAML:
+The configuration file is YAML, one entry per SSID:
 .PP
 .RS
 .nf
-interfaces:
-  - name: wlan0
-    type: wifi-phy
-    wifi:
-      ssid: MyNetwork
-      password: "secretpass"
+---
+version: 1
+wifis:
+  - ssid: Test-WIFI
+    password: "12345678"
+    interface: any
+    roaming: true
+    roaming_threshold: -70
+    sae_pwe: auto
+    wowlan: true
+    dns:
+      nameservers:
+        - 192.0.2.1
+    ipv4:
+      auto: true
+    ipv6:
+      auto: true
 .fi
 .RE
+.TP
+.B ssid
+Network name to scan for and connect to (required).
+.TP
+.B password
+Passphrase for WPA2-Personal / WPA3-Personal networks.
+Omit for open networks.
+.TP
+.B interface
+Interface to bind to; \fBany\fR (or omitted) picks the first
+WiFi NIC.  Entries sharing an interface share one connection
+engine; different interfaces connect concurrently.
+.TP
+.B roaming
+Signal-triggered roaming (default \fBtrue\fR); BTM (802.11v)
+requests are always honoured.
+.TP
+.B roaming_threshold
+Signal level (dBm) below which the client scans for roam
+candidates (default \fB-70\fR).
+.TP
+.B sae_pwe
+SAE PWE derivation: \fBauto\fR (default), \fBh2e\fR, or
+\fBhnp\fR.
+.TP
+.B wowlan
+Wake-on-WLAN: arm the wiphy's Disconnect / GTK-rekey-failure
+triggers while connected so the device can wake the host on
+suspend.  Default \fBfalse\fR (opt-in).
+.TP
+.B dns.nameservers / dns.searches
+DNS servers and search domains to write to
+.IR /etc/resolv.conf .
+.TP
+.B ipv4 / ipv6
+Per-family config: \fBauto: true\fR for DHCPv4 / IPv6 SLAAC,
+or \fBauto: false\fR with \fBaddress\fR and \fBgateway\fR for
+static configuration.
+.SH SYSTEMD
+The package ships
+.I packaging/shulid.service
+which starts
+.B shulid
+as root (required for nl80211/rtnetlink, the raw DHCPv4
+socket, IPv6 sysctls, and \fI/etc/resolv.conf\fR).  Install
+it and the default config with:
+.PP
+.RS
+.nf
+sudo install -Dm644 packaging/shulid.service /etc/systemd/system/
+sudo install -Dm644 examples/config.yml /etc/shuli/config.yml
+sudo systemctl daemon-reload
+sudo systemctl enable --now shulid
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/shuli/config.yml
+Default configuration file.
+.TP
+.I /usr/bin/shulid
+Daemon binary.
+.TP
+.I /etc/systemd/system/shulid.service
+Installed systemd unit.
 .SH SIGNALS
 .TP
 .B SIGINT, SIGTERM
-Cleanly disconnect from the AP and exit.
+Cleanly disconnect from the AP, clear WoWLAN triggers, and
+exit.
 .SH EXIT STATUS
 .TP
 .B 0

@@ -49,7 +49,7 @@ as Stage 2 work):
 | M5 Roaming (G8) | **Done 2026-08-06** (`afb4278`; follow-ups `40fba35`, `eea56d1`) |
 | M6 Suspend / WoWLAN (G9) | **Done 2026-08-13.** The `wl-nl80211` set-side work (SET_WOWLAN triggers builder, wake notification via `NL80211_ATTR_WOWLAN_TRIGGERS`, deauth/disassoc reason events) is committed (`61a51b8`). The shuli side adds `WifiClient::arm_wowlan()` / `disarm_wowlan()` with wiphy trigger-support detection, and per-network `wowlan: true` config (default off, like wpa_supplicant's `wowlan_triggers`) arms the supported Disconnect / GtkRekeyFailure triggers while connected, leaving them set for the kernel to use on suspend (wpa_supplicant model - no logind/zbus needed). `WowlanWakeup` handling: GTK-rekey-failure / disconnect wakes tear down the connection for a clean reconnect, other wakes only clear the triggers. Unit tests cover trigger filtering + wake classification and config default/mapping; a hwsim integration test proves the graceful unsupported path. |
 | M7 Robustness (G5) | **Done 2026-08-09.** Unsupported-AKM BSSes (`SecurityType::Unsupported`: 802.1X, PSK-SHA256, TKIP, WPA1) are skipped with a clear log (unit tests); the daemon runs one `WifiClient` per configured interface (unit tests + 2-radio-pair integration test); deauth/disassoc events carry the IEEE 802.11 reason (reason 2/23 -> long auth backoff, others -> short). Also fixed: SAE auth frames from a foreign peer are filtered by BSSID (two STAs on one hwsim air no longer corrupt each other's SAE exchange). |
-| M8 Packaging (G6) | **Not started** (systemd unit, `/etc/shuli/` layout, docs). |
+| M8 Packaging (G6) | **Done 2026-08-13.** `packaging/shulid.service` (Type=exec, restart on failure, `Before=network.target`), default `/etc/shuli/config.yml` layout documented with install steps, root/capability notes (`CAP_NET_ADMIN` for nl80211/rtnetlink, `CAP_NET_RAW` for the DHCPv4 raw socket, root for `/etc/resolv.conf` + IPv6 sysctls), README install section, and `man/shulid.8` rewritten for the current config schema. |
 | M9 nipart decision (G7) | **Not started.** §1/§3 imply option (a) embed the `shuli` crate; to be recorded here when decided. |
 
 Catch-up entry point: run `git log --oneline` in this repo for the
@@ -374,7 +374,11 @@ multi-interface and packaging.
   frames are now filtered by the peer BSSID, so a second STA on the
   same medium cannot corrupt an in-flight SAE exchange.
 * **M8** Packaging (G6): systemd unit + docs; daemon runs from the
-  unit with `CAP_NET_ADMIN`.  **Not started (2026-08-09).**
+  unit with `CAP_NET_ADMIN`.  **Done 2026-08-13:** unit shipped in
+  `packaging/shulid.service`, `/etc/shuli/` layout + install steps in
+  README and man page (including the `CAP_NET_RAW` need for DHCPv4
+  and root for `/etc/resolv.conf` / IPv6 sysctls); `man/shulid.8`
+  rewritten for the current `wifis` schema.
 * **M9** nipart decision (G7): decision recorded; if (a), nipart
   drives `shuli` in its wifi flow.  **Not started (2026-08-09)**;
   §1/§3 imply option (a) embed.
@@ -465,5 +469,5 @@ Notes from the deep-dive:
 6. Unsupported-AKM BSSes are skipped cleanly; multi-interface works.
    **Met 2026-08-09 (M7).**
 7. systemd unit shipped; fmt/clippy/test + integration suite green.
-   **Open (M8; suite is green at 2026-08-09).**
+   **Met 2026-08-13 (M8).**
 8. nipart decision (G7) recorded.  **Open (M9).**

@@ -69,6 +69,27 @@ host on suspend, and it reconnects after a GTK-rekey-failure wake.
 
 A ready-to-use example lives in [`examples/config.yml`](examples/config.yml).
 
+## Installing and running shulid
+
+Build and install the daemon, the systemd unit, and the default config:
+
+```sh
+cargo build --release
+sudo install -Dm755 target/release/shulid /usr/bin/shulid
+sudo install -Dm644 packaging/shulid.service /etc/systemd/system/shulid.service
+sudo install -Dm644 examples/config.yml /etc/shuli/config.yml
+sudo systemctl daemon-reload
+sudo systemctl enable --now shulid
+```
+
+`shulid` must run with root privileges (or equivalent capabilities):
+it configures the WiFi interface over nl80211/rtnetlink (`CAP_NET_ADMIN`),
+runs DHCPv4 on a raw packet socket (`CAP_NET_RAW`), writes IPv6 sysctls,
+and updates `/etc/resolv.conf`. The packaged
+[`shulid.service`](packaging/shulid.service) therefore runs as root and
+reads `/etc/shuli/config.yml` by default. Change that file and
+`systemctl restart shulid` to apply new networks.
+
 ## Using the `shuli` crate
 
 Add these lines to your Cargo.toml:

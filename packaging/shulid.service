@@ -1,0 +1,15 @@
+[Unit]
+Description=Shuli WiFi authentication daemon
+Documentation=man:shulid(8)
+Wants=network.target
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/shulid /etc/shuli/config.yml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
