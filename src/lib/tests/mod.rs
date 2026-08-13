@@ -7,6 +7,7 @@ mod crypto_kdf;
 mod crypto_sae;
 mod eap;
 mod eap_tls;
+mod elements;
 mod ieee80211_auth;
 mod ieee80211_eapol;
 mod pmksa;

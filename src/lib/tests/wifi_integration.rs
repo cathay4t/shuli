@@ -266,6 +266,48 @@ ctrl_interface=/var/run/hostapd
 "
 }
 
+/// Stage 3 M5: WPA3-Enterprise (AKM 5, mandatory PMF).
+fn wpa3_eap_hostapd_conf() -> &'static str {
+    r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-EAP3
+wpa=2
+wpa_key_mgmt=WPA-EAP-SHA256
+rsn_pairwise=CCMP
+ieee8021x=1
+ieee80211w=2
+eap_server=1
+tls_flags=[ENABLE-TLSv1.3]
+eap_user_file=/tmp/shuli_rs_test_eap_users
+ca_cert=/tmp/shuli_rs_test_certs/ca.pem
+server_cert=/tmp/shuli_rs_test_certs/server.pem
+private_key=/tmp/shuli_rs_test_certs/server.key
+ctrl_interface=/var/run/hostapd
+"
+}
+
+/// Copy the self-signed test certificates to /tmp and write the EAP
+/// user file for hostapd's internal EAP server.
+fn write_test_certs() {
+    let cert_dir = "/tmp/shuli_rs_test_certs";
+    std::fs::create_dir_all(cert_dir).expect("create cert dir");
+    for name in [
+        "ca.pem",
+        "server.pem",
+        "server.key",
+        "client.pem",
+        "client.key",
+    ] {
+        let src = format!("{}/tests/certs/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::copy(&src, format!("{cert_dir}/{name}")).expect("copy cert");
+    }
+    std::fs::write("/tmp/shuli_rs_test_eap_users", "\"shuli-test\" TLS\n")
+        .expect("write eap_user_file");
+}
+
 /// Run `hostapd_cli` against the test AP inside the test netns.
 fn hostapd_cli(args: &str) {
     hostapd_cli_if(AP_NIC, args);
@@ -823,20 +865,8 @@ async fn wifi_client_wpa2_eap_connect() {
     }
 
     // hostapd's internal EAP server reads its config from /tmp.
+    write_test_certs();
     let cert_dir = "/tmp/shuli_rs_test_certs";
-    std::fs::create_dir_all(cert_dir).expect("create cert dir");
-    for (name, dest) in [
-        ("ca.pem", "ca.pem"),
-        ("server.pem", "server.pem"),
-        ("server.key", "server.key"),
-        ("client.pem", "client.pem"),
-        ("client.key", "client.key"),
-    ] {
-        let src = format!("{}/tests/certs/{name}", env!("CARGO_MANIFEST_DIR"));
-        std::fs::copy(&src, format!("{cert_dir}/{dest}")).expect("copy cert");
-    }
-    std::fs::write("/tmp/shuli_rs_test_eap_users", "\"shuli-test\" TLS\n")
-        .expect("write eap_user_file");
 
     let _guard = WIFI_LOCK.lock().await;
     let conf = wpa2_eap_hostapd_conf();
@@ -895,6 +925,89 @@ async fn wifi_client_wpa2_eap_connect() {
         "ICMP echo through the WPA2-Enterprise data path never \
          succeeded:\n{last_err}"
     );
+    client.shutdown().await;
+}
+
+/// Stage 3 M5: WPA3-Enterprise baseline (802.1X-SHA256, AKM 5) with
+/// mandatory PMF.  EAP-TLS + 4-way must complete, the IGTK must be
+/// installed (an SA Query is answered by the kernel and the
+/// connection survives), and traffic must flow.
+#[tokio::test]
+async fn wifi_client_wpa3_eap_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa3_eap_connect: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+
+    write_test_certs();
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(wpa3_eap_hostapd_conf());
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-EAP3", None);
+    config.networks[0].eap = Some(crate::EapConfig {
+        identity: "shuli-test".to_string(),
+        ca_cert: Some("/tmp/shuli_rs_test_certs/ca.pem".into()),
+        client_cert: Some("/tmp/shuli_rs_test_certs/client.pem".into()),
+        client_key: Some("/tmp/shuli_rs_test_certs/client.key".into()),
+        server_name: Some("eap-tls.test".to_string()),
+    });
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.bss_info.security,
+        crate::SecurityType::Wpa2EntSha256,
+        "scan must classify the AP as 802.1X-SHA256 / WPA3-Enterprise"
+    );
+
+    // Mandatory PMF: the kernel must have the IGTK installed to
+    // answer the AP's protected SA Query (same check as the SAE PMF
+    // test); hostapd disassociates a STA that does not respond.
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("SA_QUERY {sta_mac}"));
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(state)) => {
+                assert!(
+                    matches!(
+                        state,
+                        WifiState::ConnectedWithoutOffloadRekey
+                            | WifiState::ConnectedWithOffloadRekey
+                    ),
+                    "SA Query broke the connection: {state:?}"
+                );
+            }
+            Ok(Err(e)) => panic!("client error during SA Query: {e}"),
+            Err(_) => {} // 500 ms without an event: still connected
+        }
+    }
+    assert!(matches!(
+        client.state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
     client.shutdown().await;
 }
 

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M5 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-13, M6 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -45,7 +45,10 @@
   (`tls_flags=[ENABLE-TLSv1.3]`) with the encrypted data path.
 * **M5 — WPA3-Enterprise (Goal 3):** mandatory-PMF SHA-256 AKM `:5`
   suite; 192-bit CNSA tier (AKM `:12`, GCMP-256, HMAC-SHA384,
-  BIP-GMAC-256, P-384 EAP-TLS) as stretch.
+  BIP-GMAC-256, P-384 EAP-TLS) as stretch.  **Done 2026-08-13:** the
+  AKM 5 RSNE now requires PMF (MFPR + MFPC) and association requests
+  MFP required; hostapd `WPA-EAP-SHA256` + `ieee80211w=2` integration
+  test with SA Query survival.  The 192-bit CNSA tier remains stretch.
 * **M6 — Wired 802.1X (Goal 6):** raw AF_PACKET EAPOL transport,
   `WiredClient`, `ethernets:` YAML section, port authorization -> IP
   config; integration with a wired authenticator test rig.

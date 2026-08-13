@@ -215,9 +215,9 @@ pub fn wpa2_ent_ie() -> Vec<u8> {
     buf
 }
 
-/// Build the RSNE for WPA2-Enterprise with SHA-256 algorithms
-/// (802.1X-SHA256, AKM 00-0F-AC:5, CCMP-128) with optional
-/// management frame protection.
+/// Build the RSNE for WPA3-Enterprise (802.1X-SHA256, AKM
+/// 00-0F-AC:5, CCMP-128) with **mandatory** management frame
+/// protection (MFPR + MFPC) - the WPA3 baseline requirement.
 pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
@@ -225,7 +225,9 @@ pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
             group_cipher: Some(Nl80211CipherSuite::Ccmp128),
             pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
             akm_suits: vec![Nl80211AkmSuite::Ieee8021xSha256],
-            rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
+            rsn_capbilities: Some(
+                Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
+            ),
             pmkids: vec![],
             group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
         })]);

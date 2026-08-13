@@ -888,12 +888,11 @@ impl WifiClient {
                         {
                             log::info!(
                                 "open-system AUTHENTICATE ok - sending \
-                                 WPA2-Enterprise-SHA256 ASSOCIATE"
+                                 WPA3-Enterprise ASSOCIATE"
                             );
-                            let mfp = self
-                                .bss_info
-                                .ap_mfp_capable()
-                                .then_some(Nl80211UseMfp::Required);
+                            // WPA3-Enterprise baseline: PMF is
+                            // mandatory for the SHA-256 AKM.
+                            let mfp = Some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(elements::wpa2_ent_sha256_ie(), mfp)
                                 .await
