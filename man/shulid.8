@@ -87,6 +87,33 @@ DNS servers and search domains to write to
 Per-family config: \fBauto: true\fR for DHCPv4 / IPv6 SLAAC,
 or \fBauto: false\fR with \fBaddress\fR and \fBgateway\fR for
 static configuration.
+.SH ETHERNETS
+Wired 802.1X ports are configured in a top-level
+.B ethernets
+section.  Each entry names an Ethernet NIC and carries an
+.B eap
+block plus the same
+.B dns / ipv4 / ipv6
+settings as WiFi entries:
+.PP
+.RS
+.nf
+ethernets:
+  - name: eth0
+    eap:
+      identity: user@example.org
+      ca_cert: /etc/shuli/ca.pem
+      client_cert: /etc/shuli/client.pem
+      client_key: /etc/shuli/client.key
+      server_name: radius.example.org
+    ipv4:
+      auto: true
+.fi
+.RE
+.PP
+There is no association, 4-way handshake, or key installation on
+wired links: EAP-TLS runs directly over EAPOL (ethertype 0x888E) and
+EAP-Success authorizes the port before the IP config is applied.
 .SH SYSTEMD
 The package ships
 .I packaging/shulid.service

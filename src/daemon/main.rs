@@ -37,10 +37,10 @@ async fn main() -> ExitCode {
 async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     let shuli_config = config::ShuliConfig::load(config_path)?;
     let wifis = &shuli_config.wifis;
-    if wifis.is_empty() {
+    if wifis.is_empty() && shuli_config.ethernets.is_empty() {
         return Err(shuli::WifiError::new(
             shuli::ErrorKind::InvalidConfig,
-            "no wifis in config",
+            "no wifis or ethernets in config",
         ));
     }
 
@@ -93,6 +93,14 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
         let shutdown_rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
             run_interface(&iface_name, &entries, client, shutdown_rx).await
+        }));
+    }
+    // Stage 3 M6: one wired 802.1X task per configured Ethernet port.
+    for entry in &shuli_config.ethernets {
+        let shutdown_rx = shutdown_rx.clone();
+        let entry = entry.clone();
+        tasks.push(tokio::spawn(async move {
+            run_wired_interface(&entry, shutdown_rx).await
         }));
     }
 
@@ -202,7 +210,9 @@ async fn run_interface(
                                     Some(entry) => {
                                         if let Err(e) = apply_network_config(
                                             iface_name,
-                                            entry,
+                                            entry.dns.as_ref(),
+                                            entry.ipv4.as_ref(),
+                                            entry.ipv6.as_ref(),
                                         )
                                         .await
                                         {
@@ -274,16 +284,19 @@ async fn resolve_iface_name(
     ))
 }
 
-/// Apply network configuration after WiFi connection: static IP,
-/// DHCP, and/or IPv6 RA depending on the config.
+/// Apply network configuration after a WiFi or wired 802.1X
+/// connection: static IP, DHCP, and/or IPv6 RA depending on the
+/// config.
 async fn apply_network_config(
     iface_name: &str,
-    wifi_entry: &config::WifiEntry,
+    dns_cfg: Option<&config::DnsConfig>,
+    ipv4: Option<&config::IpConfig>,
+    ipv6: Option<&config::IpConfig>,
 ) -> Result<(), shuli::WifiError> {
-    let mut dns = wifi_entry.dns.clone();
+    let mut dns = dns_cfg.cloned();
 
     // IPv4: static or DHCP.
-    if let Some(ref ipv4) = wifi_entry.ipv4
+    if let Some(ipv4) = ipv4
         && ipv4.auto
     {
         let lease_dns = dhcp::run_dhcpv4(iface_name).await?;
@@ -293,7 +306,7 @@ async fn apply_network_config(
     }
 
     // IPv6: enable RA (SLAAC) when auto.
-    if let Some(ref ipv6) = wifi_entry.ipv6
+    if let Some(ipv6) = ipv6
         && ipv6.auto
     {
         dhcp::enable_ipv6_ra(iface_name)?;
@@ -301,13 +314,86 @@ async fn apply_network_config(
 
     // Apply static IP config (addresses/gateway for non-auto, and
     // DNS from either config or DHCP lease).
-    ip::apply_ip_config(
-        iface_name,
-        wifi_entry.ipv4.as_ref(),
-        wifi_entry.ipv6.as_ref(),
-        dns.as_ref(),
-    )
-    .await
+    ip::apply_ip_config(iface_name, ipv4, ipv6, dns.as_ref()).await
+}
+
+/// Drive one wired 802.1X port until shutdown: authenticate with EAP,
+/// apply the port's IP config, and retry with backoff on failure.
+async fn run_wired_interface(
+    entry: &config::EthernetEntry,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, shuli::WifiError> {
+    let eap = entry.eap.to_lib();
+    let mut connected = false;
+    loop {
+        let mut client = match shuli::WiredClient::init(&entry.name, &eap) {
+            Ok(client) => client,
+            Err(e) => {
+                log::warn!("wired 802.1X init {} failed: {e}", entry.name);
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return Ok(connected),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                }
+                continue;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    log::info!("shutting down wired port {}", entry.name);
+                    return Ok(connected);
+                }
+                result = client.run() => {
+                    match result {
+                        Ok(shuli::WiredState::Connected) => {
+                            connected = true;
+                            log::info!(
+                                "wired 802.1X authorized on {} - link up",
+                                entry.name
+                            );
+                            if let Err(e) = apply_network_config(
+                                &entry.name,
+                                entry.dns.as_ref(),
+                                entry.ipv4.as_ref(),
+                                entry.ipv6.as_ref(),
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "IP config failed on {}: {e}",
+                                    entry.name
+                                );
+                            }
+                            // The port stays authorized; hold until
+                            // shutdown.
+                            let _ = shutdown_rx.changed().await;
+                            return Ok(connected);
+                        }
+                        Ok(shuli::WiredState::Failed) => {
+                            log::warn!(
+                                "wired 802.1X failed on {}; retrying",
+                                entry.name
+                            );
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "wired 802.1X error on {}: {e}",
+                                entry.name
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Backoff before the next attempt.
+        tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(connected),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+        }
+    }
 }
 
 /// Group configured networks by their resolved interface (M7): one

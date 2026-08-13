@@ -53,6 +53,20 @@ wifis:
       auto: true
     ipv6:
       auto: true
+# Wired 802.1X (Stage 3 M6): EAP-TLS over Ethernet, then the same IP
+# config as WiFi entries.
+# ethernets:
+#   - name: eth0
+#     eap:
+#       identity: user@example.org
+#       ca_cert: /etc/shuli/ca.pem
+#       client_cert: /etc/shuli/client.pem
+#       client_key: /etc/shuli/client.key
+#       server_name: radius.example.org
+#     ipv4:
+#       auto: true
+#     ipv6:
+#       auto: true
   # A second NIC: its networks run in a second WifiClient concurrently
   # with the ones above.
   # - ssid: Test-WIFI-2

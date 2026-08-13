@@ -17,6 +17,7 @@ mod roam;
 pub mod scan;
 #[cfg(test)]
 mod tests;
+pub mod wired;
 
 pub(crate) use self::mac::ETH_ALEN;
 pub use self::{
@@ -27,4 +28,5 @@ pub use self::{
     },
     error::{ErrorKind, WifiError},
     scan::{BssInfo, SecurityType},
+    wired::{WiredClient, WiredState},
 };

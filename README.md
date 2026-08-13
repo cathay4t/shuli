@@ -69,6 +69,23 @@ host on suspend, and it reconnects after a GTK-rekey-failure wake.
 An `eap:` block (identity, CA/client certificates, server name) turns
 the network into WPA2-Enterprise with EAP-TLS (802.1X).
 
+Wired 802.1X ports go in their own `ethernets:` section: each entry
+authenticates one Ethernet NIC with EAP-TLS (no WiFi association or
+4-way handshake) and then applies the same static/DHCP/IPv6 config:
+
+```yaml
+ethernets:
+  - name: eth0
+    eap:
+      identity: user@example.org
+      ca_cert: /etc/shuli/ca.pem
+      client_cert: /etc/shuli/client.pem
+      client_key: /etc/shuli/client.key
+      server_name: radius.example.org
+    ipv4:
+      auto: true
+```
+
 A ready-to-use example lives in [`examples/config.yml`](examples/config.yml).
 
 ## Installing and running shulid

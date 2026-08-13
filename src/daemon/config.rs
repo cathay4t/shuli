@@ -21,6 +21,10 @@ pub(crate) struct ShuliConfig {
     pub version: u32,
     #[serde(default)]
     pub wifis: Vec<WifiEntry>,
+    /// Wired 802.1X ports (Stage 3 M6): each entry authenticates one
+    /// Ethernet interface with EAP and then applies its IP config.
+    #[serde(default)]
+    pub ethernets: Vec<EthernetEntry>,
 }
 
 /// SAE PWE derivation mode as configured in the YAML file. Kept as its
@@ -106,6 +110,31 @@ pub(crate) struct EapEntry {
     pub server_name: Option<String>,
 }
 
+impl EapEntry {
+    pub(crate) fn to_lib(&self) -> shuli::EapConfig {
+        shuli::EapConfig {
+            identity: self.identity.clone(),
+            ca_cert: self.ca_cert.as_ref().map(PathBuf::from),
+            client_cert: self.client_cert.as_ref().map(PathBuf::from),
+            client_key: self.client_key.as_ref().map(PathBuf::from),
+            server_name: self.server_name.clone(),
+        }
+    }
+}
+
+/// A wired 802.1X port entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EthernetEntry {
+    pub name: String,
+    pub eap: EapEntry,
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
+    #[serde(default)]
+    pub ipv4: Option<IpConfig>,
+    #[serde(default)]
+    pub ipv6: Option<IpConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct DnsConfig {
     #[serde(default)]
@@ -165,13 +194,7 @@ impl ShuliConfig {
             network.roaming_threshold = entry.roaming_threshold;
             network.wowlan = entry.wowlan;
             if let Some(eap) = entry.eap.as_ref() {
-                network.eap = Some(shuli::EapConfig {
-                    identity: eap.identity.clone(),
-                    ca_cert: eap.ca_cert.as_ref().map(PathBuf::from),
-                    client_cert: eap.client_cert.as_ref().map(PathBuf::from),
-                    client_key: eap.client_key.as_ref().map(PathBuf::from),
-                    server_name: eap.server_name.clone(),
-                });
+                network.eap = Some(eap.to_lib());
             }
             network.sae_pwe = entry.sae_pwe.to_lib();
             config.networks.push(network);
@@ -294,5 +317,24 @@ wifis:
             Some(std::path::Path::new("/etc/shuli/ca.pem"))
         );
         assert_eq!(eap.server_name.as_deref(), Some("radius.example.org"));
+    }
+
+    #[test]
+    fn ethernet_entry_defaults_and_eap_parse() {
+        let config = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    eap:
+      identity: user@example.org
+      server_name: radius.example.org
+",
+        );
+        let entry = &config.ethernets[0];
+        assert_eq!(entry.name, "eth0");
+        assert_eq!(entry.eap.identity, "user@example.org");
+        assert!(entry.dns.is_none());
     }
 }

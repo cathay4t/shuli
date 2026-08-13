@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M6 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-13, M7 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -51,13 +51,19 @@
   test with SA Query survival.  The 192-bit CNSA tier remains stretch.
 * **M6 — Wired 802.1X (Goal 6):** raw AF_PACKET EAPOL transport,
   `WiredClient`, `ethernets:` YAML section, port authorization -> IP
-  config; integration with a wired authenticator test rig.
+  config.  **Done 2026-08-13:** `WiredClient` with a raw ethertype
+  0x888E socket (EAPOL-Start, shared EapPeer/EAP-TLS, EAP-Success),
+  daemon `ethernets:` section with per-port IP config, and an
+  integration test over a veth pair against an in-test EAP-TLS
+  authenticator (the installed hostapd lacks `driver=wired`).
 * **M7 — Hardening picks (Goal 5):** per deployment need (SAE password
   identifiers, Transition Disable, OCV, Extended Key ID, more BIP
-  ciphers); each picked item ships with its own tests.
+  ciphers); each picked item ships with its own tests.  Not started -
+  pick items per deployment.
 
 **Exit criteria:** M1-M6 implemented with unit + integration tests
 where the test hardware supports them; M7 items tracked as chosen.
+**All of M1-M6 are now done.**
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 

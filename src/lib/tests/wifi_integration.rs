@@ -24,13 +24,25 @@
 //! Set `RUST_LOG=info` (or `debug`) to get the client's `log` output while
 //! debugging.
 
-use std::sync::LazyLock;
+use std::{
+    io::Cursor,
+    os::fd::AsRawFd,
+    sync::{Arc, LazyLock},
+};
 
+use rustls::{ServerConfig, ServerConnection};
 use tokio::sync::Mutex;
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiState,
     client::RETRY_BACKOFF_INIT_SEC,
+    eap::{CODE_REQUEST, CODE_SUCCESS, EapPacket, TYPE_IDENTITY, TYPE_TLS},
+    eap_tls::{
+        EAP_TLS_FLAG_START, build_tls_message, cert_from_pem, key_from_pem,
+        parse_tls_message,
+    },
+    ieee80211::eapol::{build_eapol_eap_frame, parse_eapol_eap_frame},
+    wired::{open_eapol_socket, recv_eapol_frame, send_eapol_frame},
 };
 
 static WIFI_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -287,6 +299,158 @@ server_cert=/tmp/shuli_rs_test_certs/server.pem
 private_key=/tmp/shuli_rs_test_certs/server.key
 ctrl_interface=/var/run/hostapd
 "
+}
+
+/// Wired test environment: a veth pair in the default netns.  The
+/// installed hostapd lacks the `wired` driver, so the test supplies an
+/// in-process EAP-TLS authenticator on the other end.
+struct WiredVethEnv;
+
+impl WiredVethEnv {
+    fn setup() -> Self {
+        sh_allow_fail("ip link del veth0");
+        sh_ok("ip link add veth0 type veth peer name veth1");
+        sh_ok("ip link set veth0 up");
+        sh_ok("ip link set veth1 up");
+        WiredVethEnv
+    }
+}
+
+impl Drop for WiredVethEnv {
+    fn drop(&mut self) {
+        sh_allow_fail("ip link del veth0");
+    }
+}
+
+/// TLS 1.3 server config for the in-test wired authenticator.
+fn wired_server_config() -> ServerConfig {
+    let cert = cert_from_pem(include_str!("certs/server.pem")).unwrap();
+    let key = key_from_pem(include_str!("certs/server.key")).unwrap();
+    ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap()
+}
+
+/// Block on one EAPOL frame from the authenticator's raw socket.
+fn recv_wired_auth(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
+    loop {
+        match recv_eapol_frame(fd.as_raw_fd()) {
+            Ok(frame) if !frame.is_empty() => return frame,
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(e) => panic!("wired authenticator recv: {e}"),
+        }
+    }
+}
+
+/// In-test wired 802.1X authenticator: EAP-Identity, EAP-TLS 1.3 via a
+/// rustls server, then EAP-Success.
+fn run_wired_authenticator() {
+    let (fd, if_index, mac) =
+        open_eapol_socket("veth1").expect("authenticator socket");
+
+    // Client sends EAPOL-Start first; answer with Identity.
+    let _start = recv_wired_auth(&fd);
+    let identity = EapPacket::build(CODE_REQUEST, 1, Some(TYPE_IDENTITY), b"");
+    send_eapol_frame(
+        fd.as_raw_fd(),
+        if_index,
+        &mac,
+        &build_eapol_eap_frame(&identity),
+    )
+    .unwrap();
+    // Read the client's EAP-Response/Identity before starting TLS.
+    let _identity_response = recv_wired_auth(&fd);
+
+    // EAP-TLS: Start, then exchange TLS records until both sides are
+    // done, then EAP-Success.
+    let start = EapPacket::build(
+        CODE_REQUEST,
+        2,
+        Some(TYPE_TLS),
+        &[EAP_TLS_FLAG_START],
+    );
+    send_eapol_frame(
+        fd.as_raw_fd(),
+        if_index,
+        &mac,
+        &build_eapol_eap_frame(&start),
+    )
+    .unwrap();
+
+    let mut server =
+        ServerConnection::new(Arc::new(wired_server_config())).unwrap();
+    let mut tx = Vec::new();
+    loop {
+        let frame = recv_wired_auth(&fd);
+        let eap_pdu =
+            parse_eapol_eap_frame(&frame).expect("authenticator EAPOL");
+        let packet = EapPacket::parse(eap_pdu).expect("authenticator EAP");
+        assert_eq!(
+            packet.type_,
+            Some(TYPE_TLS),
+            "authenticator expected EAP-TLS"
+        );
+        let (_, tls_data) =
+            parse_tls_message(&packet.body).expect("authenticator TLS");
+        if !tls_data.is_empty() {
+            let used = server.read_tls(&mut Cursor::new(tls_data)).unwrap();
+            assert_eq!(used, tls_data.len());
+            server.process_new_packets().unwrap();
+            server.write_tls(&mut tx).unwrap();
+        }
+
+        if !server.is_handshaking() {
+            // Deliver any remaining server data, then authorize.
+            if !tx.is_empty() {
+                let msg = EapPacket::build(
+                    CODE_REQUEST,
+                    2,
+                    Some(TYPE_TLS),
+                    &build_tls_message(&tx),
+                );
+                send_eapol_frame(
+                    fd.as_raw_fd(),
+                    if_index,
+                    &mac,
+                    &build_eapol_eap_frame(&msg),
+                )
+                .unwrap();
+                tx.clear();
+                // Client ACKs the final flight.
+                let _ack = recv_wired_auth(&fd);
+            }
+            let success = EapPacket::build(CODE_SUCCESS, 3, None, b"");
+            send_eapol_frame(
+                fd.as_raw_fd(),
+                if_index,
+                &mac,
+                &build_eapol_eap_frame(&success),
+            )
+            .unwrap();
+            return;
+        }
+
+        if !tx.is_empty() {
+            let msg = EapPacket::build(
+                CODE_REQUEST,
+                2,
+                Some(TYPE_TLS),
+                &build_tls_message(&tx),
+            );
+            send_eapol_frame(
+                fd.as_raw_fd(),
+                if_index,
+                &mac,
+                &build_eapol_eap_frame(&msg),
+            )
+            .unwrap();
+            tx.clear();
+        }
+    }
 }
 
 /// Copy the self-signed test certificates to /tmp and write the EAP
@@ -1009,6 +1173,62 @@ async fn wifi_client_wpa3_eap_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     client.shutdown().await;
+}
+
+/// Stage 3 M6: wired 802.1X (EAP-TLS) against hostapd's wired
+/// authenticator driver over a veth pair.  EAP-Success authorizes the
+/// port; there is no 4-way handshake or key install on wired links.
+#[tokio::test]
+async fn wired_8021x_eap_tls_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wired_8021x_eap_tls_connect: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WiredVethEnv::setup();
+    let auth = std::thread::spawn(run_wired_authenticator);
+
+    let eap = crate::EapConfig {
+        identity: "shuli-test".to_string(),
+        ca_cert: Some("/tmp/shuli_rs_test_certs/ca.pem".into()),
+        client_cert: Some("/tmp/shuli_rs_test_certs/client.pem".into()),
+        client_key: Some("/tmp/shuli_rs_test_certs/client.key".into()),
+        server_name: Some("eap-tls.test".to_string()),
+    };
+    let mut client =
+        crate::WiredClient::init("veth0", &eap).expect("wired client");
+
+    let mut connected = false;
+    for _ in 0..20 {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(crate::WiredState::Connected)) => {
+                connected = true;
+                break;
+            }
+            Ok(Ok(crate::WiredState::Failed)) => {
+                panic!("wired 802.1X failed");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("wired client error: {e}"),
+            Err(_) => panic!("wired client made no progress within 20 s"),
+        }
+    }
+    assert!(
+        connected,
+        "wired 802.1X EAP-TLS never reached the Connected state"
+    );
+    assert_eq!(client.state(), crate::WiredState::Connected);
+    auth.join().expect("wired authenticator thread");
 }
 
 /// G4: after the first SAE connection the PMKSA is cached. When the AP
