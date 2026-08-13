@@ -988,6 +988,9 @@ impl WifiClient {
             target.bssid,
             target.freq_mhz
         );
+        // G9: a roam is still a connected state - keep WoWLAN armed
+        // (wpa_supplicant model: triggers stay set for the interface).
+        self.arm_wowlan_if_enabled().await;
         Ok(())
     }
 

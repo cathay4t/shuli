@@ -343,6 +343,44 @@ async fn wifi_client_open_connect() {
     client.shutdown().await;
 }
 
+/// G9: mac80211_hwsim has no WoWLAN support, so arming (with
+/// `wowlan: true` configured) must degrade gracefully (report
+/// unsupported, keep connecting) instead of failing. WoWLAN is opt-in
+/// and defaults to off.
+#[tokio::test]
+async fn wifi_client_wowlan_unsupported_graceful() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wowlan_unsupported_graceful: test binary \
+             not running as root (`.cargo/config.toml` runs tests via `sudo`, \
+             so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    config.networks[0].wowlan = true;
+    let mut client = WifiClient::init(config).await.expect("init");
+    assert!(
+        !client.wowlan_supported(),
+        "mac80211_hwsim must not advertise WoWLAN triggers"
+    );
+    let armed = client.arm_wowlan().await.expect("arm is best-effort");
+    assert!(!armed, "WoWLAN must not be armed on hwsim");
+
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn wifi_client_sae_connect() {
     init_logger();

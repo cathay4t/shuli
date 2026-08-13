@@ -35,6 +35,7 @@ fn network_config_builder() {
     network.set_password("12345678");
     assert_eq!(network.ssid, "Test-WIFI");
     assert_eq!(network.password, Some("12345678".to_string()));
+    assert!(!network.wowlan, "WoWLAN must be opt-in (off by default)");
 }
 
 #[test]
@@ -53,4 +54,14 @@ fn roaming_can_be_disabled_and_threshold_adjusted() {
     assert_eq!(network.roaming_threshold, -80);
     network.roaming = false;
     assert!(!network.roaming);
+}
+
+#[test]
+fn wowlan_is_opt_in_and_can_be_enabled() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(!network.wowlan, "WoWLAN must default to disabled");
+    network.set_wowlan(true);
+    assert!(network.wowlan);
+    network.set_wowlan(false);
+    assert!(!network.wowlan);
 }

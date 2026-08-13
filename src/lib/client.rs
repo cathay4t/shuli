@@ -16,7 +16,8 @@ use wl_nl80211::{
     Nl80211Event, Nl80211EventCode, Nl80211EventReason, Nl80211Handle,
     Nl80211Key, Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
     Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
-    Nl80211SchedScanPlanAttr, Nl80211UseMfp,
+    Nl80211SchedScanPlanAttr, Nl80211UseMfp, Nl80211Wowlan,
+    Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
 };
 
 use crate::{
@@ -111,6 +112,13 @@ pub struct WifiClient {
     pub(crate) sched_scan_supported: bool,
     /// Whether a scheduled scan is currently running in the firmware.
     pub(crate) sched_scan_active: bool,
+    /// G9: the WoWLAN triggers the wiphy advertises (e.g.
+    /// `GtkRekeyFailure`), as reported by
+    /// `NL80211_ATTR_WOWLAN_TRIGGERS_SUPPORTED`. Empty when the driver
+    /// has no WoWLAN support.
+    pub(crate) wowlan_supported_triggers: Vec<Nl80211WowlanTriggersSupport>,
+    /// G9: whether WoWLAN triggers are currently armed on the device.
+    pub(crate) wowlan_armed: bool,
     /// A stop was requested and the kernel's `SCHED_SCAN_STOPPED` echo
     /// has not been consumed yet. The kernel multicasts that event for
     /// every stop - including our own - so this flag lets
@@ -223,7 +231,50 @@ impl WifiClient {
                 }
             };
 
-        let conn_handle = handle.connection();
+        // G9: detect WoWLAN trigger support once, so arming a
+        // `wowlan: true` network is a no-op (and clearly logged) on
+        // drivers without it.
+        let wowlan_supported_triggers =
+            match wiphy_wowlan_support(&handle, wiphy_idx).await {
+                Ok(triggers) if !triggers.is_empty() => {
+                    log::info!(
+                        "wiphy {wiphy_idx} supports WoWLAN: {triggers:?}"
+                    );
+                    triggers
+                }
+                Ok(_) => {
+                    log::info!(
+                        "wiphy {wiphy_idx} has no WoWLAN trigger support; \
+                         triggers will not be armed"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    log::debug!("could not query WoWLAN support: {e}");
+                    Vec::new()
+                }
+            };
+
+        let mut conn_handle = handle.connection();
+
+        // G9: clear any WoWLAN triggers a previous (possibly crashed)
+        // run left armed. The daemon arms them again right before the
+        // next suspend; a leftover configuration would keep the device
+        // in WoWLAN mode with nobody handling the wake.
+        if !wowlan_supported_triggers.is_empty() {
+            let attrs =
+                Nl80211Wowlan::new(if_index).triggers(Vec::new()).build();
+            match drain_request(conn_handle.set_wowlan(attrs).execute().await)
+                .await
+            {
+                Ok(()) => log::info!(
+                    "cleared stale WoWLAN triggers from a previous run"
+                ),
+                Err(e) => {
+                    log::debug!("clear stale WoWLAN triggers failed: {e}")
+                }
+            }
+        }
 
         let network = config.networks.first().cloned().ok_or_else(|| {
             WifiError::new(
@@ -241,6 +292,8 @@ impl WifiClient {
             sched_scan_supported,
             sched_scan_active: false,
             sched_scan_stop_pending: false,
+            wowlan_supported_triggers,
+            wowlan_armed: false,
             if_index,
             mac,
             config,
@@ -866,6 +919,7 @@ impl WifiClient {
                         );
                         self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                         self.state = WifiState::ConnectedWithoutOffloadRekey;
+                        self.arm_wowlan_if_enabled().await;
                     } else if self.bss_info.security == SecurityType::Owe {
                         if self.process_owe_assoc_response(ies.as_deref()) {
                             log::info!(
@@ -943,6 +997,11 @@ impl WifiClient {
                 log::info!("PORT_AUTHORIZED - connection ready");
                 self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
+                self.arm_wowlan_if_enabled().await;
+            }
+
+            Nl80211Event::WowlanWakeup { reasons } => {
+                self.handle_wowlan_wakeup(reasons).await;
             }
 
             Nl80211Event::Disconnect { reason } => {
@@ -1095,6 +1154,60 @@ impl WifiClient {
                  ignored",
                 self.state
             );
+        }
+    }
+
+    /// G9: the device woke the host while it was suspended. Clear the
+    /// per-suspend triggers, and when the wake means the connection is
+    /// no longer trustworthy (GTK rekey failure / disconnect) tear it
+    /// down so the retry loop rebuilds it.
+    async fn handle_wowlan_wakeup(
+        &mut self,
+        reasons: Vec<Nl80211WowlanWakeup>,
+    ) {
+        if reasons.is_empty() {
+            log::debug!("WoWLAN wake event without reasons");
+        } else {
+            log::warn!("WoWLAN wake: {reasons:?}");
+        }
+
+        // Triggers stay armed while connected; clear them after a wake
+        // so they cannot fire again before the next connection (which
+        // re-arms when `wowlan: true`).
+        if self.wowlan_armed
+            && let Err(e) = self.disarm_wowlan().await
+        {
+            log::warn!("clear WoWLAN triggers after wake failed: {e}");
+        }
+
+        if !matches!(
+            self.state,
+            WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        ) {
+            log::debug!("stale WoWLAN wake in state {:?}; ignored", self.state);
+            return;
+        }
+
+        if wowlan_wakeup_requires_reconnect(&reasons) {
+            log::warn!("WoWLAN wake invalidated the connection; reconnecting");
+            // Same kernel-state cleanup as an AP disconnect: clear
+            // wdev->connected before the next ASSOCIATE.
+            if let Err(e) =
+                connect::disconnect(&mut self.conn_handle, self.if_index).await
+            {
+                log::debug!("disconnect cleanup after WoWLAN wake failed: {e}");
+            }
+            self.state = WifiState::Failed;
+        }
+    }
+
+    /// G9: arm WoWLAN when the connected network opted in
+    /// (`NetworkConfig::wowlan`). WoWLAN is off by default; this keeps
+    /// the feature opt-in per network.
+    pub(crate) async fn arm_wowlan_if_enabled(&mut self) {
+        if self.network.wowlan {
+            let _ = self.arm_wowlan().await;
         }
     }
 
@@ -1636,6 +1749,12 @@ impl WifiClient {
                 self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
+            // G9 (wpa_supplicant model): arm WoWLAN triggers when the
+            // connection lands and leave them armed. The kernel only
+            // uses them while the host is suspended; the wake handler
+            // clears them after a WoWLAN wake and this arms again on
+            // the next reconnect.
+            self.arm_wowlan_if_enabled().await;
         } else if parsed.has_mic()
             && parsed.is_secure()
             && parsed.has_ack()
@@ -1741,11 +1860,82 @@ impl WifiClient {
         &self.network.ssid
     }
 
+    /// Whether the wiphy advertises WoWLAN triggers shuli can arm
+    /// (disconnect and/or GTK rekey failure).
+    pub fn wowlan_supported(&self) -> bool {
+        !desired_wowlan_triggers(&self.wowlan_supported_triggers).is_empty()
+    }
+
+    /// G9: arm WoWLAN triggers (`NL80211_CMD_SET_WOWLAN`) so the device
+    /// can wake the host while it is suspended. Arms `Disconnect` and
+    /// `GtkRekeyFailure` when the wiphy advertises them; returns `true`
+    /// when triggers were armed and `false` when the wiphy has no
+    /// usable WoWLAN support. Best-effort: failures are logged, not
+    /// fatal (a suspend must not be blocked on WoWLAN).
+    pub async fn arm_wowlan(&mut self) -> Result<bool, WifiError> {
+        if self.wowlan_armed {
+            return Ok(true);
+        }
+        let triggers = desired_wowlan_triggers(&self.wowlan_supported_triggers);
+        if triggers.is_empty() {
+            log::debug!("WoWLAN unsupported; not arming triggers");
+            return Ok(false);
+        }
+        let attrs =
+            Nl80211Wowlan::new(self.if_index).triggers(triggers).build();
+        match drain_request(self.conn_handle.set_wowlan(attrs).execute().await)
+            .await
+        {
+            Ok(()) => {
+                self.wowlan_armed = true;
+                log::info!(
+                    "WoWLAN triggers armed (disconnect, GTK rekey failure)"
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                log::warn!("arm WoWLAN failed: {e}");
+                Ok(false)
+            }
+        }
+    }
+
+    /// G9: clear WoWLAN triggers (`NL80211_CMD_SET_WOWLAN` with an
+    /// empty trigger set), e.g. after a WoWLAN wake or before
+    /// shutdown. Best-effort.
+    pub async fn disarm_wowlan(&mut self) -> Result<(), WifiError> {
+        if !self.wowlan_armed {
+            return Ok(());
+        }
+        let attrs = Nl80211Wowlan::new(self.if_index)
+            .triggers(Vec::new())
+            .build();
+        match drain_request(self.conn_handle.set_wowlan(attrs).execute().await)
+            .await
+        {
+            Ok(()) => {
+                self.wowlan_armed = false;
+                log::info!("WoWLAN triggers cleared");
+                Ok(())
+            }
+            Err(e) => {
+                self.wowlan_armed = false;
+                log::warn!("disarm WoWLAN failed: {e}");
+                Ok(())
+            }
+        }
+    }
+
     /// Cleanly disconnect from the AP.  Call this before dropping the
     /// client so the AP receives a proper deauthentication.
     pub async fn shutdown(&mut self) {
         // Stop any running firmware scheduled scan before disconnecting.
         let _ = self.stop_sched_scan().await;
+        if self.wowlan_armed
+            && let Err(e) = self.disarm_wowlan().await
+        {
+            log::debug!("disarm WoWLAN on shutdown failed: {e}");
+        }
         if let Err(e) =
             connect::disconnect(&mut self.conn_handle, self.if_index).await
         {
@@ -1760,6 +1950,7 @@ impl Drop for WifiClient {
         let handle = self.handle.clone();
         let if_index = self.if_index;
         let sched_scan_active = self.sched_scan_active;
+        let wowlan_armed = self.wowlan_armed;
         // Best-effort: run the cleanup on a dedicated thread with its own
         // runtime so we never panic outside a tokio context.  The thread
         // is detached; if the process exits first the cleanup is simply
@@ -1782,12 +1973,59 @@ impl Drop for WifiClient {
                         )
                         .await;
                     }
+                    if wowlan_armed {
+                        let _ = drain_request(
+                            conn_handle
+                                .set_wowlan(
+                                    Nl80211Wowlan::new(if_index)
+                                        .triggers(Vec::new())
+                                        .build(),
+                                )
+                                .execute()
+                                .await,
+                        )
+                        .await;
+                    }
                     let _ =
                         connect::disconnect(&mut conn_handle, if_index).await;
                 });
             }
         });
     }
+}
+
+/// G9: the WoWLAN triggers shuli wants to arm, filtered down to what
+/// the wiphy advertises. GTK-rekey-failure is the motivating trigger:
+/// while the host is suspended the device must wake it when the AP
+/// rekeys the group key (otherwise the association silently loses the
+/// new GTK). Disconnect wakes on link loss.
+fn desired_wowlan_triggers(
+    supported: &[Nl80211WowlanTriggersSupport],
+) -> Vec<Nl80211WowlanTriggersSupport> {
+    let mut triggers = Vec::new();
+    for trigger in [
+        Nl80211WowlanTriggersSupport::Disconnect,
+        Nl80211WowlanTriggersSupport::GtkRekeyFailure,
+    ] {
+        if supported.contains(&trigger) {
+            triggers.push(trigger);
+        }
+    }
+    triggers
+}
+
+/// G9: a WoWLAN wake that invalidates the current connection: the GTK
+/// rekey failed while the host was suspended (the group key is unknown,
+/// so the old association must be rebuilt) or the device woke on a
+/// disconnect.
+fn wowlan_wakeup_requires_reconnect(reasons: &[Nl80211WowlanWakeup]) -> bool {
+    reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            Nl80211WowlanWakeup::GtkRekeyFailure
+                | Nl80211WowlanWakeup::Disconnect
+        )
+    })
 }
 
 /// Whether an AP-initiated disconnect reason means a fatal
@@ -2102,11 +2340,43 @@ async fn wiphy_supports_sched_scan(
     Ok(false)
 }
 
+/// G9: the WoWLAN triggers the wiphy owning `wiphy_idx` advertises via
+/// `NL80211_ATTR_WOWLAN_TRIGGERS_SUPPORTED` (empty when the driver has
+/// no WoWLAN support).
+async fn wiphy_wowlan_support(
+    handle: &Nl80211Handle,
+    wiphy_idx: u32,
+) -> Result<Vec<Nl80211WowlanTriggersSupport>, WifiError> {
+    let mut dump = handle.wireless_physic().get().execute().await;
+    while let Some(msg) = dump.try_next().await? {
+        let mut idx = None;
+        let mut triggers = Vec::new();
+        for attr in &msg.payload.attributes {
+            match attr {
+                Nl80211Attr::Wiphy(i) => idx = Some(*i),
+                Nl80211Attr::WowlanTriggersSupport(supported) => {
+                    triggers.clone_from(supported)
+                }
+                _ => {}
+            }
+        }
+        if idx == Some(wiphy_idx) {
+            return Ok(triggers);
+        }
+    }
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
-    use wl_nl80211::Nl80211EventReason;
+    use wl_nl80211::{
+        Nl80211EventReason, Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
+    };
 
-    use super::is_fatal_disconnect_reason;
+    use super::{
+        desired_wowlan_triggers, is_fatal_disconnect_reason,
+        wowlan_wakeup_requires_reconnect,
+    };
 
     /// M7 (G5): reasons 2 (PREV_AUTH_NOT_VALID) and 23
     /// (IEEE_802_1X_AUTH_FAILED) mean a fatal credential/PMKSA problem
@@ -2138,5 +2408,45 @@ mod tests {
         }
         // A disconnect without a parseable reason is transient.
         assert!(!is_fatal_disconnect_reason(None));
+    }
+
+    /// G9: only triggers the wiphy actually advertises are armed, and
+    /// GTK-rekey-failure alone is enough to enable WoWLAN.
+    #[test]
+    fn wowlan_desired_triggers_filtered_by_support() {
+        let all = vec![
+            Nl80211WowlanTriggersSupport::Disconnect,
+            Nl80211WowlanTriggersSupport::GtkRekeyFailure,
+        ];
+        assert_eq!(desired_wowlan_triggers(&all), all);
+
+        let rekey_only = vec![Nl80211WowlanTriggersSupport::GtkRekeyFailure];
+        assert_eq!(
+            desired_wowlan_triggers(&rekey_only),
+            vec![Nl80211WowlanTriggersSupport::GtkRekeyFailure]
+        );
+
+        let none = vec![Nl80211WowlanTriggersSupport::MagicPkt];
+        assert!(desired_wowlan_triggers(&none).is_empty());
+    }
+
+    /// G9: a GTK-rekey-failure or disconnect wake must rebuild the
+    /// connection; any other wake (magic packet, rfkill, ...) does not
+    /// invalidate it.
+    #[test]
+    fn wowlan_wakeup_reconnect_reasons() {
+        assert!(wowlan_wakeup_requires_reconnect(&[
+            Nl80211WowlanWakeup::GtkRekeyFailure
+        ]));
+        assert!(wowlan_wakeup_requires_reconnect(&[
+            Nl80211WowlanWakeup::Disconnect
+        ]));
+        assert!(!wowlan_wakeup_requires_reconnect(&[
+            Nl80211WowlanWakeup::MagicPkt
+        ]));
+        assert!(!wowlan_wakeup_requires_reconnect(&[
+            Nl80211WowlanWakeup::Any
+        ]));
+        assert!(!wowlan_wakeup_requires_reconnect(&[]));
     }
 }

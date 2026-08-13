@@ -341,6 +341,7 @@ mod tests {
             password: None,
             roaming: true,
             roaming_threshold: shuli::DEFAULT_ROAM_THRESHOLD_DBM,
+            wowlan: false,
             sae_pwe: config::SaePweConfig::Auto,
             interface: interface.map(|s| s.to_string()),
             dns: None,

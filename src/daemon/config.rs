@@ -61,6 +61,12 @@ pub(crate) struct WifiEntry {
     /// `RoamThreshold`).
     #[serde(default = "default_roam_threshold")]
     pub roaming_threshold: i32,
+    /// Wake-on-WLAN (WoWLAN): arm the wiphy's Disconnect / GTK-rekey
+    /// failure triggers while connected, so the device can wake the
+    /// host on suspend. Defaults to `false` (opt-in, like
+    /// wpa_supplicant's `wowlan_triggers` config).
+    #[serde(default)]
+    pub wowlan: bool,
     /// SAE PWE derivation for WPA3-Personal networks: `auto` (default,
     /// H2E with hunting-and-pecking fallback), `h2e`, or `hnp`.
     #[serde(default)]
@@ -134,6 +140,7 @@ impl ShuliConfig {
             }
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
+            network.wowlan = entry.wowlan;
             network.sae_pwe = entry.sae_pwe.to_lib();
             config.networks.push(network);
         }
@@ -208,5 +215,26 @@ wifis:
         let network = &wifi.networks[0];
         assert!(network.roaming);
         assert_eq!(network.roaming_threshold, -80);
+    }
+
+    #[test]
+    fn wowlan_defaults_to_disabled_and_maps_true() {
+        let config = parse(MINIMAL_YAML);
+        assert!(!config.wifis[0].wowlan);
+
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(!wifi.networks[0].wowlan);
+
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    wowlan: true
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(wifi.networks[0].wowlan);
     }
 }

@@ -47,15 +47,15 @@ as Stage 2 work):
 | M3 SAE interop (G2) | **Done 2026-08-09** (`5aae947`) |
 | M4 PMKSA caching (G4) | **Done 2026-08-06** (`60e7404`) |
 | M5 Roaming (G8) | **Done 2026-08-06** (`afb4278`; follow-ups `40fba35`, `eea56d1`) |
-| M6 Suspend / WoWLAN (G9) | **In progress.** The `wl-nl80211` set-side work (SET_WOWLAN triggers builder, wake notification via `NL80211_ATTR_WOWLAN_TRIGGERS`, deauth/disassoc reason events) is committed in the `cathay4t/wl-nl80211` fork (`8bfd419`, not yet upstream; shuli consumes it via a `[patch]` to the local checkout). The shuli side (`arm_wowlan()`, wake handling) is not started. |
+| M6 Suspend / WoWLAN (G9) | **Done 2026-08-13.** The `wl-nl80211` set-side work (SET_WOWLAN triggers builder, wake notification via `NL80211_ATTR_WOWLAN_TRIGGERS`, deauth/disassoc reason events) is committed (`61a51b8`). The shuli side adds `WifiClient::arm_wowlan()` / `disarm_wowlan()` with wiphy trigger-support detection, and per-network `wowlan: true` config (default off, like wpa_supplicant's `wowlan_triggers`) arms the supported Disconnect / GtkRekeyFailure triggers while connected, leaving them set for the kernel to use on suspend (wpa_supplicant model - no logind/zbus needed). `WowlanWakeup` handling: GTK-rekey-failure / disconnect wakes tear down the connection for a clean reconnect, other wakes only clear the triggers. Unit tests cover trigger filtering + wake classification and config default/mapping; a hwsim integration test proves the graceful unsupported path. |
 | M7 Robustness (G5) | **Done 2026-08-09.** Unsupported-AKM BSSes (`SecurityType::Unsupported`: 802.1X, PSK-SHA256, TKIP, WPA1) are skipped with a clear log (unit tests); the daemon runs one `WifiClient` per configured interface (unit tests + 2-radio-pair integration test); deauth/disassoc events carry the IEEE 802.11 reason (reason 2/23 -> long auth backoff, others -> short). Also fixed: SAE auth frames from a foreign peer are filtered by BSSID (two STAs on one hwsim air no longer corrupt each other's SAE exchange). |
 | M8 Packaging (G6) | **Not started** (systemd unit, `/etc/shuli/` layout, docs). |
 | M9 nipart decision (G7) | **Not started.** §1/§3 imply option (a) embed the `shuli` crate; to be recorded here when decided. |
 
 Catch-up entry point: run `git log --oneline` in this repo for the
-milestone commits, and read `wl-nl80211_change_plan.md` before touching
-`/home/fge/Source/netlink/wl-nl80211` (that repo currently has
-uncommitted, non-compiling WoWLAN changes from 2026-08-09).
+milestone commits. The `wl-nl80211` WoWLAN support is committed as
+`61a51b8` in the `cathay4t/wl-nl80211` fork and consumed through the
+pinned git dependency in `Cargo.lock`.
 
 ## 1. Design decision: no IPC
 
@@ -262,8 +262,12 @@ GTK rekey offload (Stage 1) was built as this feature's prerequisite;
 WoWLAN is the motivating use case.  Planned because it matters here,
 not for parity with the reference daemons.
 
-* On suspend: configure WoWLAN triggers via `NL80211_CMD_SET_WOWLAN`,
-  including `NL80211_WOWLAN_TRIG_GTK_REKEY_FAILURE`.
+* Arm WoWLAN triggers via `NL80211_CMD_SET_WOWLAN` when a connection
+  lands on a network configured with `wowlan: true` (wpa_supplicant
+  model - no logind/zbus dependency), including
+  `NL80211_WOWLAN_TRIG_GTK_REKEY_FAILURE`.  Default is **off**;
+  the kernel uses the armed triggers whenever the host suspends; shuli
+  clears them after a WoWLAN wake and on shutdown.
 * On resume: handle wake notifications; on a GTK-rekey-failure wake,
   disconnect and reconnect (not a userspace-rekey fallback on the old
   association).
@@ -338,12 +342,19 @@ multi-interface and packaging.
   FT-SAE over-the-Air with PMK-R0/R1 hierarchy; BTM Request/Response
   with Neighbor Report candidates; signal-threshold roam scan with
   cooldown; OKC PMKID cloning attempted before full-auth fallback).
-* **M6** Suspend / WoWLAN (G9): WoWLAN triggers armed on suspend;
+* **M6** Suspend / WoWLAN (G9): WoWLAN triggers armed for suspend;
   wake path (GTK-rekey failure -> disconnect + reconnect) covered
-  where the driver supports it.  **In progress (2026-08-09):** the
-  `wl-nl80211` set-side work is applied but uncommitted/non-compiling
-  there; shuli side (`arm_wowlan()`, wake handling, tests) open.  See
-  `wl-nl80211_change_plan.md`.
+  where the driver supports it.  **Done 2026-08-13:** `wl-nl80211`
+  ships the SET_WOWLAN builder + wake event (`61a51b8`); `shuli`
+  detects wiphy trigger support, arms only the supported Disconnect /
+  GtkRekeyFailure triggers, handles `WowlanWakeup` (GtkRekeyFailure /
+  Disconnect -> disconnect + retry, anything else -> clear triggers).
+  Arming follows the wpa_supplicant model and is **opt-in**: the
+  per-network `wowlan: true` config (default off) sets the triggers
+  once when a connection lands and leaves them set (no logind/zbus
+  dependency); the kernel uses them whenever the host suspends.  Unit
+  tests + hwsim graceful-unsupported integration test; driver-side
+  coverage remains environment-dependent.
 * **M7** Robustness (G5): unsupported-AKM BSS skipped (unit test),
   two interfaces connected concurrently (integration), reason-code
   aware retry.  **Done 2026-08-09.**  `SecurityType::Unsupported`
@@ -448,8 +459,9 @@ Notes from the deep-dive:
    green; a WPA2-PSK PMKSA-reconnect integration test is still open.
 4. Roaming works in a two-BSS test netns: FT transition and
    BTM-directed roam both land (G8).  **Met 2026-08-06 (M5).**
-5. WoWLAN triggers armed on suspend; wake path handled (G9).
-   **Open (M6):** wl-nl80211 set-side work in progress.
+5. WoWLAN triggers armed while connected when enabled (`wowlan: true`);
+   wake path handled (G9).
+   **Met 2026-08-13 (M6).**
 6. Unsupported-AKM BSSes are skipped cleanly; multi-interface works.
    **Met 2026-08-09 (M7).**
 7. systemd unit shipped; fmt/clippy/test + integration suite green.

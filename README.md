@@ -31,6 +31,8 @@ version: 1
 wifis:
   - ssid: Test-WIFI
     password: "12345678"
+    # wowlan: true # arm WoWLAN triggers (disconnect, GTK rekey
+    #              # failure) while connected; off by default
     dns:
       nameservers:
         - 2001:db8:1::254
@@ -60,6 +62,10 @@ wifis:
 With `auto: true` the IPv4 address comes from DHCP (and IPv6 from router
 solicitation), with DNS taken from the lease when not set in the config.
 `interface: any` (or absent) picks the first available WiFi interface.
+`wowlan: true` enables Wake-on-WLAN for that network (opt-in; the
+default is off): while connected, shuli arms the wiphy's supported
+disconnect and GTK-rekey-failure triggers so the device can wake the
+host on suspend, and it reconnects after a GTK-rekey-failure wake.
 
 A ready-to-use example lives in [`examples/config.yml`](examples/config.yml).
 

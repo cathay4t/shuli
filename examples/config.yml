@@ -20,6 +20,8 @@ wifis:
     password: "12345678"
     # roaming: true
     # roaming_threshold: -70
+    # wowlan: true # arm WoWLAN (disconnect + GTK rekey failure) while
+    #              # connected; off by default
     dns:
       nameservers:
         - 2001:db8:1::254

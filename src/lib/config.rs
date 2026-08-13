@@ -68,6 +68,12 @@ pub struct NetworkConfig {
     /// candidates while connected to this SSID. Defaults to
     /// [`DEFAULT_ROAM_THRESHOLD_DBM`].
     pub roaming_threshold: i32,
+    /// Wake-on-WLAN (WoWLAN): when `true`, the client arms the
+    /// `Disconnect` and `GtkRekeyFailure` triggers (as supported by the
+    /// wiphy) while connected, so the device can wake the host on
+    /// suspend. Defaults to `false` - opt in per network (matches
+    /// wpa_supplicant, where `wowlan_triggers` is unset by default).
+    pub wowlan: bool,
     /// SAE PWE derivation mode (WPA3-Personal only). Defaults to
     /// [`SaePwe::Auto`]: hash-to-element first, hunting-and-pecking
     /// fallback for HnP-only APs.
@@ -81,12 +87,21 @@ impl NetworkConfig {
             password: None,
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
+            wowlan: false,
             sae_pwe: SaePwe::Auto,
         }
     }
 
     pub fn set_password(&mut self, password: &str) -> &mut Self {
         self.password = Some(password.to_string());
+        self
+    }
+
+    /// Enable (or disable) Wake-on-WLAN for this network. WoWLAN is
+    /// off by default; enabling it arms the wiphy's supported
+    /// `Disconnect` / `GtkRekeyFailure` triggers while connected.
+    pub fn set_wowlan(&mut self, enabled: bool) -> &mut Self {
+        self.wowlan = enabled;
         self
     }
 }
