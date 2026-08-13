@@ -1,12 +1,12 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: NOT STARTED (2026-08-09).** Stage 2 has since completed
-> (all exit criteria met, M1-M8; M9 removed). Stage 3 has no plan
-> yet: this document records goals, protocol names, and
-> authentication workflows in enough detail to produce a good plan.
-> Spec references are to `~/Source/wifi_docs/` (`802.11-2020.pdf`,
-> `802.11-2024.pdf`, `wpa2.pdf`, `wpa3_v3.3.pdf`).
+> **Status: IN PROGRESS (2026-08-13, M1 next).** Stage 2 has completed
+> (all exit criteria met, M1-M8; M9 removed). This document records
+> goals, protocol names, authentication workflows, and the milestone
+> plan below. Spec references are to `~/Source/wifi_docs/`
+> (`802.11-2020.pdf`, `802.11-2024.pdf`, `wpa2.pdf`,
+> `wpa3_v3.3.pdf`).
 >
 > **Design note (2026-08):** `shulid` provides no IPC interface for
 > live configuration; Stage 3 features land as engine work +
@@ -15,6 +15,33 @@
 > added by it and later **moved to Stage 2** (roaming is needed in
 > the home WiFi environment); Goal 5 was added by the audit; Goal 6
 > (wired 802.1X) was added 2026-08-13.
+
+## Milestones
+
+* **M1 — WPA2-Personal PSK-SHA256 (Goal 1):** AKM `00-0F-AC:6`
+  autodetection (`SecurityType::Wpa2PskSha256`), KDF-Hash-Length +
+  AES-CMAC 4-way (Key Descriptor Version 3), SHA-256 PMKID for PMKSA
+  caching, optional PMF.  Unit tests + hostapd
+  `wpa_key_mgmt=WPA-PSK-SHA256` integration test.
+* **M2 — EAP transport (Goal 2 core):** EAPOL type 0 framing, EAP peer
+  state machine (RFC 4137), EAP-TLS via rustls (RFC 5216
+  fragmentation), MSK export, credential config model.  Unit tests +
+  an EAP-TLS handshake test.
+* **M3 — WPA2-Enterprise on WiFi (Goal 2):** AKM `00-0F-AC:1` /
+  `:5`, EAP over the nl80211 control port, MSK -> PMK -> 4-way;
+  hostapd `WPA-EAP` + internal EAP server integration test.
+* **M4 — WPA3-Enterprise (Goal 3):** mandatory-PMF SHA-256 AKM `:5`
+  suite; 192-bit CNSA tier (AKM `:12`, GCMP-256, HMAC-SHA384,
+  BIP-GMAC-256, P-384 EAP-TLS) as stretch.
+* **M5 — Wired 802.1X (Goal 6):** raw AF_PACKET EAPOL transport,
+  `WiredClient`, `ethernets:` YAML section, port authorization -> IP
+  config; integration with a wired authenticator test rig.
+* **M6 — Hardening picks (Goal 5):** per deployment need (SAE password
+  identifiers, Transition Disable, OCV, Extended Key ID, more BIP
+  ciphers); each picked item ships with its own tests.
+
+**Exit criteria:** M1-M5 implemented with unit + integration tests
+where the test hardware supports them; M6 items tracked as chosen.
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 
