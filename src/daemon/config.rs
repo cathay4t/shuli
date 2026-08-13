@@ -113,7 +113,7 @@ impl ShuliConfig {
         }
         let content = fs::read_to_string(path)?;
         let config: ShuliConfig =
-            serde_yaml::from_str(&content).map_err(|e| {
+            rmsd_yaml::from_str(&content).map_err(|e| {
                 WifiError::new(ErrorKind::InvalidConfig, e.to_string())
             })?;
         Ok(config)
@@ -162,7 +162,7 @@ wifis:
 ";
 
     fn parse(yaml: &str) -> ShuliConfig {
-        serde_yaml::from_str(yaml).expect("valid YAML")
+        rmsd_yaml::from_str(yaml).expect("valid YAML")
     }
 
     #[test]
