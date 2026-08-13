@@ -1,20 +1,20 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: NOT STARTED (2026-08-09).** Stage 2 was incomplete when
-> this was written; milestones M6-M8 have since landed - see
-> `STAGE2_PLAN.md` §0 for the current state. Stage 3 has no plan yet:
-> this document records goals, protocol names, and authentication
-> workflows in enough detail to produce a good plan after Stage 2
-> lands. Spec references are to `~/Source/wifi_docs/`
-> (`802.11-2020.pdf`, `802.11-2024.pdf`, `wpa2.pdf`, `wpa3_v3.3.pdf`).
+> **Status: NOT STARTED (2026-08-09).** Stage 2 has since completed
+> (all exit criteria met, M1-M8; M9 removed). Stage 3 has no plan
+> yet: this document records goals, protocol names, and
+> authentication workflows in enough detail to produce a good plan.
+> Spec references are to `~/Source/wifi_docs/` (`802.11-2020.pdf`,
+> `802.11-2024.pdf`, `wpa2.pdf`, `wpa3_v3.3.pdf`).
 >
 > **Design note (2026-08):** `shulid` provides no IPC interface for
 > live configuration; Stage 3 features land as engine work +
 > config-schema fields activated by daemon restart.  Goals 1-3 below
 > were updated in the 2026-08 iwd/wpa_supplicant audit; Goal 4 was
 > added by it and later **moved to Stage 2** (roaming is needed in
-> the home WiFi environment); Goal 5 was added by the audit.
+> the home WiFi environment); Goal 5 was added by the audit; Goal 6
+> (wired 802.1X) was added 2026-08-13.
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 
@@ -156,13 +156,74 @@ pick per deployment need:
   once IGTK installation (Stage 2 G1) is in; iwd advertises all four
   and prefers GMAC-256 > CMAC-256 > GMAC-128 > CMAC-128.
 
+## Goal 6 - Wired 802.1X (EAPOL over Ethernet)
+
+**Added 2026-08-13.** IEEE 802.1X port-based access control on wired
+NICs.  Unlike the WiFi enterprise goals (Goal 2/3), there is **no
+association, no 4-way handshake, and no key installation**: the
+supplicant runs EAP over EAPOL directly on the Ethernet link, and on
+EAP-Success the switch/authenticator opens the port.  No PMK/PTK
+exists on wired 802.1X - the output of authentication is port
+authorization (plus optionally MACsec later, which is out of scope).
+
+**Workflow (high level):**
+1. Bring the NIC up; the controlled port is blocked.
+2. Optionally send EAPOL-Start; exchange EAPOL frames
+   (EAP-Request/Identity, EAP-Response, method frames,
+   EAP-Success/Failure) on ethertype `0x888E`.
+3. On EAP-Success the port is authorized; shulid then applies the
+   existing static / DHCPv4 / IPv6 config (reuse
+   `src/daemon/{dhcp,ip}.rs`).
+4. On EAP-Failure or timeout, retry with backoff (reuse the daemon's
+   retry-loop pattern).
+
+**Transport differences vs WiFi (important):**
+* No nl80211: EAPOL TX/RX is fully in userspace over a raw
+  AF_PACKET socket (nix + tokio `AsyncFd`, same approach as mozim's
+  DHCPv4 socket) with a BPF filter for ethertype `0x888E`.
+* No kernel key install and no control-port-over-netlink.
+* Wired EAPOL is addressed to the PAE group address
+  `01:80:c2:00:00:03` or the authenticator's MAC.
+
+**Reuse from Goal 2:**
+* The EAP peer state machine (RFC 4137) and EAP method stack
+  (EAP-TLS first) are shared; Goal 2 should land the common `eap`
+  module before this goal starts.
+* EAPOL framing: extend `ieee80211::eapol` with EAPOL type 0 (EAP)
+  frames - today only EAPOL-Key is parsed.
+* The credential model (identity, CA cert, client cert/key,
+  server-name validation) is shared.
+
+**Scope:**
+* Initial: EAP-TLS end-to-end on one wired NIC (matches Goal 2's
+  method choice).
+* Config: a new top-level daemon section (e.g. `ethernets:` with a
+  per-NIC `eap:` block), distinct from `wifis:`; every field maps
+  through the lib config.
+* `shulid` runs wired and WiFi clients concurrently (one task per
+  interface, mirroring the Stage 2 M7 multi-interface pattern).
+* Out of scope: MACsec, MAC Authentication Bypass (MAB), and 802.1X
+  over WiFi (that is Goal 2/3); PEAP/TTLS follow Goal 2's method
+  order.
+
+**Open questions before planning:**
+* Test rig for a wired authenticator: hostapd `driver=wired` +
+  FreeRADIUS, or a minimal in-test EAP server (hostapd wired support
+  needs checking).
+* Whether the library gets a `WiredClient` parallel to `WifiClient`
+  or a unified EAP client - decide after Goal 2's EAP module shape.
+* Raw-socket helper placement (a small `afpacket` module in shuli vs
+  reusing mozim-style code).
+
 ## Cross-cutting notes for the future Stage 3 plan
 
-* All goals **reuse the existing 4-Way Handshake and key-install
-  path**; the new work is (a) PMK *sources* (EAP/MSK for Enterprise,
-  PMKSA cache for FT) and (b) AKM-specific KDF/MIC/cipher variants
-  (SHA-1 vs SHA-256 vs SHA-384, CCMP vs GCMP-256).  PBKDF2/PRF for
-  WPA2-PSK is done.
+* All **WiFi** goals **reuse the existing 4-Way Handshake and
+  key-install path**; the new work is (a) PMK *sources* (EAP/MSK for
+  Enterprise, PMKSA cache for FT) and (b) AKM-specific KDF/MIC/cipher
+  variants (SHA-1 vs SHA-256 vs SHA-384, CCMP vs GCMP-256).
+  PBKDF2/PRF for WPA2-PSK is done.  Wired 802.1X (Goal 6) is the
+  exception: it stops at EAP-Success / port authorization and never
+  enters the 4-way handshake.
 * Crypto stays on the actual stack - **`p256` + `aws-lc-rs`** (the
   RustCrypto suite originally proposed in Stage 1 was replaced); the
   only expected addition is a TLS stack (`rustls`) for EAP-TLS.  New
