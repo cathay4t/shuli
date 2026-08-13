@@ -10,6 +10,10 @@
 // zeroed).
 
 const EAPOL_VERSION: u8 = 2;
+/// EAPOL type 0: an EAP packet (RFC 3748 / 802.1X).  Used by WiFi
+/// 802.1X (Goal 2) and wired 802.1X (Goal 6); the EAPOL-Key type 3 is
+/// handled by the rest of this module.
+const EAPOL_TYPE_EAP: u8 = 0;
 const EAPOL_TYPE_KEY: u8 = 3;
 const EAPOL_KEY_DESCRIPTOR_RSN: u8 = 2;
 
@@ -41,6 +45,30 @@ const KEY_INFO_MIC: u16 = 0x0100;
 const KEY_INFO_SECURE: u16 = 0x0200;
 const KEY_INFO_REQUEST: u16 = 0x0800;
 const KEY_INFO_ENCRYPTED_DATA: u16 = 0x1000;
+
+/// Build an EAPOL frame (version + type 0 + length) carrying an EAP
+/// packet.
+#[allow(dead_code)] // EAP transport API: wired into 802.1X in M3/M4
+pub fn build_eapol_eap_frame(eap: &[u8]) -> Vec<u8> {
+    let mut pdu = vec![EAPOL_VERSION, EAPOL_TYPE_EAP];
+    pdu.extend_from_slice(&(eap.len() as u16).to_be_bytes());
+    pdu.extend_from_slice(eap);
+    pdu
+}
+
+/// Parse an EAPOL frame and return the EAP payload it carries.
+/// Returns `None` for non-EAP EAPOL types or truncated frames.
+#[allow(dead_code)] // EAP transport API: wired into 802.1X in M3/M4
+pub fn parse_eapol_eap_frame(pdu: &[u8]) -> Option<&[u8]> {
+    if pdu.len() < 4 || pdu[1] != EAPOL_TYPE_EAP {
+        return None;
+    }
+    let len = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
+    if pdu.len() < 4 + len {
+        return None;
+    }
+    Some(&pdu[4..4 + len])
+}
 
 /// EAPOL-Key frame parsed fields.
 #[derive(Debug, Clone)]

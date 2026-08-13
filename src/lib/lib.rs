@@ -4,6 +4,8 @@ mod auth;
 mod client;
 mod config;
 mod crypto;
+#[allow(dead_code)] // EAP transport API: wired into WiFi 802.1X in M4
+mod eap;
 mod error;
 mod ieee80211;
 mod mac;

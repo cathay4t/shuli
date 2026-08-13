@@ -5,6 +5,7 @@ mod crypto_ft;
 mod crypto_handshake4;
 mod crypto_kdf;
 mod crypto_sae;
+mod eap;
 mod ieee80211_auth;
 mod ieee80211_eapol;
 mod pmksa;
