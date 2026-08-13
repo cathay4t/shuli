@@ -9,7 +9,10 @@ use rustls::{ServerConfig, ServerConnection};
 
 use crate::{
     ErrorKind,
-    eap::{EapMethod, TYPE_TLS},
+    eap::{
+        CODE_REQUEST, CODE_RESPONSE, CODE_SUCCESS, EapAction, EapMethod,
+        EapPacket, EapPeer, EapState, TYPE_IDENTITY, TYPE_TLS,
+    },
     eap_tls::{
         EAP_TLS_FLAG_START, EapTlsMethod, build_tls_message, cert_from_pem,
         client_config, key_from_pem, parse_tls_message,
@@ -53,9 +56,9 @@ fn test_tls_message_framing_roundtrip() {
     assert_eq!(flags & 0x80, 0x80, "L bit set");
     assert_eq!(parsed, data);
 
-    // Empty data is the RFC 5216 ACK (zero-length message).
-    assert!(build_tls_message(b"").is_empty());
-    let (flags, parsed) = parse_tls_message(b"").unwrap();
+    // Empty data is the RFC 5216 ACK: a one-octet flags field.
+    assert_eq!(build_tls_message(b""), vec![0]);
+    let (flags, parsed) = parse_tls_message(&[0]).unwrap();
     assert_eq!(flags, 0);
     assert!(parsed.is_empty());
 
@@ -179,5 +182,82 @@ fn test_eap_tls_verifies_server_certificate() {
     assert!(
         failed,
         "client must reject a server certificate from an unknown CA"
+    );
+}
+
+/// Drive the complete EAP flow through the EapPeer state machine with
+/// the real EAP-TLS method: Identity, TLS handshake, MSK, Success.
+#[test]
+fn test_eap_peer_full_tls_exchange() {
+    let mut peer = EapPeer::new("shuli-test".to_string());
+    let ca = cert_from_pem(CA_PEM).expect("CA PEM");
+    let cert = cert_from_pem(CLIENT_PEM).expect("client PEM");
+    let key = key_from_pem(CLIENT_KEY_PEM).expect("client key PEM");
+    let config = client_config(&[ca], vec![cert], key).expect("client config");
+    peer.set_method(Box::new(
+        EapTlsMethod::new(config, SERVER_NAME).expect("method"),
+    ));
+    let mut server = server_connection();
+
+    // 1. Identity exchange.
+    let request = EapPacket::build(CODE_REQUEST, 1, Some(TYPE_IDENTITY), b"");
+    let action = peer
+        .handle_packet(&EapPacket::parse(&request).unwrap())
+        .unwrap();
+    let EapAction::Respond(response) = action else {
+        panic!("expected identity response");
+    };
+    let identity = EapPacket::parse(&response).unwrap();
+    assert_eq!(identity.code, CODE_RESPONSE);
+    assert_eq!(identity.type_, Some(TYPE_IDENTITY));
+    assert_eq!(identity.body, b"shuli-test");
+
+    // 2. EAP-TLS handshake.
+    let mut server_tx = Vec::new();
+    let mut first = true;
+    let mut rounds = 0;
+    loop {
+        let tls_body = if first {
+            first = false;
+            vec![EAP_TLS_FLAG_START]
+        } else {
+            build_tls_message(&server_tx)
+        };
+        server_tx.clear();
+        let request =
+            EapPacket::build(CODE_REQUEST, 2, Some(TYPE_TLS), &tls_body);
+        let action = peer
+            .handle_packet(&EapPacket::parse(&request).unwrap())
+            .unwrap();
+        let EapAction::Respond(response) = action else {
+            panic!("expected TLS response");
+        };
+        let response = EapPacket::parse(&response).unwrap();
+        assert_eq!(response.type_, Some(TYPE_TLS));
+        let (_, tls_data) =
+            parse_tls_message(&response.body).expect("parse TLS body");
+        if !tls_data.is_empty() {
+            server.read_tls(&mut Cursor::new(tls_data)).expect("read");
+        }
+        server.process_new_packets().expect("server process");
+        server.write_tls(&mut server_tx).expect("server write");
+
+        rounds += 1;
+        assert!(rounds < 20, "TLS handshake did not converge");
+        if !server.is_handshaking() && peer.msk().is_some() {
+            break;
+        }
+    }
+
+    // 3. EAP-Success authorizes the port.
+    let success = EapPacket::build(CODE_SUCCESS, 3, None, b"");
+    let action = peer
+        .handle_packet(&EapPacket::parse(&success).unwrap())
+        .unwrap();
+    assert_eq!(action, EapAction::Success);
+    assert_eq!(peer.state(), EapState::Success);
+    assert!(
+        peer.msk().expect("MSK") != [0u8; 64],
+        "MSK must be non-zero"
     );
 }

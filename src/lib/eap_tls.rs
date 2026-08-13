@@ -17,6 +17,7 @@ use rustls::{
 
 use crate::{
     ErrorKind, WifiError,
+    config::EapConfig,
     eap::{EapMethod, MSK_LEN, TYPE_TLS},
 };
 
@@ -26,10 +27,11 @@ pub(crate) const EAP_TLS_FLAG_M: u8 = 0x40;
 pub(crate) const EAP_TLS_FLAG_START: u8 = 0x20;
 
 /// Build an EAP-TLS message body from TLS data.  Empty data produces
-/// the zero-length ACK message (RFC 5216 §2.1).
+/// the one-octet ACK (flags = 0, no TLS data; RFC 5216 §2.1,
+/// `eap_peer_tls_build_ack` in wpa_supplicant).
 pub(crate) fn build_tls_message(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
-        return Vec::new();
+        return vec![0];
     }
     let mut msg = Vec::with_capacity(1 + 4 + data.len());
     msg.push(EAP_TLS_FLAG_L);
@@ -104,6 +106,10 @@ pub(crate) struct EapTlsMethod {
     server_name: ServerName<'static>,
     /// TLS bytes received but not yet consumed by rustls.
     rx_buf: Vec<u8>,
+    /// TLS bytes of the current (possibly fragmented) EAP-TLS message.
+    rx_fragments: Vec<u8>,
+    /// Total TLS length announced by the L bit of the first fragment.
+    rx_expected_len: Option<u32>,
     msk: Option<[u8; MSK_LEN]>,
 }
 
@@ -119,8 +125,51 @@ impl EapTlsMethod {
             config,
             server_name,
             rx_buf: Vec::new(),
+            rx_fragments: Vec::new(),
+            rx_expected_len: None,
             msk: None,
         })
+    }
+
+    /// Build the method from an [`EapConfig`] (certificate PEM files on
+    /// disk).  Identity is handled by the [`EapPeer`](crate::eap::EapPeer).
+    pub(crate) fn from_config(config: &EapConfig) -> Result<Self, WifiError> {
+        let read_pem = |path: &std::path::Path, what: &str| {
+            std::fs::read_to_string(path).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    format!("read {what} {}: {e}", path.display()),
+                )
+            })
+        };
+        let ca_path = config.ca_cert.as_ref().ok_or_else(|| {
+            WifiError::new(ErrorKind::InvalidConfig, "EAP: ca_cert required")
+        })?;
+        let client_cert = config.client_cert.as_ref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: client_cert required",
+            )
+        })?;
+        let client_key = config.client_key.as_ref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: client_key required",
+            )
+        })?;
+        let server_name = config.server_name.as_deref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: server_name required",
+            )
+        })?;
+
+        let ca = cert_from_pem(&read_pem(ca_path, "CA certificate")?)?;
+        let cert =
+            cert_from_pem(&read_pem(client_cert, "client certificate")?)?;
+        let key = key_from_pem(&read_pem(client_key, "client key")?)?;
+        let config = client_config(&[ca], vec![cert], key)?;
+        Self::new(config, server_name)
     }
 }
 
@@ -154,10 +203,34 @@ impl EapMethod for EapTlsMethod {
             ));
         };
 
-        // Feed TLS bytes (possibly fragmented across EAP messages);
-        // rustls buffers partial records internally.
+        // RFC 5216 receive-side fragmentation: a message with the M
+        // bit (or one whose L bit announced a longer total) is
+        // acknowledged with an empty EAP-TLS response and only fed to
+        // TLS once all fragments arrived.
+        if flags & EAP_TLS_FLAG_L != 0 {
+            if body.len() < 5 {
+                return Err(WifiError::new(
+                    ErrorKind::HandshakeFailed,
+                    "EAP-TLS message with L bit but no length field",
+                ));
+            }
+            let len = u32::from_be_bytes(body[1..5].try_into().unwrap());
+            self.rx_expected_len = Some(len);
+        }
         if !data.is_empty() {
-            self.rx_buf.extend_from_slice(data);
+            self.rx_fragments.extend_from_slice(data);
+        }
+        let complete = self
+            .rx_expected_len
+            .is_none_or(|len| self.rx_fragments.len() as u32 >= len)
+            && flags & EAP_TLS_FLAG_M == 0;
+        if !complete {
+            // ACK this fragment; the rest of the message is coming.
+            return Ok(build_tls_message(&[]));
+        }
+        self.rx_expected_len = None;
+        if !self.rx_fragments.is_empty() {
+            self.rx_buf.append(&mut self.rx_fragments);
             while !self.rx_buf.is_empty() {
                 let used = conn
                     .read_tls(&mut Cursor::new(&self.rx_buf))

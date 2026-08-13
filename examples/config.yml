@@ -22,6 +22,12 @@ wifis:
     # roaming_threshold: -70
     # wowlan: true # arm WoWLAN (disconnect + GTK rekey failure) while
     #              # connected; off by default
+    # eap: # WPA2-Enterprise / 802.1X (EAP-TLS)
+    #   identity: user@example.org
+    #   ca_cert: /etc/shuli/ca.pem
+    #   client_cert: /etc/shuli/client.pem
+    #   client_key: /etc/shuli/client.key
+    #   server_name: radius.example.org
     dns:
       nameservers:
         - 2001:db8:1::254

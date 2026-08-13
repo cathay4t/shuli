@@ -243,6 +243,29 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Stage 3 M4: WPA2-Enterprise (AKM 1) with hostapd's internal
+/// EAP-TLS server.  Certificate paths are filled in by the test.
+fn wpa2_eap_hostapd_conf() -> &'static str {
+    r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-EAP
+wpa=2
+wpa_key_mgmt=WPA-EAP
+rsn_pairwise=CCMP
+ieee8021x=1
+eap_server=1
+tls_flags=[ENABLE-TLSv1.3]
+eap_user_file=/tmp/shuli_rs_test_eap_users
+ca_cert=/tmp/shuli_rs_test_certs/ca.pem
+server_cert=/tmp/shuli_rs_test_certs/server.pem
+private_key=/tmp/shuli_rs_test_certs/server.key
+ctrl_interface=/var/run/hostapd
+"
+}
+
 /// Run `hostapd_cli` against the test AP inside the test netns.
 fn hostapd_cli(args: &str) {
     hostapd_cli_if(AP_NIC, args);
@@ -779,6 +802,97 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
     assert!(
         ponged,
         "ICMP echo through the WPA2-PSK-SHA256 data path never \
+         succeeded:\n{last_err}"
+    );
+    client.shutdown().await;
+}
+
+/// Stage 3 M4: WPA2-Enterprise (802.1X / EAP-TLS, AKM 1) full flow:
+/// open-system auth, association, EAP identity + TLS over the control
+/// port, MSK -> PMK, 4-way handshake, and the encrypted data path.
+#[tokio::test]
+async fn wifi_client_wpa2_eap_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa2_eap_connect: test binary not running \
+             as root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+
+    // hostapd's internal EAP server reads its config from /tmp.
+    let cert_dir = "/tmp/shuli_rs_test_certs";
+    std::fs::create_dir_all(cert_dir).expect("create cert dir");
+    for (name, dest) in [
+        ("ca.pem", "ca.pem"),
+        ("server.pem", "server.pem"),
+        ("server.key", "server.key"),
+        ("client.pem", "client.pem"),
+        ("client.key", "client.key"),
+    ] {
+        let src = format!("{}/tests/certs/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::copy(&src, format!("{cert_dir}/{dest}")).expect("copy cert");
+    }
+    std::fs::write("/tmp/shuli_rs_test_eap_users", "\"shuli-test\" TLS\n")
+        .expect("write eap_user_file");
+
+    let _guard = WIFI_LOCK.lock().await;
+    let conf = wpa2_eap_hostapd_conf();
+    let _env = WifiTestEnv::setup(conf);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-EAP", None);
+    config.networks[0].eap = Some(crate::EapConfig {
+        identity: "shuli-test".to_string(),
+        ca_cert: Some(format!("{cert_dir}/ca.pem").into()),
+        client_cert: Some(format!("{cert_dir}/client.pem").into()),
+        client_key: Some(format!("{cert_dir}/client.key").into()),
+        server_name: Some("eap-tls.test".to_string()),
+    });
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.bss_info.security,
+        crate::SecurityType::Wpa2Ent,
+        "scan must classify the AP as WPA2-Enterprise"
+    );
+    assert!(
+        client.eap_pmk.is_some(),
+        "EAP-Success must have produced the PMK from the MSK"
+    );
+
+    // Data path over the installed PTK.
+    sh_ok("ip addr add 192.0.2.100/24 dev test-wlan0");
+    let mut ponged = false;
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("ping -I test-wlan0 -c 1 -W 1 192.0.2.1")
+            .output()
+            .expect("spawn ping");
+        if out.status.success() {
+            ponged = true;
+            break;
+        }
+        last_err = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sh_allow_fail("ip addr del 192.0.2.100/24 dev test-wlan0");
+    assert!(
+        ponged,
+        "ICMP echo through the WPA2-Enterprise data path never \
          succeeded:\n{last_err}"
     );
     client.shutdown().await;

@@ -10,7 +10,7 @@
 
 use crate::{
     ETH_ALEN, ErrorKind, WifiClient, WifiError, crypto::sae::SaeAuth,
-    scan::SecurityType,
+    eap::EapPeer, eap_tls::EapTlsMethod, scan::SecurityType,
 };
 
 /// What the client should do after processing an authentication frame.
@@ -201,6 +201,30 @@ impl WifiClient {
         self.sae_sync = 0;
         self.sae_commit_auth_data.clear();
         self.sae_hnp_attempted = false;
+        self.eap_peer = None;
+        self.eap_pmk = None;
+
+        // Stage 3 M4: WPA2-Enterprise runs EAP over the control port
+        // after association.  Prepare the EAP peer + EAP-TLS method
+        // now, so the first EAP-Request/Identity finds it ready.
+        if matches!(
+            self.bss_info.security,
+            SecurityType::Wpa2Ent | SecurityType::Wpa2EntSha256
+        ) {
+            let eap_cfg = self.network.eap.as_ref().ok_or_else(|| {
+                WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    format!(
+                        "{:?} network requires EAP credentials",
+                        self.bss_info.security
+                    ),
+                )
+            })?;
+            let method = EapTlsMethod::from_config(eap_cfg)?;
+            let mut peer = EapPeer::new(eap_cfg.identity.clone());
+            peer.set_method(Box::new(method));
+            self.eap_peer = Some(peer);
+        }
 
         // G4: a cached PMKSA for the selected BSS replaces the full
         // authentication (SAE) with open-system auth + a PMKID-bearing

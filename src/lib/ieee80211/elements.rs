@@ -196,6 +196,45 @@ pub fn wpa2_psk_sha256_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
     buf
 }
 
+/// Build the RSNE for WPA2-Enterprise (802.1X, AKM 00-0F-AC:1,
+/// CCMP-128) with optional management frame protection.
+pub fn wpa2_ent_ie() -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::Ieee8021x],
+            rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
+            pmkids: vec![],
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}
+
+/// Build the RSNE for WPA2-Enterprise with SHA-256 algorithms
+/// (802.1X-SHA256, AKM 00-0F-AC:5, CCMP-128) with optional
+/// management frame protection.
+pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::Ieee8021xSha256],
+            rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
+            pmkids: vec![],
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}
+
 /// Build the FT-SAE RSNE element only (AKM 00-0F-AC:9). Used where the
 /// RSNE and RSNXE must stay separate elements (FT Reassociation Request:
 /// the FTIE MIC covers RSNE, MDIE, FTIE, then RSNXE in that order).

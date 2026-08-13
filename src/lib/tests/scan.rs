@@ -65,8 +65,10 @@ fn test_open_bss_without_security_ies() {
 fn test_supported_akms_are_recognized() {
     // Regression: every supported AKM keeps its type.
     for (akm, expected) in [
+        (1, SecurityType::Wpa2Ent),
         (2, SecurityType::Wpa2Psk),
         (6, SecurityType::Wpa2PskSha256),
+        (5, SecurityType::Wpa2EntSha256),
         (4, SecurityType::FtPsk),
         (8, SecurityType::Sae),
         (9, SecurityType::FtSae),
@@ -80,13 +82,13 @@ fn test_supported_akms_are_recognized() {
 
 #[test]
 fn test_unsupported_akm_is_not_open() {
-    // WPA-Enterprise / 802.1X (AKM 1) is not joinable; classifying it
-    // open would associate without encryption.
-    let sec = detect_security(&rsne_ie(1));
+    // Suite-B-192 (AKM 12) is not joinable yet; classifying it open
+    // would associate without encryption.
+    let sec = detect_security(&rsne_ie(12));
     assert_eq!(
         sec.security,
         SecurityType::Unsupported,
-        "AKM 00-0F-AC:1 must classify as Unsupported"
+        "AKM 00-0F-AC:12 must classify as Unsupported"
     );
 }
 

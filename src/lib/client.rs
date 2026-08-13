@@ -29,6 +29,7 @@ use crate::{
         kdf,
         owe::{self, OweAuth},
     },
+    eap::{EapAction, EapPacket, EapPeer},
     ieee80211::{auth, eapol, elements},
     nl80211::connect,
     pmksa::{
@@ -139,6 +140,11 @@ pub struct WifiClient {
     pub(crate) owe: Option<OweAuth>,
     /// WPA2-PSK PMK derived via PBKDF2 (only for WPA2-PSK networks).
     pub(crate) psk_pmk: Option<[u8; 32]>,
+    /// Stage 3 M4: EAP peer state machine for 802.1X networks
+    /// (WPA2-Enterprise / later wired 802.1X).
+    pub(crate) eap_peer: Option<EapPeer>,
+    /// PMK derived from the EAP MSK after EAP-Success (enterprise).
+    pub(crate) eap_pmk: Option<[u8; 32]>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
     /// PMKSA cache (Stage 2 G4): reconnects and roams to a cached BSS
@@ -302,6 +308,8 @@ impl WifiClient {
             auth: None,
             owe: None,
             psk_pmk: None,
+            eap_peer: None,
+            eap_pmk: None,
             fourway: None,
             pmksa_cache: PmksaCache::default(),
             pmksa_in_use: None,
@@ -849,6 +857,45 @@ impl WifiClient {
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(elements::wpa2_psk_sha256_ie(), mfp)
+                                .await
+                            {
+                                log::warn!("ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                            }
+                        } else if self.bss_info.security
+                            == SecurityType::Wpa2Ent
+                        {
+                            // WPA2-Enterprise (AKM 1): open-system
+                            // auth, associate, then run EAP over the
+                            // control port.
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending \
+                                 WPA2-Enterprise ASSOCIATE"
+                            );
+                            let mfp = self
+                                .bss_info
+                                .ap_mfp_capable()
+                                .then_some(Nl80211UseMfp::Required);
+                            if let Err(e) = self
+                                .associate(elements::wpa2_ent_ie(), mfp)
+                                .await
+                            {
+                                log::warn!("ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                            }
+                        } else if self.bss_info.security
+                            == SecurityType::Wpa2EntSha256
+                        {
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending \
+                                 WPA2-Enterprise-SHA256 ASSOCIATE"
+                            );
+                            let mfp = self
+                                .bss_info
+                                .ap_mfp_capable()
+                                .then_some(Nl80211UseMfp::Required);
+                            if let Err(e) = self
+                                .associate(elements::wpa2_ent_sha256_ie(), mfp)
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -1423,6 +1470,13 @@ impl WifiClient {
 
     /// Handle an EAPOL-Key frame (4-way handshake / group rekey).
     async fn handle_control_port_frame(&mut self, frame: &[u8]) {
+        // Stage 3 M4: 802.1X EAP frames (EAPOL type 0) arrive on the
+        // same control port as EAPOL-Key frames.
+        if let Some(eap_pdu) = eapol::parse_eapol_eap_frame(frame) {
+            self.handle_eap_frame(eap_pdu).await;
+            return;
+        }
+
         let Some(parsed) = eapol::parse_eapol_key_frame(frame) else {
             log::debug!("unparseable control port frame");
             return;
@@ -1535,6 +1589,30 @@ impl WifiClient {
                                 (
                                     pmk,
                                     elements::wpa2_psk_sha256_ie(),
+                                    MicAlg::AesCmac,
+                                )
+                            }
+                            SecurityType::Wpa2Ent => {
+                                let Some(pmk) = self.eap_pmk else {
+                                    log::warn!(
+                                        "no EAP PMK for 4-way handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (pmk, elements::wpa2_ent_ie(), MicAlg::HmacSha1)
+                            }
+                            SecurityType::Wpa2EntSha256 => {
+                                let Some(pmk) = self.eap_pmk else {
+                                    log::warn!(
+                                        "no EAP PMK for 4-way handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (
+                                    pmk,
+                                    elements::wpa2_ent_sha256_ie(),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1858,6 +1936,58 @@ impl WifiClient {
             log::debug!("unhandled EAPOL-Key frame type");
         }
     }
+
+    /// Stage 3 M4: feed an EAP packet into the 802.1X peer state
+    /// machine and act on its output (response / Success / Failure).
+    async fn handle_eap_frame(&mut self, eap_pdu: &[u8]) {
+        let Some(packet) = EapPacket::parse(eap_pdu) else {
+            log::warn!("unparseable EAP packet ({} bytes)", eap_pdu.len());
+            return;
+        };
+        let Some(peer) = self.eap_peer.as_mut() else {
+            log::warn!("EAP frame without an active EAP peer");
+            return;
+        };
+        match peer.handle_packet(&packet) {
+            Ok(EapAction::Respond(response)) => {
+                let frame = eapol::build_eapol_eap_frame(&response);
+                if let Err(e) = send_ctrl_port_frame(
+                    &mut self.conn_handle,
+                    self.if_index,
+                    self.bss_info.bssid,
+                    &frame,
+                )
+                .await
+                {
+                    log::warn!("send EAP response failed: {e}");
+                    self.state = WifiState::Failed;
+                }
+            }
+            Ok(EapAction::Success) => {
+                let Some(msk) = peer.msk() else {
+                    log::warn!("EAP-Success without an MSK");
+                    self.state = WifiState::FailedAuthentication;
+                    return;
+                };
+                let mut pmk = [0u8; 32];
+                pmk.copy_from_slice(&msk[..32]);
+                self.eap_pmk = Some(pmk);
+                log::info!(
+                    "EAP success - PMK derived from MSK; awaiting 4-way \
+                     handshake"
+                );
+            }
+            Ok(EapAction::Failure) => {
+                log::warn!("EAP failure");
+                self.state = WifiState::FailedAuthentication;
+            }
+            Ok(EapAction::Wait) => {}
+            Err(e) => {
+                log::warn!("EAP error: {e}");
+                self.state = WifiState::FailedAuthentication;
+            }
+        }
+    }
 }
 
 impl WifiClient {
@@ -2133,6 +2263,8 @@ impl WifiClient {
             SecurityType::Wpa2PskSha256 => {
                 elements::wpa2_psk_sha256_ie_with_pmkid(pmkid)
             }
+            SecurityType::Wpa2Ent => elements::wpa2_ent_ie(),
+            SecurityType::Wpa2EntSha256 => elements::wpa2_ent_sha256_ie(),
             SecurityType::FtPsk => elements::ft_psk_ie(pmkid),
             SecurityType::Owe => elements::owe_ie(),
             SecurityType::Open | SecurityType::Unsupported => Vec::new(),

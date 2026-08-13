@@ -6,7 +6,10 @@
 //! (`/etc/shuli/config.yml` or `$1`).  It targets small systems
 //! that don't run nipart: full static or full dynamic (DHCP).
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use shuli::{ErrorKind, WifiError};
@@ -67,6 +70,10 @@ pub(crate) struct WifiEntry {
     /// wpa_supplicant's `wowlan_triggers` config).
     #[serde(default)]
     pub wowlan: bool,
+    /// EAP credentials for WPA2-Enterprise / 802.1X networks
+    /// (EAP-TLS).  `None` for PSK/SAE/open networks.
+    #[serde(default)]
+    pub eap: Option<EapEntry>,
     /// SAE PWE derivation for WPA3-Personal networks: `auto` (default,
     /// H2E with hunting-and-pecking fallback), `h2e`, or `hnp`.
     #[serde(default)]
@@ -81,6 +88,22 @@ pub(crate) struct WifiEntry {
     pub ipv4: Option<IpConfig>,
     #[serde(default)]
     pub ipv6: Option<IpConfig>,
+}
+
+/// EAP credential settings as configured in the YAML file; mapped onto
+/// `shuli::EapConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct EapEntry {
+    #[serde(default)]
+    pub identity: String,
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    #[serde(default)]
+    pub client_key: Option<String>,
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -141,6 +164,15 @@ impl ShuliConfig {
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
             network.wowlan = entry.wowlan;
+            if let Some(eap) = entry.eap.as_ref() {
+                network.eap = Some(shuli::EapConfig {
+                    identity: eap.identity.clone(),
+                    ca_cert: eap.ca_cert.as_ref().map(PathBuf::from),
+                    client_cert: eap.client_cert.as_ref().map(PathBuf::from),
+                    client_key: eap.client_key.as_ref().map(PathBuf::from),
+                    server_name: eap.server_name.clone(),
+                });
+            }
             network.sae_pwe = entry.sae_pwe.to_lib();
             config.networks.push(network);
         }
@@ -236,5 +268,31 @@ wifis:
         );
         let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(wifi.networks[0].wowlan);
+    }
+
+    #[test]
+    fn eap_entry_maps_to_eap_config() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Corp
+    eap:
+      identity: user@example.org
+      ca_cert: /etc/shuli/ca.pem
+      client_cert: /etc/shuli/client.pem
+      client_key: /etc/shuli/client.key
+      server_name: radius.example.org
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        let eap = wifi.networks[0].eap.as_ref().expect("EAP config");
+        assert_eq!(eap.identity, "user@example.org");
+        assert_eq!(
+            eap.ca_cert.as_deref(),
+            Some(std::path::Path::new("/etc/shuli/ca.pem"))
+        );
+        assert_eq!(eap.server_name.as_deref(), Some("radius.example.org"));
     }
 }

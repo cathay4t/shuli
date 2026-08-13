@@ -100,7 +100,7 @@ impl EapPacket {
 /// One EAP method (e.g. EAP-TLS in M3).  The peer hands every
 /// method-type Request to the active method; the method returns the
 /// Response body (EAP framing is applied by [`EapPeer`]).
-pub trait EapMethod {
+pub trait EapMethod: Send {
     /// This method's EAP Type (e.g. [`TYPE_TLS`]).
     fn method_type(&self) -> u8;
 

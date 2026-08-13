@@ -66,6 +66,8 @@ solicitation), with DNS taken from the lease when not set in the config.
 default is off): while connected, shuli arms the wiphy's supported
 disconnect and GTK-rekey-failure triggers so the device can wake the
 host on suspend, and it reconnects after a GTK-rekey-failure wake.
+An `eap:` block (identity, CA/client certificates, server name) turns
+the network into WPA2-Enterprise with EAP-TLS (802.1X).
 
 A ready-to-use example lives in [`examples/config.yml`](examples/config.yml).
 

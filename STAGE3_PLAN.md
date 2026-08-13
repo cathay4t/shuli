@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M4 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-13, M5 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -37,8 +37,12 @@
   model, and in-process handshake tests (matching peer/server MSK,
   unknown-CA rejection).
 * **M4 — WPA2-Enterprise on WiFi (Goal 2):** AKM `00-0F-AC:1` /
-  `:5`, EAP over the nl80211 control port, MSK -> PMK -> 4-way;
-  hostapd `WPA-EAP` + internal EAP server integration test.
+  `:5`, EAP over the nl80211 control port, MSK -> PMK -> 4-way.
+  **Done 2026-08-13:** AKM 1/5 classification + RSNE builders,
+  EAPOL type-0 handling on the control port, EAP peer wired into
+  `WifiClient` (EAP-TLS -> MSK -> PMK), daemon `eap:` YAML mapping,
+  and a hostapd internal EAP-TLS server integration test
+  (`tls_flags=[ENABLE-TLSv1.3]`) with the encrypted data path.
 * **M5 — WPA3-Enterprise (Goal 3):** mandatory-PMF SHA-256 AKM `:5`
   suite; 192-bit CNSA tier (AKM `:12`, GCMP-256, HMAC-SHA384,
   BIP-GMAC-256, P-384 EAP-TLS) as stretch.
