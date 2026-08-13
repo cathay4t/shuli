@@ -442,17 +442,28 @@ impl WifiClient {
     /// Opportunistic Key Caching for a roam target: derive the PMKID the
     /// target BSS *would* use for the current PMK and cache it, so the
     /// reconnecting state machine offers it in the (Re)Association RSNE.
-    /// Only meaningful for HMAC-based PMKIDs (WPA2-PSK); SAE PMKIDs come
-    /// from the SAE exchange itself and cannot be cloned.
+    /// Only meaningful for PSK-family PMKIDs (WPA2-PSK / PSK-SHA256);
+    /// SAE PMKIDs come from the SAE exchange itself and cannot be
+    /// cloned.
     fn synthesize_okc_entry(&mut self, target: &BssInfo) {
-        if self.bss_info.security != SecurityType::Wpa2Psk {
-            return;
-        }
         let Some(pmk) = self.psk_pmk else {
             return;
         };
-        let pmkid =
-            crate::crypto::kdf::pmkid_sha1(&pmk, &target.bssid, &self.mac);
+        let (pmkid, mic_alg) = match self.bss_info.security {
+            SecurityType::Wpa2Psk => (
+                crate::crypto::kdf::pmkid_sha1(&pmk, &target.bssid, &self.mac),
+                crate::crypto::handshake4::MicAlg::HmacSha1,
+            ),
+            SecurityType::Wpa2PskSha256 => (
+                crate::crypto::kdf::pmkid_sha256(
+                    &pmk,
+                    &target.bssid,
+                    &self.mac,
+                ),
+                crate::crypto::handshake4::MicAlg::AesCmac,
+            ),
+            _ => return,
+        };
         log::debug!(
             "OKC: offering cloned PMKID {pmkid:02x?} to {:02x?}",
             target.bssid
@@ -462,7 +473,7 @@ impl WifiClient {
             bssid: target.bssid,
             pmkid,
             pmk,
-            mic_alg: crate::crypto::handshake4::MicAlg::HmacSha1,
+            mic_alg,
             expires: std::time::Instant::now()
                 + std::time::Duration::from_secs(
                     crate::pmksa::PMK_LIFETIME_SECS,

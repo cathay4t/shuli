@@ -229,6 +229,20 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Stage 3 M1: WPA2-Personal with SHA-256 algorithms (AKM 6).
+const WPA2_PSK_SHA256_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PSK-SHA256
+wpa=2
+wpa_key_mgmt=WPA-PSK-SHA256
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 /// Run `hostapd_cli` against the test AP inside the test netns.
 fn hostapd_cli(args: &str) {
     hostapd_cli_if(AP_NIC, args);
@@ -703,6 +717,69 @@ async fn wifi_client_wpa2_psk_connect() {
     assert!(
         ponged,
         "ICMP echo through the WPA2-PSK data path never succeeded:\n{last_err}"
+    );
+    client.shutdown().await;
+}
+
+/// Stage 3 M1: WPA2-PSK-SHA256 (AKM 00-0F-AC:6) full 4-way handshake
+/// against hostapd, with the encrypted data path exercised end-to-end
+/// (KDV 3 + AES-CMAC MIC + KDF-Hash-Length PTK must be correct for
+/// traffic to flow).
+#[tokio::test]
+async fn wifi_client_wpa2_psk_sha256_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wpa2_psk_sha256_connect: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_SHA256_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK-SHA256", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.bss_info.security,
+        crate::SecurityType::Wpa2PskSha256,
+        "scan must classify the AP as WPA2-PSK-SHA256"
+    );
+
+    // Data path: same ICMP check as the plain WPA2-PSK test.
+    sh_ok("ip addr add 192.0.2.100/24 dev test-wlan0");
+    let mut ponged = false;
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("ping -I test-wlan0 -c 1 -W 1 192.0.2.1")
+            .output()
+            .expect("spawn ping");
+        if out.status.success() {
+            ponged = true;
+            break;
+        }
+        last_err = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sh_allow_fail("ip addr del 192.0.2.100/24 dev test-wlan0");
+    assert!(
+        ponged,
+        "ICMP echo through the WPA2-PSK-SHA256 data path never \
+         succeeded:\n{last_err}"
     );
     client.shutdown().await;
 }

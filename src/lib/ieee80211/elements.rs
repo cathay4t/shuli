@@ -170,6 +170,32 @@ pub fn wpa2_psk_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
     buf
 }
 
+/// Build the RSNE for WPA2-Personal with SHA-256 algorithms
+/// (PSK-SHA256, AKM 00-0F-AC:6, CCMP-128). Same security policy as
+/// [`wpa2_psk_ie`] (optional MFP), only the AKM suite differs.
+pub fn wpa2_psk_sha256_ie() -> Vec<u8> {
+    wpa2_psk_sha256_ie_with_pmkid(None)
+}
+
+/// [`wpa2_psk_sha256_ie`] carrying a PMKID (PMKSA caching / roaming).
+/// PSK-SHA256 uses the SHA-256 PMKID derivation.
+pub fn wpa2_psk_sha256_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::PskSha256],
+            rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
+            pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
+            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}
+
 /// Build the FT-SAE RSNE element only (AKM 00-0F-AC:9). Used where the
 /// RSNE and RSNXE must stay separate elements (FT Reassociation Request:
 /// the FTIE MIC covers RSNE, MDIE, FTIE, then RSNXE in that order).

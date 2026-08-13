@@ -53,6 +53,95 @@ fn test_ptk_derivation() {
     assert_eq!(state.tk().unwrap().len(), 16);
 }
 
+/// Stage 3 M1: PSK-SHA256 (AKM 00-0F-AC:6) uses KDF-Hash-Length for
+/// the PTK and AES-CMAC MIC with Key Descriptor Version 3, and echoes
+/// KDV 3 in Messages 2 and 4.
+#[test]
+fn test_psk_sha256_kdv3_handshake() {
+    let pmk = [0x01u8; 32];
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    // Message 1 with Key Descriptor Version 3 (AES-128-CMAC), as sent
+    // by a PSK-SHA256 AP.
+    let msg1_key_info = 0x0080 | 0x0008 | 0x0003; // ack + pairwise + KDV 3
+    let msg1 = eapol::build_eapol_key_pdu(
+        msg1_key_info,
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let msg2 = state
+        .process_message_1(
+            &parsed1.key_nonce,
+            parsed1.replay_counter,
+            parsed1.key_info,
+        )
+        .unwrap();
+    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    assert_eq!(eapol::desc_version(m2.key_info), 3);
+    let kck = state.kck().unwrap();
+    let m2_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2)).unwrap();
+    assert_eq!(m2.key_mic, m2_mic);
+
+    // Message 3 with an encrypted GTK; MIC verified with AES-CMAC.
+    let kek = state.kek().unwrap();
+    let gtk = [0x77u8; 16];
+    let mut kde = vec![
+        0xDD,
+        (6 + gtk.len()) as u8,
+        0x00,
+        0x0F,
+        0xAC,
+        0x01,
+        0x01,
+        0x00,
+    ];
+    kde.extend_from_slice(&gtk);
+    let mut padded = kde.clone();
+    while padded.len() < 16 || !padded.len().is_multiple_of(8) {
+        padded.push(0);
+    }
+    let wrapped = aes_key_wrap(&kek, &padded).unwrap();
+    let msg3_key_info =
+        0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000 | 0x0003;
+    let mut msg3 = eapol::build_eapol_key_pdu(
+        msg3_key_info,
+        16,
+        2,
+        &[0u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
+    );
+    let msg3_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
+    eapol::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let (msg4, kdes) = state.process_message_3(&parsed3).unwrap();
+    assert_eq!(kdes.gtk, Some((1, gtk.to_vec())));
+    let m4 = eapol::parse_eapol_key_frame(&msg4).unwrap();
+    assert_eq!(eapol::desc_version(m4.key_info), 3);
+    let m4_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg4)).unwrap();
+    assert_eq!(m4.key_mic, m4_mic);
+}
+
 #[test]
 fn test_mic_roundtrip() {
     let kck = [0xAAu8; 16];

@@ -30,6 +30,9 @@ pub enum SecurityType {
     Open,
     /// RSNE with AKM 00-0F-AC:2 — WPA2-PSK.
     Wpa2Psk,
+    /// RSNE with AKM 00-0F-AC:6 — WPA2-Personal with SHA-256
+    /// algorithms (PSK-SHA256): KDF-Hash-Length + AES-CMAC.
+    Wpa2PskSha256,
     /// RSNE with AKM 00-0F-AC:18 — OWE (opportunistic encryption).
     Owe,
     /// RSNE with AKM 00-0F-AC:8 — WPA3-SAE.
@@ -39,8 +42,8 @@ pub enum SecurityType {
     /// RSNE with AKM 00-0F-AC:9 — FT over WPA3-SAE (802.11r).
     FtSae,
     /// Encrypted with a security mode shuli does not support (e.g.
-    /// WPA-Enterprise / 802.1X, PSK-SHA256, WPA1/TKIP). Never connect
-    /// to such a BSS: it must not be treated as open.
+    /// WPA-Enterprise / 802.1X, WPA1/TKIP). Never connect to such a
+    /// BSS: it must not be treated as open.
     Unsupported,
 }
 
@@ -312,9 +315,9 @@ impl WifiClient {
             );
             let bss_security = detect_security(ies);
             // M7 (G5): never present an AP shuli cannot actually join
-            // (WPA-Enterprise, PSK-SHA256, WPA1/TKIP, ...) as a
-            // connection candidate - classifying it open would make the
-            // client associate without encryption.
+            // (WPA-Enterprise, WPA1/TKIP, ...) as a connection
+            // candidate - classifying it open would make the client
+            // associate without encryption.
             if bss_security.security == SecurityType::Unsupported {
                 log::info!(
                     "BSS {bssid:02x?} (ssid={bss_ssid}) has no supported \
@@ -346,6 +349,7 @@ const IE_ID_RSNXE: u8 = 244;
 const IE_ID_MDIE: u8 = 54;
 const IE_ID_VENDOR: u8 = 0xDD;
 const AKM_PSK: u8 = 2;
+const AKM_PSK_SHA256: u8 = 6;
 const AKM_FT_PSK: u8 = 4;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
@@ -371,9 +375,9 @@ pub(crate) struct BssScanSecurity {
 ///
 /// A BSS is `Unsupported` when it is encrypted in a way shuli cannot
 /// join - an RSNE whose AKMs are all unknown (WPA-Enterprise / 802.1X,
-/// PSK-SHA256, ...), an RSNE with a TKIP group cipher, or a WPA1 AP
-/// (vendor WPA IE, no RSNE). Such a BSS must never fall through to
-/// `Open`, which would make the client associate without encryption.
+/// ...), an RSNE with a TKIP group cipher, or a WPA1 AP (vendor WPA IE,
+/// no RSNE). Such a BSS must never fall through to `Open`, which would
+/// make the client associate without encryption.
 pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let mut rsne = Vec::new();
     let mut rsnxe = Vec::new();
@@ -434,6 +438,7 @@ fn akm_rank(security: SecurityType) -> u8 {
         SecurityType::FtPsk => 4,
         SecurityType::Sae => 3,
         SecurityType::Owe => 2,
+        SecurityType::Wpa2PskSha256 => 2,
         SecurityType::Wpa2Psk => 1,
         SecurityType::Open | SecurityType::Unsupported => 0,
     }
@@ -486,6 +491,7 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
                 AKM_SAE => SecurityType::Sae,
                 AKM_OWE => SecurityType::Owe,
                 AKM_PSK => SecurityType::Wpa2Psk,
+                AKM_PSK_SHA256 => SecurityType::Wpa2PskSha256,
                 _ => SecurityType::Unsupported,
             };
             if akm_rank(candidate) > akm_rank(best) {

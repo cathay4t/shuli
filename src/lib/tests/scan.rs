@@ -66,6 +66,7 @@ fn test_supported_akms_are_recognized() {
     // Regression: every supported AKM keeps its type.
     for (akm, expected) in [
         (2, SecurityType::Wpa2Psk),
+        (6, SecurityType::Wpa2PskSha256),
         (4, SecurityType::FtPsk),
         (8, SecurityType::Sae),
         (9, SecurityType::FtSae),
@@ -79,17 +80,33 @@ fn test_supported_akms_are_recognized() {
 
 #[test]
 fn test_unsupported_akm_is_not_open() {
-    // WPA-Enterprise / 802.1X (AKM 1) and PSK-SHA256 (AKM 6) are not
-    // joinable; classifying them open would associate without
-    // encryption.
-    for akm in [1, 6] {
-        let sec = detect_security(&rsne_ie(akm));
-        assert_eq!(
-            sec.security,
-            SecurityType::Unsupported,
-            "AKM 00-0F-AC:{akm} must classify as Unsupported"
-        );
-    }
+    // WPA-Enterprise / 802.1X (AKM 1) is not joinable; classifying it
+    // open would associate without encryption.
+    let sec = detect_security(&rsne_ie(1));
+    assert_eq!(
+        sec.security,
+        SecurityType::Unsupported,
+        "AKM 00-0F-AC:1 must classify as Unsupported"
+    );
+}
+
+#[test]
+fn test_mixed_psk_and_psk_sha256_prefers_sha256() {
+    // An RSNE advertising both WPA2-PSK (2) and PSK-SHA256 (6) must
+    // pick the stronger SHA-256 AKM.
+    let body = vec![
+        0x01, 0x00, // version 1
+        0x00, 0x0F, 0xAC, 0x04, // group cipher: CCMP
+        0x01, 0x00, // pairwise cipher count
+        0x00, 0x0F, 0xAC, 0x04, // pairwise cipher: CCMP
+        0x02, 0x00, // AKM suite count: 2
+        0x00, 0x0F, 0xAC, 0x02, // AKM: PSK
+        0x00, 0x0F, 0xAC, 0x06, // AKM: PSK-SHA256
+    ];
+    let mut ies = vec![48, body.len() as u8];
+    ies.extend_from_slice(&body);
+    let sec = detect_security(&ies);
+    assert_eq!(sec.security, SecurityType::Wpa2PskSha256);
 }
 
 #[test]

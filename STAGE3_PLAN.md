@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M1 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-13, M2 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -21,8 +21,9 @@
 * **M1 — WPA2-Personal PSK-SHA256 (Goal 1):** AKM `00-0F-AC:6`
   autodetection (`SecurityType::Wpa2PskSha256`), KDF-Hash-Length +
   AES-CMAC 4-way (Key Descriptor Version 3), SHA-256 PMKID for PMKSA
-  caching, optional PMF.  Unit tests + hostapd
-  `wpa_key_mgmt=WPA-PSK-SHA256` integration test.
+  caching and OKC, optional PMF.  **Done 2026-08-13:** unit tests
+  (scan classification/ranking, KDV-3 handshake roundtrip) + hostapd
+  `wpa_key_mgmt=WPA-PSK-SHA256` integration test with data path.
 * **M2 — EAP transport (Goal 2 core):** EAPOL type 0 framing, EAP peer
   state machine (RFC 4137), EAP-TLS via rustls (RFC 5216
   fragmentation), MSK export, credential config model.  Unit tests +

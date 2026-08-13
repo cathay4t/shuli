@@ -834,6 +834,26 @@ impl WifiClient {
                                 log::warn!("ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
                             }
+                        } else if self.bss_info.security
+                            == SecurityType::Wpa2PskSha256
+                        {
+                            // WPA2-PSK-SHA256 (AKM 6): same association
+                            // shape as WPA2-PSK, different RSNE.
+                            log::info!(
+                                "open-system AUTHENTICATE ok - sending \
+                                 WPA2-PSK-SHA256 ASSOCIATE"
+                            );
+                            let mfp = self
+                                .bss_info
+                                .ap_mfp_capable()
+                                .then_some(Nl80211UseMfp::Required);
+                            if let Err(e) = self
+                                .associate(elements::wpa2_psk_sha256_ie(), mfp)
+                                .await
+                            {
+                                log::warn!("ASSOCIATE failed: {e}");
+                                self.state = WifiState::Failed;
+                            }
                         } else if self.bss_info.security == SecurityType::FtPsk
                         {
                             // FT-PSK: open-system auth, then associate
@@ -1504,6 +1524,20 @@ impl WifiClient {
                                 };
                                 (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
                             }
+                            SecurityType::Wpa2PskSha256 => {
+                                let Some(pmk) = self.psk_pmk else {
+                                    log::warn!(
+                                        "no PSK PMK for 4-way handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (
+                                    pmk,
+                                    elements::wpa2_psk_sha256_ie(),
+                                    MicAlg::AesCmac,
+                                )
+                            }
                             _ => {
                                 // SAE
                                 let Some(pmk) =
@@ -2096,6 +2130,9 @@ impl WifiClient {
             SecurityType::Sae => elements::sae_ie_with_pmkid(pmkid),
             SecurityType::FtSae => elements::ft_sae_ie(pmkid),
             SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid(pmkid),
+            SecurityType::Wpa2PskSha256 => {
+                elements::wpa2_psk_sha256_ie_with_pmkid(pmkid)
+            }
             SecurityType::FtPsk => elements::ft_psk_ie(pmkid),
             SecurityType::Owe => elements::owe_ie(),
             SecurityType::Open | SecurityType::Unsupported => Vec::new(),
@@ -2178,6 +2215,22 @@ impl WifiClient {
                                 &self.mac,
                             ),
                             MicAlg::HmacSha1,
+                        )
+                    }
+                    // PSK-SHA256: PMKID = Truncate-128(HMAC-SHA256(PMK,
+                    // "PMK Name" || AA || SPA)).
+                    SecurityType::Wpa2PskSha256 => {
+                        let Some(pmk) = self.psk_pmk else {
+                            return;
+                        };
+                        (
+                            pmk,
+                            kdf::pmkid_sha256(
+                                &pmk,
+                                &self.bss_info.bssid,
+                                &self.mac,
+                            ),
+                            MicAlg::AesCmac,
                         )
                     }
                     _ => return,

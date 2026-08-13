@@ -209,6 +209,7 @@ impl WifiClient {
             self.bss_info.security,
             SecurityType::Sae
                 | SecurityType::Wpa2Psk
+                | SecurityType::Wpa2PskSha256
                 | SecurityType::FtSae
                 | SecurityType::FtPsk
         ) && let Some(entry) = self
@@ -237,7 +238,9 @@ impl WifiClient {
             if self.pmksa_in_use.is_none()
                 && matches!(
                     self.bss_info.security,
-                    SecurityType::Wpa2Psk | SecurityType::FtPsk
+                    SecurityType::Wpa2Psk
+                        | SecurityType::Wpa2PskSha256
+                        | SecurityType::FtPsk
                 )
             {
                 let password =
