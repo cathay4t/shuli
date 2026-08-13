@@ -33,6 +33,7 @@ p256 = { version = "0.14", features = ["arithmetic", "hash2curve", "ecdh", "getr
 getrandom = { version = "0.4", features = ["sys_rng"] }
 aws-lc-rs = "1"
 nispor = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 
 [workspace.dependencies.rtnetlink]
 version = "0.21"

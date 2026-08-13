@@ -74,6 +74,9 @@ pub struct NetworkConfig {
     /// suspend. Defaults to `false` - opt in per network (matches
     /// wpa_supplicant, where `wowlan_triggers` is unset by default).
     pub wowlan: bool,
+    /// EAP credentials for 802.1X networks (WPA-Enterprise / wired
+    /// 802.1X). `None` for PSK/SAE/open networks.
+    pub eap: Option<EapConfig>,
     /// SAE PWE derivation mode (WPA3-Personal only). Defaults to
     /// [`SaePwe::Auto`]: hash-to-element first, hunting-and-pecking
     /// fallback for HnP-only APs.
@@ -88,6 +91,7 @@ impl NetworkConfig {
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
             wowlan: false,
+            eap: None,
             sae_pwe: SaePwe::Auto,
         }
     }
@@ -104,6 +108,28 @@ impl NetworkConfig {
         self.wowlan = enabled;
         self
     }
+
+    /// Attach EAP credentials to this network (802.1X).
+    pub fn set_eap(&mut self, eap: EapConfig) -> &mut Self {
+        self.eap = Some(eap);
+        self
+    }
+}
+
+/// EAP credential configuration (Stage 3 M3): identity, certificate
+/// paths, and the TLS server name used for certificate validation.
+#[derive(Debug, Clone, Default)]
+pub struct EapConfig {
+    /// EAP identity (outer identity) sent in the Identity exchange.
+    pub identity: String,
+    /// PEM CA certificate used to validate the EAP server.
+    pub ca_cert: Option<std::path::PathBuf>,
+    /// PEM client certificate (EAP-TLS).
+    pub client_cert: Option<std::path::PathBuf>,
+    /// PEM client private key (EAP-TLS).
+    pub client_key: Option<std::path::PathBuf>,
+    /// TLS server name for certificate validation (SNI / SAN match).
+    pub server_name: Option<String>,
 }
 
 impl WifiConfig {

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M3 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-13, M4 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -31,8 +31,11 @@
   tests for packet roundtrips, Identity/Notification/Nak handling,
   method delegation and Success/Failure transitions.
 * **M3 — EAP-TLS via rustls (Goal 2):** RFC 5216 fragmentation,
-  TLS record plumbing, MSK export, credential config model; EAP-TLS
-  handshake test.
+  TLS record plumbing, MSK export, credential config model.
+  **Done 2026-08-13:** rustls TLS 1.3 method with RFC 9190 MSK
+  exporter (`EXPORTER_EAP_TLS_Key_Material`), `EapConfig` credential
+  model, and in-process handshake tests (matching peer/server MSK,
+  unknown-CA rejection).
 * **M4 — WPA2-Enterprise on WiFi (Goal 2):** AKM `00-0F-AC:1` /
   `:5`, EAP over the nl80211 control port, MSK -> PMK -> 4-way;
   hostapd `WPA-EAP` + internal EAP server integration test.

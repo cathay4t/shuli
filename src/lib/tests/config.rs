@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{NetworkConfig, WifiConfig};
+use crate::config::{EapConfig, NetworkConfig, WifiConfig};
 
 #[test]
 fn wifi_config_requires_networks() {
@@ -64,4 +64,24 @@ fn wowlan_is_opt_in_and_can_be_enabled() {
     assert!(network.wowlan);
     network.set_wowlan(false);
     assert!(!network.wowlan);
+}
+
+#[test]
+fn eap_config_defaults_to_none_and_can_be_set() {
+    let mut network = NetworkConfig::new("Enterprise-WIFI");
+    assert!(network.eap.is_none(), "EAP credentials must be opt-in");
+    let eap = EapConfig {
+        identity: "user@example.org".to_string(),
+        ca_cert: Some("/etc/shuli/ca.pem".into()),
+        client_cert: Some("/etc/shuli/client.pem".into()),
+        client_key: Some("/etc/shuli/client.key".into()),
+        server_name: Some("radius.example.org".to_string()),
+    };
+    network.set_eap(eap);
+    let eap = network.eap.as_ref().expect("EAP config set");
+    assert_eq!(eap.identity, "user@example.org");
+    assert_eq!(
+        eap.client_cert.as_deref(),
+        Some(std::path::Path::new("/etc/shuli/client.pem"))
+    );
 }
