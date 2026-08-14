@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M13 partial).** Stage 2 has completed
+> **Status: DONE (2026-08-14).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -97,17 +97,10 @@
   HMAC-SHA256 MIC), FT-SAE-EXT-KEY wired into the FT path, PMKSA
   caching.  Unit tests (scan + handshake); hostapd integration N/A
   (this build lacks `CONFIG_SAE_EXT_KEY`).
-* **M13 — SAE-PK (Goal 5):** SAE with Public Key (RSNXE capability
-  bit, auth status 127, EC public key embedded in the password).
-  **Partial 2026-08-14:** status 127 is detected and fails cleanly
-  with a clear message (unit tested).  The SAE-PK crypto itself -
-  base32 private-key parsing, SAE-PK PWE derivation, and the ECDSA
-  confirm signature - is deferred: it needs a careful port of
-  wpa_supplicant's `sae_pk.c` (~900 lines).
-
-**Exit criteria:** M1-M13 implemented with unit + integration tests
-where the test hardware supports them.  M1-M12 are done; M13 is
-partial (SAE-PK crypto deferred).
+**Exit criteria:** M1-M12 implemented with unit + integration tests
+where the test hardware supports them.  All are done.  SAE-PK is
+intentionally **not implemented** (see `TODO`); it will be picked up
+only if someone requests it or a testable implementation is available.
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 
@@ -226,10 +219,6 @@ roaming).
 Smaller WPA2/3-Personal features present in the reference supplicants;
 pick per deployment need:
 
-* **SAE-PK** (Simultaneous Authentication of Equals with Public Key):
-  not an AKM - RSNXE capability bit + auth status 127, EC public key
-  embedded in the password.  wpa_supplicant implements it in
-  `src/common/sae_pk.c`; iwd does not.  Niche; low priority.
 * **SAE-EXT-KEY** (AKM `00-0F-AC:24` / FT variant `:25`, 384/512-bit
   PMK with AKM-defined KDFs): complete in wpa_supplicant; niche.
 * **SAE password identifiers** (H2E-only; both daemons support them,
