@@ -1,25 +1,32 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli)
 
-**A pure-Rust Linux WiFi authentication library and daemon.**
+**Linux WiFi authentication library and daemon in Rust**
 
-The `shuli` crate authenticates a Linux station (client) to modern WiFi
-networks entirely in Rust, talking directly to the kernel's [nl80211] netlink
-interface via [`wl-nl80211`] - no `wpa_supplicant`, no C dependencies.
-Authentication crypto (SAE, the EAPOL 4-way handshake) runs in userspace;
-data-frame encryption stays in the kernel/hardware after keys are installed.
-A bundled `shulid` daemon drives the crate from a YAML config file.
+The `shuli` crate and `shulid` daemon authenticates a Linux station (client) to
+modern WiFi networks written entirely in Rust.
 
-[nl80211]: https://wireless.wiki.kernel.org/en/developers/documentation/nl80211
-[`wl-nl80211`]: https://github.com/rust-netlink/wl-nl80211
+## Features
 
-## ⚠️ Work in progress
-
-This project is in **early development and is not yet usable**. APIs, config
-schema, and on-disk formats will change without notice. Do not use it in
-production. There is no stable release.
+* **WPA3-Personal** - SAE with hash-to-element and hunting-and-pecking
+  fallback, anti-clogging tokens, and optional SAE password identifiers.
+* **WPA2-Personal** - PSK (AKM 2) and PSK-SHA256 (AKM 6).
+* **WPA3-OWE** - WPA3 open networks.
+* **WPA2-Enterprise and WPA3-Enterprise** - 802.1X / EAP-TLS (rustls,
+  TLS 1.3, RFC 9190 MSK), mandatory PMF for WPA3.
+* **Roaming** - 802.11r fast BSS transition (FT-PSK / FT-SAE),
+  802.11v BTM, and signal-triggered roam scans; PMKSA caching and OKC.
+* **Wired 802.1X** - EAP-TLS over Ethernet (raw AF_PACKET EAPOL).
+* **Hardening** - WoWLAN (opt-in), OCV, Extended Key ID, Transition
+  Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
+  CMAC-128).
+* **Rust crate** - Async crate for WIFI authentication.
+* **shulid daemon** - YAML configuration, one client per interface,
+  systemd unit, handling both WIFI and IP config.
 
 ## Using the daemon for simple WiFi configuration
+
+Full configuration document are stored in
+[`examples/config.yml`](examples/config.yml).
 
 `shulid` reads YAML from `/etc/shuli/config.yml` (or a path given on the
 command line).  It targets small systems that don't run nipart: each WiFi
@@ -29,6 +36,13 @@ entry is configured either fully static or fully dynamic (DHCP):
 ---
 version: 1
 wifis:
+  - ssid: Test-WIFI-OPEN
+    interface: any
+    ipv4:
+      # automatically set IP, route and DNS
+      auto: true
+    ipv6:
+      auto: true
   - ssid: Test-WIFI
     password: "12345678"
     # wowlan: true # arm WoWLAN triggers (disconnect, GTK rekey
@@ -51,34 +65,9 @@ wifis:
         - ip: 2001:db8:1::1
           prefix-length: 64
       gateway: 2001:db8:1::254
-  - ssid: Test-WIFI-OPEN
-    interface: any
-    ipv4:
-      auto: true
-    ipv6:
-      auto: true
 ```
 
-With `auto: true` the IPv4 address comes from DHCP (and IPv6 from router
-solicitation), with DNS taken from the lease when not set in the config.
-`interface: any` (or absent) picks the first available WiFi interface.
-`wowlan: true` enables Wake-on-WLAN for that network (opt-in; the
-default is off): while connected, shuli arms the wiphy's supported
-disconnect and GTK-rekey-failure triggers so the device can wake the
-host on suspend, and it reconnects after a GTK-rekey-failure wake.
-An `eap:` block (identity, CA/client certificates, server name) turns
-the network into WPA2-Enterprise with EAP-TLS (802.1X).
-`sae_password_id` sets an optional SAE password identifier for
-WPA3-Personal networks (H2E-only; mixed into the PWE and the commit).
-`ocv: true` enables Operating Channel Validation for the network
-(OCVC RSN capability, OCI in Message 2, AP OCI verified in Message 3
-and group rekeys).
-`ext_key_id: true` enables Extended Key ID (pairwise key id 0/1
-rotation for lossless PTK rekeys; requires driver support).
-
-Wired 802.1X ports go in their own `ethernets:` section: each entry
-authenticates one Ethernet NIC with EAP-TLS (no WiFi association or
-4-way handshake) and then applies the same static/DHCP/IPv6 config:
+Wired 802.1X authentication:
 
 ```yaml
 ethernets:
@@ -93,8 +82,6 @@ ethernets:
       auto: true
 ```
 
-A ready-to-use example lives in [`examples/config.yml`](examples/config.yml).
-
 ## Installing and running shulid
 
 Build and install the daemon, the systemd unit, and the default config:
@@ -108,13 +95,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now shulid
 ```
 
-`shulid` must run with root privileges (or equivalent capabilities):
-it configures the WiFi interface over nl80211/rtnetlink (`CAP_NET_ADMIN`),
-runs DHCPv4 on a raw packet socket (`CAP_NET_RAW`), writes IPv6 sysctls,
-and updates `/etc/resolv.conf`. The packaged
-[`shulid.service`](packaging/shulid.service) therefore runs as root and
-reads `/etc/shuli/config.yml` by default. Change that file and
-`systemctl restart shulid` to apply new networks.
+`shulid` must run with root privileges (`CAP_NET_ADMIN` and `CAP_NET_RAW`)
+to start WIFI and DHCP, writes IPv6 sysctls, and updates `/etc/resolv.conf`.
 
 ## Using the `shuli` crate
 
@@ -124,11 +106,6 @@ Add these lines to your Cargo.toml:
 [dependencies.shuli]
 package = "shuli"
 version = "0.1.0"
-git = "https://github.com/cathay4t/shuli"
-
-[dependencies.tokio]
-version = "1"
-features = ["rt-multi-thread", "macros"]
 ```
 
 The crate exposes a `WifiClient` that drives the whole connection flow -
@@ -141,7 +118,9 @@ use shuli::{WifiClient, WifiConfig, WifiState};
 #[tokio::main]
 async fn main() -> Result<(), shuli::WifiError> {
     let mut config = WifiConfig::new("wlan0");
-    config.add_network("Test-WIFI", Some("12345678"));
+    config.add_network("Test-WIFI", Some("12345678"))
+        .add_network("Office-WIFI", Some("office-secret"))
+        .add_network("Guest-Open", None);
 
     let mut client = WifiClient::init(config).await?;
 
@@ -149,35 +128,27 @@ async fn main() -> Result<(), shuli::WifiError> {
     // Failed states retry on the next call; errors are logged and retried.
     loop {
         match client.run().await {
-            Ok(WifiState::ConnectedWithoutOffloadRekey)
-            | Ok(WifiState::ConnectedWithOffloadRekey) => break,
-            Ok(_) => {}
+            Ok(WifiState::ConnectedWithoutOffloadRekey) |
+            Ok(WifiState::ConnectedWithOffloadRekey) => {
+                println!("WIFI connected");
+            }
+            Ok(s) => {
+                // Keep the client alive to handle rekey and disconnection
+                println!("WIFI state {s}");
+            }
             Err(e) => eprintln!("{e}"),
-        }
-    }
-    println!("connected to Test-WIFI");
-
-    // Keep the client alive to drain events (group rekeys, disconnects).
-    loop {
-        if let Err(e) = client.run().await {
-            eprintln!("{e}");
         }
     }
 }
 ```
 
-To scan for and connect to several networks, add them to the config - a
-single scan schedule probes for all of them and the strongest matching
-BSS wins:
+## Contact
 
-```rust
-let mut config = WifiConfig::new("wlan0");
-config
-    .add_network("Home-WIFI", Some("home-secret"))
-    .add_network("Office-WIFI", Some("office-secret"))
-    .add_network("Guest-Open", None);
-```
+ * Crate github issue
+ * Use Matrix room: [`#rust-netlink:fedora.im`][matrix_room_url]
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+[matrix_room_url]: https://app.element.io/#/room/#rust-netlink:fedora.im
