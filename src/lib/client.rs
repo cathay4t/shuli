@@ -1764,6 +1764,17 @@ impl WifiClient {
                 }
             };
 
+            // Stage 3 M9: the AP can tell the STA to stop using legacy
+            // AKMs via the Transition Disable KDE.  shuli's config is
+            // file-driven (no runtime profile update), so record it in
+            // the log; future reconnects pick up a config change.
+            if let Some(bitmap) = kdes.transition_disable {
+                log::info!(
+                    "AP Transition Disable KDE: 0x{bitmap:02x} ({})",
+                    fmt_transition_disable(bitmap)
+                );
+            }
+
             if let Err(e) = send_ctrl_port_frame(
                 &mut self.conn_handle,
                 self.if_index,
@@ -2268,6 +2279,30 @@ fn is_fatal_disconnect_reason(reason: Option<Nl80211EventReason>) -> bool {
     )
 }
 
+/// Stage 3 M9: human-readable names for the Transition Disable KDE
+/// bitmap bits (bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
+/// 3 = Enhanced Open).
+fn fmt_transition_disable(bitmap: u8) -> String {
+    let mut flags = Vec::new();
+    if bitmap & 0x01 != 0 {
+        flags.push("WPA3-Personal");
+    }
+    if bitmap & 0x02 != 0 {
+        flags.push("SAE-PK");
+    }
+    if bitmap & 0x04 != 0 {
+        flags.push("WPA3-Enterprise");
+    }
+    if bitmap & 0x08 != 0 {
+        flags.push("Enhanced Open");
+    }
+    if flags.is_empty() {
+        "none".to_string()
+    } else {
+        flags.join(", ")
+    }
+}
+
 async fn send_ctrl_port_frame(
     conn_handle: &mut Nl80211ConnectionHandle,
     if_index: u32,
@@ -2644,8 +2679,8 @@ mod tests {
     };
 
     use super::{
-        desired_wowlan_triggers, is_fatal_disconnect_reason,
-        wowlan_wakeup_requires_reconnect,
+        desired_wowlan_triggers, fmt_transition_disable,
+        is_fatal_disconnect_reason, wowlan_wakeup_requires_reconnect,
     };
 
     /// M7 (G5): reasons 2 (PREV_AUTH_NOT_VALID) and 23
@@ -2718,5 +2753,21 @@ mod tests {
             Nl80211WowlanWakeup::Any
         ]));
         assert!(!wowlan_wakeup_requires_reconnect(&[]));
+    }
+
+    /// Stage 3 M9: the Transition Disable bitmap maps to the AKM group
+    /// names (bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
+    /// 3 = Enhanced Open).
+    #[test]
+    fn transition_disable_bitmap_names() {
+        let s = fmt_transition_disable(0x01);
+        assert!(s.contains("WPA3-Personal"));
+        assert!(!s.contains("Enhanced Open"));
+        let s = fmt_transition_disable(0x08);
+        assert!(s.contains("Enhanced Open"));
+        assert!(!s.contains("WPA3-Personal"));
+        let s = fmt_transition_disable(0x0F);
+        assert_eq!(s, "WPA3-Personal, SAE-PK, WPA3-Enterprise, Enhanced Open");
+        assert_eq!(fmt_transition_disable(0), "none");
     }
 }

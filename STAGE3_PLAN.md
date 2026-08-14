@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M9 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M10 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -73,6 +73,10 @@
   survival.
 * **M9 — Transition Disable (Goal 5):** parse the Transition Disable
   KDE from 4-way Message 3 and persist/log the disabled AKM groups.
+  **Done 2026-08-14:** WFA Transition Disable KDE (OUI 50:6F:9A,
+  type 0x20) parsed into `KeyDataKdes` and logged with human-readable
+  bit names (file-driven config: log-only).  Unit tests + hostapd
+  `transition_disable=0x08` integration test.
 * **M10 — OCV (Goal 5):** operating class/channel validation for
   non-FT AKMs (`ocv` config), validating rekeys and handshakes.
 * **M11 — Extended Key ID (Goal 5):** pairwise key id 0/1 rotation

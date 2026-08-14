@@ -272,6 +272,9 @@ fn test_parse_key_data_kdes_all() {
     key_data.extend_from_slice(&gtk);
     key_data.extend_from_slice(&build_mgmt_key_kde(9, 4, &ipn, &igtk));
     key_data.extend_from_slice(&build_mgmt_key_kde(10, 6, &ipn, &bigtk));
+    // Transition Disable KDE (WFA OUI 50:6F:9A, type 0x20, bitmap 0x09
+    // = WPA3-Personal + WPA3-Enterprise disabled).
+    key_data.extend_from_slice(&[0xDD, 5, 0x50, 0x6F, 0x9A, 0x20, 0x09]);
     key_data.extend_from_slice(&rsne);
     key_data.extend_from_slice(&rsnxe);
 
@@ -291,6 +294,7 @@ fn test_parse_key_data_kdes_all() {
     );
     assert_eq!(kdes.rsne.as_deref(), Some(rsne.as_slice()));
     assert_eq!(kdes.rsnxe.as_deref(), Some(rsnxe.as_slice()));
+    assert_eq!(kdes.transition_disable, Some(0x09));
     // parse_gtk_kde keeps its GTK-only contract on top of the full parser.
     assert_eq!(parse_gtk_kde(&key_data), Some((2, gtk.to_vec())));
 }

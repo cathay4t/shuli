@@ -508,12 +508,18 @@ pub(crate) struct KeyDataKdes {
     pub rsne: Option<Vec<u8>>,
     /// The AP's RSNXE as a full element (ID 244 + length + body).
     pub rsnxe: Option<Vec<u8>>,
+    /// Transition Disable KDE bitmap (WFA OUI 50:6F:9A, type 0x20):
+    /// bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
+    /// 3 = Enhanced Open (Stage 3 M9).
+    pub transition_disable: Option<u8>,
 }
 
 const KDE_OUI: [u8; 3] = [0x00, 0x0F, 0xAC];
+const WFA_OUI: [u8; 3] = [0x50, 0x6F, 0x9A];
 const GTK_KDE_TYPE: u8 = 1;
 const IGTK_KDE_TYPE: u8 = 9;
 const BIGTK_KDE_TYPE: u8 = 10;
+const WFA_TRANSITION_DISABLE_TYPE: u8 = 0x20;
 const IE_ID_RSN: u8 = 48;
 const IE_ID_RSNXE: u8 = 244;
 
@@ -534,6 +540,13 @@ pub(crate) fn parse_key_data_kdes(key_data: &[u8]) -> KeyDataKdes {
         }
         let body = &key_data[body_start..body_end];
         match id {
+            0xDD if body.len() >= 4 && body[..3] == WFA_OUI => {
+                // WFA vendor KDEs: Transition Disable (type 0x20)
+                // carries a bitmap after the OUI + type.
+                if body[3] == WFA_TRANSITION_DISABLE_TYPE && body.len() >= 5 {
+                    kdes.transition_disable = Some(body[4]);
+                }
+            }
             0xDD if body.len() >= 4 && body[..3] == KDE_OUI => {
                 let data_type = body[3];
                 match data_type {
