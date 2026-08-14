@@ -136,6 +136,36 @@ pub fn negotiate_group_mgmt_cipher(ap_rsne: &[u8]) -> Nl80211CipherSuite {
     Nl80211CipherSuite::BipCmac128
 }
 
+/// Set or clear the OCV capability bit (bit 14) in the RSN
+/// capabilities of a built RSNE (Stage 3 M10).
+pub fn rsne_set_ocvc(rsne: &mut [u8], enabled: bool) {
+    if rsne.len() < 4 {
+        return;
+    }
+    let body = &rsne[2..];
+    if body.len() < 8 {
+        return;
+    }
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_off = 8 + pcount * 4;
+    if body.len() < akm_off + 2 {
+        return;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_off], body[akm_off + 1]]) as usize;
+    let cap_off = 2 + akm_off + 2 + acount * 4;
+    if rsne.len() < cap_off + 2 {
+        return;
+    }
+    let capab = u16::from_le_bytes([rsne[cap_off], rsne[cap_off + 1]]);
+    let capab = if enabled {
+        capab | 0x4000 // WPA_CAPABILITY_OCVC
+    } else {
+        capab & !0x4000
+    };
+    rsne[cap_off..cap_off + 2].copy_from_slice(&capab.to_le_bytes());
+}
+
 /// The RSNXE element advertising SAE Hash-to-Element support; included
 /// in FT Reassociation Requests (and their FTIE MIC) on FT-SAE.
 pub fn sae_rsnxe() -> Vec<u8> {

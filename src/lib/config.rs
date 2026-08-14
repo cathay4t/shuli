@@ -86,6 +86,11 @@ pub struct NetworkConfig {
     /// the SAE commit, and never falls back to hunting-and-pecking
     /// (password identifiers are H2E-only).
     pub sae_password_id: Option<String>,
+    /// Operating Channel Validation (OCV, Stage 3 M10): when `true`,
+    /// the STA advertises the OCVC RSN capability, sends its OCI in
+    /// 4-way Message 2, and verifies the AP's OCI in Message 3 and
+    /// group rekeys.  Defaults to `false`.
+    pub ocv: bool,
 }
 
 impl NetworkConfig {
@@ -99,6 +104,7 @@ impl NetworkConfig {
             eap: None,
             sae_pwe: SaePwe::Auto,
             sae_password_id: None,
+            ocv: false,
         }
     }
 
@@ -124,6 +130,12 @@ impl NetworkConfig {
     /// Set the optional SAE password identifier (WPA3-Personal).
     pub fn set_sae_password_id(&mut self, id: Option<&str>) -> &mut Self {
         self.sae_password_id = id.map(str::to_string);
+        self
+    }
+
+    /// Enable or disable Operating Channel Validation (OCV).
+    pub fn set_ocv(&mut self, enabled: bool) -> &mut Self {
+        self.ocv = enabled;
         self
     }
 }

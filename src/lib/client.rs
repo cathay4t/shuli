@@ -1568,16 +1568,24 @@ impl WifiClient {
                     // MDIE + FTIE from the association response join the
                     // RSNE in the Message 2 key data.
                     rsne.extend_from_slice(&ft.assoc_resp_ft_ies);
-                    self.fourway = Some(FourWayState::new_ft(
+                    if self.network.ocv {
+                        elements::rsne_set_ocvc(&mut rsne, true);
+                    }
+                    let mut fw = FourWayState::new_ft(
                         ft.pmk_r1.clone(),
                         self.mac,
                         self.bss_info.bssid,
                         rsne,
                         self.bss_info.ap_rsne.clone(),
                         self.bss_info.ap_rsnxe.clone(),
-                    ));
+                    );
+                    if !self.enable_ocv(&mut fw) {
+                        self.state = WifiState::Failed;
+                        return;
+                    }
+                    self.fourway = Some(fw);
                 } else {
-                    let (pmk, rsne, mic_alg) = if let Some(entry) =
+                    let (pmk, mut rsne, mic_alg) = if let Some(entry) =
                         self.pmksa_in_use.as_ref()
                     {
                         // G4: 4-way over a cached PMK. The RSNE must be
@@ -1691,7 +1699,10 @@ impl WifiClient {
                             }
                         }
                     };
-                    self.fourway = Some(FourWayState::new_with_ap_ies(
+                    if self.network.ocv {
+                        elements::rsne_set_ocvc(&mut rsne, true);
+                    }
+                    let mut fw = FourWayState::new_with_ap_ies(
                         &pmk,
                         mic_alg,
                         self.mac,
@@ -1699,7 +1710,12 @@ impl WifiClient {
                         rsne,
                         self.bss_info.ap_rsne.clone(),
                         self.bss_info.ap_rsnxe.clone(),
-                    ));
+                    );
+                    if !self.enable_ocv(&mut fw) {
+                        self.state = WifiState::Failed;
+                        return;
+                    }
+                    self.fourway = Some(fw);
                 }
             }
 
@@ -2318,6 +2334,28 @@ async fn send_ctrl_port_frame(
 }
 
 impl WifiClient {
+    /// Stage 3 M10: enable OCV on the 4-way state with our OCI derived
+    /// from the BSS frequency.  Returns false (and logs) when the
+    /// frequency cannot be mapped to an OCI.
+    fn enable_ocv(&self, fw: &mut FourWayState) -> bool {
+        if !self.network.ocv {
+            return true;
+        }
+        match crate::crypto::ocv::oci_from_freq(self.bss_info.freq_mhz) {
+            Some(oci) => {
+                fw.set_ocv(true, oci, self.bss_info.freq_mhz);
+                true
+            }
+            None => {
+                log::warn!(
+                    "OCV: cannot map BSS freq {} MHz to an OCI",
+                    self.bss_info.freq_mhz
+                );
+                false
+            }
+        }
+    }
+
     /// Send `NL80211_CMD_ASSOCIATE` for the selected BSS.
     ///
     /// `ie` carries the RSN element built for the network's security mode
@@ -2326,9 +2364,14 @@ impl WifiClient {
     /// for SAE and OWE, optional for WPA2-PSK (MFPC), absent for open.
     async fn associate(
         &mut self,
-        ie: Vec<u8>,
+        mut ie: Vec<u8>,
         mfp: Option<Nl80211UseMfp>,
     ) -> Result<(), WifiError> {
+        // Stage 3 M10: advertise the OCVC RSN capability when OCV is
+        // enabled for this network.
+        if self.network.ocv {
+            elements::rsne_set_ocvc(&mut ie, true);
+        }
         let mut builder = Nl80211Associate::new(self.if_index)
             .ssid(&self.network.ssid)
             .mac(self.bss_info.bssid)

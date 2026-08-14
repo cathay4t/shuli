@@ -431,6 +431,7 @@ mod tests {
             eap: None,
             sae_pwe: config::SaePweConfig::Auto,
             sae_password_id: None,
+            ocv: false,
             interface: interface.map(|s| s.to_string()),
             dns: None,
             ipv4: None,

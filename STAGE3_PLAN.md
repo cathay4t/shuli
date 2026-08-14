@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M10 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M11 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -79,6 +79,11 @@
   `transition_disable=0x08` integration test.
 * **M10 — OCV (Goal 5):** operating class/channel validation for
   non-FT AKMs (`ocv` config), validating rekeys and handshakes.
+  **Done 2026-08-14:** `ocv` config + OCVC RSN capability, OCI KDE in
+  4-way Message 2, and OCI verification in Message 3 and group rekeys
+  (20 MHz STA assumption; channel-width checks out of scope).  Unit +
+  handshake tests; hostapd integration N/A (this hostapd build lacks
+  `CONFIG_OCV`).
 * **M11 — Extended Key ID (Goal 5):** pairwise key id 0/1 rotation
   for lossless PTK rekey (AES-CC ciphers, driver support, two-phase
   RX-then-TX install).

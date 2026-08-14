@@ -19,6 +19,7 @@ wifis:
   - ssid: Test-WIFI
     password: "12345678"
     # sae_password_id: corp-id # optional SAE password identifier (H2E-only)
+    # ocv: true # operating channel validation
     # roaming: true
     # roaming_threshold: -70
     # wowlan: true # arm WoWLAN (disconnect + GTK rekey failure) while

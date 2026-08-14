@@ -4,9 +4,12 @@ use aws_lc_rs::key_wrap::{self, KeyWrap};
 
 use crate::{
     ErrorKind, WifiError,
-    crypto::handshake4::{
-        FourWayState, KEK_LEN, KeyDataKdes, MicAlg, aes_cmac, aes_key_unwrap,
-        parse_gtk_kde, parse_key_data_kdes,
+    crypto::{
+        handshake4::{
+            FourWayState, KEK_LEN, KeyDataKdes, MicAlg, aes_cmac,
+            aes_key_unwrap, parse_gtk_kde, parse_key_data_kdes,
+        },
+        ocv::{build_oci_kde, parse_oci_kde},
     },
     ieee80211::eapol,
 };
@@ -456,6 +459,135 @@ fn test_ptk_rekey_fresh_snonce() {
     assert_eq!(m2.key_mic, mic);
     let m2_1 = eapol::parse_eapol_key_frame(&msg2_1).unwrap();
     assert_eq!(m2_1.replay_counter, 1);
+}
+
+/// Stage 3 M10: with OCV enabled, Message 2 carries our OCI KDE and
+/// Message 3 is accepted only when the AP's OCI matches the BSS
+/// frequency.
+#[test]
+fn test_ocv_oci_in_msg2_and_msg3_verification() {
+    let pmk = [0x01u8; 32];
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+    state.set_ocv(true, [81, 1, 0], 2412);
+
+    let msg1 = eapol::build_eapol_key_pdu(
+        0x0080 | 0x0008,
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let msg2 = state
+        .process_message_1(
+            &parsed1.key_nonce,
+            parsed1.replay_counter,
+            parsed1.key_info,
+        )
+        .unwrap();
+    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    assert_eq!(
+        parse_oci_kde(&m2.key_data),
+        Some([81, 1, 0]),
+        "Message 2 must carry the STA OCI KDE"
+    );
+
+    // Message 3 with a matching OCI: accepted.
+    let kck = state.kck().unwrap();
+    let kek = state.kek().unwrap();
+    let mut key_data = build_oci_kde(&[81, 1, 0]);
+    while key_data.len() < 16 || !key_data.len().is_multiple_of(8) {
+        key_data.push(0);
+    }
+    let wrapped = aes_key_wrap(&kek, &key_data).unwrap();
+    let msg3_key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+    let mut msg3 = eapol::build_eapol_key_pdu(
+        msg3_key_info,
+        16,
+        2,
+        &[0u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
+    );
+    let msg3_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
+    eapol::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    state.process_message_3(&parsed3).unwrap();
+
+    // Message 3 without an OCI KDE: rejected under OCV.
+    let mut state2 = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+    state2.set_ocv(true, [81, 1, 0], 2412);
+    let msg1 = eapol::build_eapol_key_pdu(
+        0x0080 | 0x0008,
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    state2
+        .process_message_1(
+            &parsed1.key_nonce,
+            parsed1.replay_counter,
+            parsed1.key_info,
+        )
+        .unwrap();
+    let kck2 = state2.kck().unwrap();
+    let kek2 = state2.kek().unwrap();
+    let mut empty = Vec::new();
+    while empty.len() < 16 || !empty.len().is_multiple_of(8) {
+        empty.push(0);
+    }
+    let wrapped = aes_key_wrap(&kek2, &empty).unwrap();
+    let mut msg3 = eapol::build_eapol_key_pdu(
+        msg3_key_info,
+        16,
+        2,
+        &[0u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
+    );
+    let msg3_mic = aes_cmac(&kck2, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
+    eapol::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let err = state2.process_message_3(&parsed3).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+    assert!(
+        err.to_string().contains("no OCI"),
+        "unexpected error: {err}"
+    );
 }
 
 /// G1c: EAPOL-Key frames with the Request bit set are dropped by

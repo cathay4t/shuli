@@ -61,6 +61,13 @@ pub struct FourWayState {
     /// AKM), the PTK comes from PMK-R1 instead of the PMK
     /// (802.11-2020 §12.8.2.3).
     ft_pmk_r1: Option<super::ft::PmkR1>,
+    /// Stage 3 M10: OCV enabled (verify the AP's OCI in Messages 3 and
+    /// group rekeys, and send our OCI in Message 2).
+    ocv: bool,
+    /// Our OCI (operating class, channel, segment) for OCV.
+    oci: Option<[u8; 3]>,
+    /// BSS frequency (MHz) the OCI must match.
+    freq_mhz: u32,
 }
 
 impl FourWayState {
@@ -98,6 +105,9 @@ impl FourWayState {
             mic_alg,
             desc_version: 0,
             ft_pmk_r1: None,
+            ocv: false,
+            oci: None,
+            freq_mhz: 0,
         }
     }
 
@@ -133,7 +143,18 @@ impl FourWayState {
             mic_alg: MicAlg::AesCmac,
             desc_version: 0,
             ft_pmk_r1: Some(ft_pmk_r1),
+            ocv: false,
+            oci: None,
+            freq_mhz: 0,
         }
+    }
+
+    /// Stage 3 M10: enable OCV for this handshake with our OCI and the
+    /// BSS frequency to validate against.
+    pub fn set_ocv(&mut self, enabled: bool, oci: [u8; 3], freq_mhz: u32) {
+        self.ocv = enabled;
+        self.oci = Some(oci);
+        self.freq_mhz = freq_mhz;
     }
 
     pub(crate) fn derive_ptk(&self) -> [u8; PTK_LEN] {
@@ -265,10 +286,17 @@ impl FourWayState {
 
         // Build Message 2 with a zeroed MIC, compute the MIC (AES-CMAC over the
         // entire EAPOL-Key PDU), then patch it in.
+        let mut key_data = self.rsne.clone();
+        if self.ocv
+            && let Some(oci) = self.oci
+        {
+            key_data
+                .extend_from_slice(&crate::crypto::ocv::build_oci_kde(&oci));
+        }
         let mut msg2 = eapol::build_message_2(
             &self.snonce,
             self.replay_counter,
-            &self.rsne,
+            &key_data,
             self.desc_version,
         );
         let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
@@ -324,6 +352,11 @@ impl FourWayState {
             } else {
                 frame.key_data.clone()
             };
+            // Stage 3 M10: verify the AP's OCI before accepting the
+            // message.
+            if self.ocv {
+                crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
+            }
             kdes = parse_key_data_kdes(&plain);
             // G1b: fail the handshake when the AP's RSNE / RSNXE in
             // Message 3 differ from the beacon/probe response copies
@@ -445,7 +478,12 @@ impl FourWayState {
         } else {
             frame.key_data.clone()
         };
-        let (idx, gtk) = parse_gtk_kde(&plain).ok_or_else(|| {
+        // Stage 3 M10: verify the AP's OCI in the group rekey too.
+        if self.ocv {
+            crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
+        }
+        let kdes = parse_key_data_kdes(&plain);
+        let (idx, gtk) = kdes.gtk.ok_or_else(|| {
             WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "no GTK KDE in group rekey",
@@ -595,6 +633,7 @@ pub(crate) fn parse_key_data_kdes(key_data: &[u8]) -> KeyDataKdes {
 /// GTK). Key data is a sequence of KDEs/IEs; the GTK KDE has element id 0xDD,
 /// OUI 00-0F-AC, data type 1, followed by a key-info octet (low 2 bits = key
 /// id), a reserved octet, then the GTK.
+#[allow(dead_code)] // kept for tests; group rekey uses parse_key_data_kdes
 pub(crate) fn parse_gtk_kde(key_data: &[u8]) -> Option<(u8, Vec<u8>)> {
     parse_key_data_kdes(key_data).gtk
 }

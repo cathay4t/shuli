@@ -98,3 +98,13 @@ fn sae_password_id_defaults_to_none_and_can_be_set() {
     network.set_sae_password_id(None);
     assert!(network.sae_password_id.is_none());
 }
+
+#[test]
+fn ocv_defaults_to_disabled_and_can_be_enabled() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(!network.ocv, "OCV must be opt-in");
+    network.set_ocv(true);
+    assert!(network.ocv);
+    network.set_ocv(false);
+    assert!(!network.ocv);
+}

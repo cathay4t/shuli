@@ -4,6 +4,7 @@ mod config;
 mod crypto_ft;
 mod crypto_handshake4;
 mod crypto_kdf;
+mod crypto_ocv;
 mod crypto_sae;
 mod eap;
 mod eap_tls;
