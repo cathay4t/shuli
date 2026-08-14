@@ -143,6 +143,16 @@ fn process_sae_frame(
         ));
     }
 
+    // Stage 3 M13: status 127 = SAE-PK required.  shuli does not
+    // implement the SAE-PK crypto (PWE + ECDSA confirm signature) yet,
+    // so fail cleanly instead of looping with regular SAE.
+    if auth_seq == 1 && status == 127 {
+        return Err(WifiError::new(
+            ErrorKind::AuthFailed,
+            "SAE-PK required by AP but shuli does not implement SAE-PK",
+        ));
+    }
+
     const SAE_STATUS_H2E: u16 = 126;
     let status_ok = match auth_seq {
         1 => status == 0 || status == SAE_STATUS_H2E,

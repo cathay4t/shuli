@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M13 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M13 partial).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -99,10 +99,15 @@
   (this build lacks `CONFIG_SAE_EXT_KEY`).
 * **M13 — SAE-PK (Goal 5):** SAE with Public Key (RSNXE capability
   bit, auth status 127, EC public key embedded in the password).
+  **Partial 2026-08-14:** status 127 is detected and fails cleanly
+  with a clear message (unit tested).  The SAE-PK crypto itself -
+  base32 private-key parsing, SAE-PK PWE derivation, and the ECDSA
+  confirm signature - is deferred: it needs a careful port of
+  wpa_supplicant's `sae_pk.c` (~900 lines).
 
 **Exit criteria:** M1-M13 implemented with unit + integration tests
-where the test hardware supports them.  M1-M6 are done; M7-M13 are
-in progress.
+where the test hardware supports them.  M1-M12 are done; M13 is
+partial (SAE-PK crypto deferred).
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 

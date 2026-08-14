@@ -5,9 +5,12 @@ use p256::{
     elliptic_curve::{Group, point::AffineCoordinates},
 };
 
-use crate::crypto::sae::{
-    SaeAuth, compute_pwe_h2e, compute_pwe_h2e_with_id, compute_pwe_hnp,
-    parse_anti_clogging_token,
+use crate::{
+    auth::AuthMethod,
+    crypto::sae::{
+        SaeAuth, compute_pwe_h2e, compute_pwe_h2e_with_id, compute_pwe_hnp,
+        parse_anti_clogging_token,
+    },
 };
 
 fn affine_x_bytes(point: &AffinePoint) -> [u8; 32] {
@@ -129,6 +132,29 @@ fn test_sae_password_identifier() {
     supp.process_commit(&ap_scalar, &ap_elem).unwrap();
     ap.process_commit(&supp_scalar, &supp_elem).unwrap();
     assert_eq!(supp.pmk(), ap.pmk(), "PMK must match with the same id");
+}
+
+/// Stage 3 M13: an AP that requires SAE-PK (status 127) fails cleanly
+/// with a clear error - the SAE-PK crypto itself is not implemented.
+#[test]
+fn test_sae_pk_status_127_fails_cleanly() {
+    let (mac_sta, mac_ap) = test_macs();
+    let mut auth = AuthMethod::new_sae(
+        "12345678",
+        "Test-WIFI",
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+        None,
+    )
+    .unwrap();
+    let err = match auth.process_frame(1, 127, &[0u8; 2]) {
+        Err(e) => e,
+        Ok(_) => panic!("expected a SAE-PK failure"),
+    };
+    assert_eq!(err.kind, crate::ErrorKind::AuthFailed);
+    assert!(err.to_string().contains("SAE-PK"));
 }
 
 /// G2b: a full SAE exchange where both sides derive the PWE with
