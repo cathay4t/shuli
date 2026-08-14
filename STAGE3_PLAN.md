@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M8 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M9 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -65,7 +65,12 @@
 * **M8 — More BIP ciphers in the RSNE (Goal 5):** advertise and
   negotiate BIP-CMAC-128/256 and BIP-GMAC-128/256 (preference
   GMAC-256 > CMAC-256 > GMAC-128 > CMAC-128) and install IGTK/BIGTK
-  with the negotiated cipher/key length.
+  with the negotiated cipher/key length.  **Done 2026-08-14:** the
+  scan phase parses the AP's group management cipher and all RSNE
+  builders take the negotiated suite; IGTK/BIGTK install uses it.
+  Unit tests for parsing/negotiation + hostapd
+  `group_mgmt_cipher=BIP-GMAC-256` integration test with SA Query
+  survival.
 * **M9 — Transition Disable (Goal 5):** parse the Transition Disable
   KDE from 4-way Message 3 and persist/log the disabled AKM groups.
 * **M10 — OCV (Goal 5):** operating class/channel validation for

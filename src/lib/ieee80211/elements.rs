@@ -77,6 +77,65 @@ pub fn rsne_first_pmkid(body: &[u8]) -> Option<[u8; 16]> {
     Some(body[pos + 2..pos + 18].try_into().unwrap())
 }
 
+/// The group management (BIP) cipher the AP advertises in its RSNE
+/// (full element, ID + length + body); `None` when absent (older
+/// PMF-optional RSNEs omit it, and BIP-CMAC-128 is then assumed).
+pub(crate) fn parse_group_mgmt_cipher(
+    rsne: &[u8],
+) -> Option<Nl80211CipherSuite> {
+    if rsne.len() < 4 {
+        return None;
+    }
+    let body = &rsne[2..];
+    if body.len() < 8 {
+        return None;
+    }
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_off = 8 + pcount * 4;
+    if body.len() < akm_off + 2 {
+        return None;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_off], body[akm_off + 1]]) as usize;
+    let cap_off = akm_off + 2 + acount * 4;
+    if body.len() < cap_off + 2 {
+        return None;
+    }
+    let pmkid_off = cap_off + 2;
+    if body.len() < pmkid_off + 2 {
+        return None;
+    }
+    let pmkid_count =
+        u16::from_le_bytes([body[pmkid_off], body[pmkid_off + 1]]) as usize;
+    let mgmt_off = pmkid_off + 2 + pmkid_count * 16;
+    if body.len() < mgmt_off + 4 {
+        return None;
+    }
+    let bytes: [u8; 4] = body[mgmt_off..mgmt_off + 4].try_into().ok()?;
+    Some(Nl80211CipherSuite::from(u32::from_le_bytes(bytes)))
+}
+
+/// Negotiate the group management (BIP) cipher with the AP: the best
+/// supported suite the AP advertises, defaulting to BIP-CMAC-128.
+/// Preference order matches iwd: GMAC-256 > CMAC-256 > GMAC-128 >
+/// CMAC-128 (Stage 3 M8).
+pub fn negotiate_group_mgmt_cipher(ap_rsne: &[u8]) -> Nl80211CipherSuite {
+    let Some(ap) = parse_group_mgmt_cipher(ap_rsne) else {
+        return Nl80211CipherSuite::BipCmac128;
+    };
+    for preferred in [
+        Nl80211CipherSuite::BipGmac256,
+        Nl80211CipherSuite::BipCmac256,
+        Nl80211CipherSuite::BipGmac128,
+        Nl80211CipherSuite::BipCmac128,
+    ] {
+        if ap == preferred {
+            return preferred;
+        }
+    }
+    Nl80211CipherSuite::BipCmac128
+}
+
 /// The RSNXE element advertising SAE Hash-to-Element support; included
 /// in FT Reassociation Requests (and their FTIE MIC) on FT-SAE.
 pub fn sae_rsnxe() -> Vec<u8> {
@@ -94,13 +153,17 @@ pub fn sae_rsnxe() -> Vec<u8> {
 /// protection required, SAE Hash-to-Element). The exact same bytes are used in
 /// the Association Request and in 4-way handshake Message 2; the AP verifies
 /// they match, so both call sites must use this single builder.
-pub fn sae_ie() -> Vec<u8> {
-    sae_ie_with_pmkid(None)
+/// [`sae_ie`] with a negotiated group management (BIP) cipher.
+pub fn sae_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
+    sae_ie_with_pmkid_cipher(None, mgmt_cipher)
 }
 
-/// [`sae_ie`] carrying a PMKID (PMKSA caching / roaming: the AP may skip
-/// the full SAE exchange when it recognises the PMKID).
-pub fn sae_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+/// [`sae_ie_with_pmkid`] with a negotiated group management (BIP)
+/// cipher (Stage 3 M8).
+pub fn sae_ie_with_pmkid_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
     let elements = Nl80211Elements(vec![
         Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -111,7 +174,7 @@ pub fn sae_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
                 Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
             ),
             pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         }),
         Nl80211Element::RsnExt(Nl80211ElementRsnExt {
             capabilities: Nl80211RsnExtCapbilities::SaeH2e,
@@ -125,7 +188,8 @@ pub fn sae_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 
 /// Build the RSNE for OWE (AKM 00-0F-AC:18, CCMP-128, MFP required).
 /// No RSNXE — OWE does not use SAE H2E.
-pub fn owe_ie() -> Vec<u8> {
+/// [`owe_ie`] with a negotiated group management (BIP) cipher.
+pub fn owe_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -136,7 +200,7 @@ pub fn owe_ie() -> Vec<u8> {
                 Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
             ),
             pmkids: vec![],
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -148,12 +212,17 @@ pub fn owe_ie() -> Vec<u8> {
 /// frame protection is negotiated as optional (MFPC without MFPR, iwd's
 /// default `ManagementFrameProtection=1` behaviour): PMF-capable APs then
 /// protect the connection with an IGTK, PMF-less APs still accept it.
-pub fn wpa2_psk_ie() -> Vec<u8> {
-    wpa2_psk_ie_with_pmkid(None)
+/// [`wpa2_psk_ie`] with a negotiated group management (BIP) cipher.
+pub fn wpa2_psk_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
+    wpa2_psk_ie_with_pmkid_cipher(None, mgmt_cipher)
 }
 
-/// [`wpa2_psk_ie`] carrying a PMKID (PMKSA caching / roaming).
-pub fn wpa2_psk_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+/// [`wpa2_psk_ie_with_pmkid`] with a negotiated group management (BIP)
+/// cipher.
+pub fn wpa2_psk_ie_with_pmkid_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -162,7 +231,7 @@ pub fn wpa2_psk_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
             akm_suits: vec![Nl80211AkmSuite::Psk],
             rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
             pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -173,13 +242,18 @@ pub fn wpa2_psk_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 /// Build the RSNE for WPA2-Personal with SHA-256 algorithms
 /// (PSK-SHA256, AKM 00-0F-AC:6, CCMP-128). Same security policy as
 /// [`wpa2_psk_ie`] (optional MFP), only the AKM suite differs.
-pub fn wpa2_psk_sha256_ie() -> Vec<u8> {
-    wpa2_psk_sha256_ie_with_pmkid(None)
+/// [`wpa2_psk_sha256_ie`] with a negotiated group management (BIP)
+/// cipher.
+pub fn wpa2_psk_sha256_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
+    wpa2_psk_sha256_ie_with_pmkid_cipher(None, mgmt_cipher)
 }
 
-/// [`wpa2_psk_sha256_ie`] carrying a PMKID (PMKSA caching / roaming).
-/// PSK-SHA256 uses the SHA-256 PMKID derivation.
-pub fn wpa2_psk_sha256_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+/// [`wpa2_psk_sha256_ie_with_pmkid`] with a negotiated group
+/// management (BIP) cipher.
+pub fn wpa2_psk_sha256_ie_with_pmkid_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -188,7 +262,7 @@ pub fn wpa2_psk_sha256_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
             akm_suits: vec![Nl80211AkmSuite::PskSha256],
             rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
             pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -198,7 +272,8 @@ pub fn wpa2_psk_sha256_ie_with_pmkid(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 
 /// Build the RSNE for WPA2-Enterprise (802.1X, AKM 00-0F-AC:1,
 /// CCMP-128) with optional management frame protection.
-pub fn wpa2_ent_ie() -> Vec<u8> {
+/// [`wpa2_ent_ie`] with a negotiated group management (BIP) cipher.
+pub fn wpa2_ent_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -207,7 +282,7 @@ pub fn wpa2_ent_ie() -> Vec<u8> {
             akm_suits: vec![Nl80211AkmSuite::Ieee8021x],
             rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
             pmkids: vec![],
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -218,7 +293,9 @@ pub fn wpa2_ent_ie() -> Vec<u8> {
 /// Build the RSNE for WPA3-Enterprise (802.1X-SHA256, AKM
 /// 00-0F-AC:5, CCMP-128) with **mandatory** management frame
 /// protection (MFPR + MFPC) - the WPA3 baseline requirement.
-pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
+/// [`wpa2_ent_sha256_ie`] with a negotiated group management (BIP)
+/// cipher.
+pub fn wpa2_ent_sha256_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -229,7 +306,7 @@ pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
                 Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
             ),
             pmkids: vec![],
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -240,7 +317,11 @@ pub fn wpa2_ent_sha256_ie() -> Vec<u8> {
 /// Build the FT-SAE RSNE element only (AKM 00-0F-AC:9). Used where the
 /// RSNE and RSNXE must stay separate elements (FT Reassociation Request:
 /// the FTIE MIC covers RSNE, MDIE, FTIE, then RSNXE in that order).
-pub fn ft_sae_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+/// [`ft_sae_rsne`] with a negotiated group management (BIP) cipher.
+pub fn ft_sae_rsne_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -251,7 +332,7 @@ pub fn ft_sae_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
                 Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
             ),
             pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -261,7 +342,11 @@ pub fn ft_sae_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 
 /// Build the FT-PSK RSNE element only (AKM 00-0F-AC:4); see
 /// [`ft_sae_rsne`].
-pub fn ft_psk_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
+/// [`ft_psk_rsne`] with a negotiated group management (BIP) cipher.
+pub fn ft_psk_rsne_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
     let elements =
         Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
             version: 1,
@@ -270,7 +355,7 @@ pub fn ft_psk_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
             akm_suits: vec![Nl80211AkmSuite::FtPsk],
             rsn_capbilities: Some(Nl80211RsnCapbilities::Mfpc),
             pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
-            group_mgmt_cipher: Some(Nl80211CipherSuite::BipCmac128),
+            group_mgmt_cipher: Some(mgmt_cipher),
         })]);
 
     let mut buf = vec![0u8; elements.buffer_len()];
@@ -281,8 +366,12 @@ pub fn ft_psk_rsne(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 /// Build the RSNE + RSNXE for FT-SAE (AKM 00-0F-AC:9): same crypto
 /// policy as [`sae_ie`] (CCMP-128, MFP required, SAE H2E), only the AKM
 /// differs. `pmkid` carries PMKR0Name / PMKR1Name during FT.
-pub fn ft_sae_ie(pmkid: Option<[u8; 16]>) -> Vec<u8> {
-    let mut buf = ft_sae_rsne(pmkid);
+/// [`ft_sae_ie`] with a negotiated group management (BIP) cipher.
+pub fn ft_sae_ie_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
+    let mut buf = ft_sae_rsne_cipher(pmkid, mgmt_cipher);
     buf.extend_from_slice(&sae_rsnxe());
     buf
 }
@@ -290,8 +379,12 @@ pub fn ft_sae_ie(pmkid: Option<[u8; 16]>) -> Vec<u8> {
 /// Build the RSNE for FT-PSK (AKM 00-0F-AC:4): same crypto policy as
 /// [`wpa2_psk_ie`] (CCMP-128, optional MFP). `pmkid` carries PMKR0Name
 /// / PMKR1Name during FT.
-pub fn ft_psk_ie(pmkid: Option<[u8; 16]>) -> Vec<u8> {
-    ft_psk_rsne(pmkid)
+/// [`ft_psk_ie`] with a negotiated group management (BIP) cipher.
+pub fn ft_psk_ie_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
+    ft_psk_rsne_cipher(pmkid, mgmt_cipher)
 }
 
 /// Build a Mobility Domain element: MDID (2) || FT Capability and

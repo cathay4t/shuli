@@ -806,7 +806,9 @@ impl WifiClient {
                                 "open-system AUTHENTICATE ok - sending OWE \
                                  ASSOCIATE"
                             );
-                            let mut ie_buf = elements::owe_ie();
+                            let mut ie_buf = elements::owe_ie_cipher(
+                                self.bss_info.group_mgmt_cipher,
+                            );
                             ie_buf.extend_from_slice(&dh_elem);
                             log::debug!("associate OWE IE: {ie_buf:02x?}");
                             if let Err(e) = self
@@ -836,7 +838,12 @@ impl WifiClient {
                                 .ap_mfp_capable()
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
-                                .associate(elements::wpa2_psk_ie(), mfp)
+                                .associate(
+                                    elements::wpa2_psk_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    mfp,
+                                )
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -856,7 +863,12 @@ impl WifiClient {
                                 .ap_mfp_capable()
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
-                                .associate(elements::wpa2_psk_sha256_ie(), mfp)
+                                .associate(
+                                    elements::wpa2_psk_sha256_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    mfp,
+                                )
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -877,7 +889,12 @@ impl WifiClient {
                                 .ap_mfp_capable()
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
-                                .associate(elements::wpa2_ent_ie(), mfp)
+                                .associate(
+                                    elements::wpa2_ent_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    mfp,
+                                )
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -894,7 +911,12 @@ impl WifiClient {
                             // mandatory for the SHA-256 AKM.
                             let mfp = Some(Nl80211UseMfp::Required);
                             if let Err(e) = self
-                                .associate(elements::wpa2_ent_sha256_ie(), mfp)
+                                .associate(
+                                    elements::wpa2_ent_sha256_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    mfp,
+                                )
                                 .await
                             {
                                 log::warn!("ASSOCIATE failed: {e}");
@@ -908,7 +930,10 @@ impl WifiClient {
                                 "open-system AUTHENTICATE ok - sending FT-PSK \
                                  ASSOCIATE"
                             );
-                            let mut ies = elements::ft_psk_ie(None);
+                            let mut ies = elements::ft_psk_ie_cipher(
+                                None,
+                                self.bss_info.group_mgmt_cipher,
+                            );
                             if let Err(e) = self.append_ft_mdie(&mut ies) {
                                 log::warn!("FT-PSK ASSOCIATE failed: {e}");
                                 self.state = WifiState::Failed;
@@ -1380,8 +1405,13 @@ impl WifiClient {
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
                 let rsne = match self.bss_info.security {
-                    SecurityType::FtSae => elements::ft_sae_ie(None),
-                    _ => elements::sae_ie(),
+                    SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                        None,
+                        self.bss_info.group_mgmt_cipher,
+                    ),
+                    _ => {
+                        elements::sae_ie_cipher(self.bss_info.group_mgmt_cipher)
+                    }
                 };
                 let mut ies = rsne;
                 // FT initial mobility domain association: the request
@@ -1526,10 +1556,14 @@ impl WifiClient {
                         return;
                     };
                     let mut rsne = match self.bss_info.security {
-                        SecurityType::FtSae => {
-                            elements::ft_sae_ie(Some(ft.pmk_r1.name))
-                        }
-                        _ => elements::ft_psk_ie(Some(ft.pmk_r1.name)),
+                        SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                            Some(ft.pmk_r1.name),
+                            self.bss_info.group_mgmt_cipher,
+                        ),
+                        _ => elements::ft_psk_ie_cipher(
+                            Some(ft.pmk_r1.name),
+                            self.bss_info.group_mgmt_cipher,
+                        ),
                     };
                     // MDIE + FTIE from the association response join the
                     // RSNE in the Message 2 key data.
@@ -1566,7 +1600,13 @@ impl WifiClient {
                                     self.state = WifiState::Failed;
                                     return;
                                 };
-                                (pmk, elements::owe_ie(), MicAlg::HmacSha256)
+                                (
+                                    pmk,
+                                    elements::owe_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    MicAlg::HmacSha256,
+                                )
                             }
                             SecurityType::Wpa2Psk => {
                                 let Some(pmk) = self.psk_pmk else {
@@ -1576,7 +1616,13 @@ impl WifiClient {
                                     self.state = WifiState::Failed;
                                     return;
                                 };
-                                (pmk, elements::wpa2_psk_ie(), MicAlg::HmacSha1)
+                                (
+                                    pmk,
+                                    elements::wpa2_psk_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    MicAlg::HmacSha1,
+                                )
                             }
                             SecurityType::Wpa2PskSha256 => {
                                 let Some(pmk) = self.psk_pmk else {
@@ -1588,7 +1634,9 @@ impl WifiClient {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_psk_sha256_ie(),
+                                    elements::wpa2_psk_sha256_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1600,7 +1648,13 @@ impl WifiClient {
                                     self.state = WifiState::Failed;
                                     return;
                                 };
-                                (pmk, elements::wpa2_ent_ie(), MicAlg::HmacSha1)
+                                (
+                                    pmk,
+                                    elements::wpa2_ent_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    MicAlg::HmacSha1,
+                                )
                             }
                             SecurityType::Wpa2EntSha256 => {
                                 let Some(pmk) = self.eap_pmk else {
@@ -1612,7 +1666,9 @@ impl WifiClient {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_ent_sha256_ie(),
+                                    elements::wpa2_ent_sha256_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1625,7 +1681,13 @@ impl WifiClient {
                                     self.state = WifiState::Failed;
                                     return;
                                 };
-                                (pmk, elements::sae_ie(), MicAlg::AesCmac)
+                                (
+                                    pmk,
+                                    elements::sae_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    MicAlg::AesCmac,
+                                )
                             }
                         }
                     };
@@ -1777,6 +1839,7 @@ impl WifiClient {
                                 igtk.key_index,
                                 igtk.ipn.to_vec(),
                             )
+                            .cipher(self.bss_info.group_mgmt_cipher)
                             .build(),
                         )
                         .execute()
@@ -1800,6 +1863,7 @@ impl WifiClient {
                                 bigtk.key_index,
                                 bigtk.ipn.to_vec(),
                             )
+                            .cipher(self.bss_info.group_mgmt_cipher)
                             .build(),
                         )
                         .execute()
@@ -2257,16 +2321,37 @@ impl WifiClient {
     /// Both sites must stay byte-identical - the AP verifies that.
     fn rsne_with_pmkid(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
         match self.bss_info.security {
-            SecurityType::Sae => elements::sae_ie_with_pmkid(pmkid),
-            SecurityType::FtSae => elements::ft_sae_ie(pmkid),
-            SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid(pmkid),
+            SecurityType::Sae => elements::sae_ie_with_pmkid_cipher(
+                pmkid,
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                pmkid,
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid_cipher(
+                pmkid,
+                self.bss_info.group_mgmt_cipher,
+            ),
             SecurityType::Wpa2PskSha256 => {
-                elements::wpa2_psk_sha256_ie_with_pmkid(pmkid)
+                elements::wpa2_psk_sha256_ie_with_pmkid_cipher(
+                    pmkid,
+                    self.bss_info.group_mgmt_cipher,
+                )
             }
-            SecurityType::Wpa2Ent => elements::wpa2_ent_ie(),
-            SecurityType::Wpa2EntSha256 => elements::wpa2_ent_sha256_ie(),
-            SecurityType::FtPsk => elements::ft_psk_ie(pmkid),
-            SecurityType::Owe => elements::owe_ie(),
+            SecurityType::Wpa2Ent => {
+                elements::wpa2_ent_ie_cipher(self.bss_info.group_mgmt_cipher)
+            }
+            SecurityType::Wpa2EntSha256 => elements::wpa2_ent_sha256_ie_cipher(
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtPsk => elements::ft_psk_ie_cipher(
+                pmkid,
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::Owe => {
+                elements::owe_ie_cipher(self.bss_info.group_mgmt_cipher)
+            }
             SecurityType::Open | SecurityType::Unsupported => Vec::new(),
         }
     }

@@ -4,7 +4,7 @@
 //! matching the configured SSID.
 
 use futures::{StreamExt, TryStreamExt};
-use wl_nl80211::Nl80211Event;
+use wl_nl80211::{Nl80211CipherSuite, Nl80211Event};
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
@@ -77,7 +77,7 @@ pub struct MdieInfo {
 }
 
 /// The best BSS candidate for the configured SSID.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BssInfo {
     pub bssid: [u8; ETH_ALEN],
     pub freq_mhz: u32,
@@ -90,8 +90,27 @@ pub struct BssInfo {
     /// The AP's RSNXE as a full element (ID 244), empty when the AP
     /// advertises none.
     pub ap_rsnxe: Vec<u8>,
+    /// Negotiated group management (BIP) cipher (Stage 3 M8):
+    /// best supported suite the AP advertises, defaulting to
+    /// BIP-CMAC-128.
+    pub(crate) group_mgmt_cipher: Nl80211CipherSuite,
     /// Mobility Domain (present only on FT-capable BSSes).
     pub mdie: Option<MdieInfo>,
+}
+
+impl Default for BssInfo {
+    fn default() -> Self {
+        Self {
+            bssid: [0; ETH_ALEN],
+            freq_mhz: 0,
+            signal_dbm: 0,
+            security: SecurityType::Open,
+            ap_rsne: Vec::new(),
+            ap_rsnxe: Vec::new(),
+            group_mgmt_cipher: Nl80211CipherSuite::BipCmac128,
+            mdie: None,
+        }
+    }
 }
 
 const RSN_CAP_MFPR: u16 = 1 << 6;
@@ -338,6 +357,7 @@ impl WifiClient {
                     security: bss_security.security,
                     ap_rsne: bss_security.ap_rsne,
                     ap_rsnxe: bss_security.ap_rsnxe,
+                    group_mgmt_cipher: bss_security.group_mgmt_cipher,
                     mdie: bss_security.mdie,
                 },
                 network,
@@ -372,6 +392,7 @@ pub(crate) struct BssScanSecurity {
     pub(crate) security: SecurityType,
     pub(crate) ap_rsne: Vec<u8>,
     pub(crate) ap_rsnxe: Vec<u8>,
+    pub(crate) group_mgmt_cipher: Nl80211CipherSuite,
     pub(crate) mdie: Option<MdieInfo>,
 }
 
@@ -429,10 +450,16 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     } else {
         SecurityType::Open
     };
+    let group_mgmt_cipher = if rsne.len() > 2 {
+        crate::ieee80211::elements::negotiate_group_mgmt_cipher(&rsne)
+    } else {
+        Nl80211CipherSuite::BipCmac128
+    };
     BssScanSecurity {
         security,
         ap_rsne: rsne,
         ap_rsnxe: rsnxe,
+        group_mgmt_cipher,
         mdie,
     }
 }
@@ -558,6 +585,7 @@ pub async fn scan_wifi_with_ies(
             security: bss_security.security,
             ap_rsne: bss_security.ap_rsne,
             ap_rsnxe: bss_security.ap_rsnxe,
+            group_mgmt_cipher: bss_security.group_mgmt_cipher,
             mdie: bss_security.mdie,
         };
         results.push((info, ies.to_vec()));

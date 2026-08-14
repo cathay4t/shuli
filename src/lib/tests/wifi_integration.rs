@@ -228,6 +228,25 @@ sae_password=12345678|id=corp-id
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Stage 3 M8: hostapd with a non-default BIP group management cipher
+/// (BIP-GMAC-256).  shuli must advertise the same cipher in its RSNE
+/// and install the IGTK with it for protected frames to work.
+const SAE_BIP_GMAC256_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-BIP
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+group_mgmt_cipher=BIP-GMAC-256
+sae_pwe=2
+sae_password=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 const WPA2_PSK_PMF_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
 driver=nl80211
@@ -772,6 +791,78 @@ async fn wifi_client_sae_password_identifier() {
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// Stage 3 M8: BIP-GMAC-256 negotiation.  The client picks the AP's
+/// group management cipher, installs the IGTK with it, and survives an
+/// SA Query (protected action frames must reach the kernel).
+#[tokio::test]
+async fn wifi_client_sae_bip_gmac256() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_bip_gmac256: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_BIP_GMAC256_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-BIP", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.bss_info.group_mgmt_cipher,
+        wl_nl80211::Nl80211CipherSuite::BipGmac256,
+        "BIP-GMAC-256 must be negotiated"
+    );
+
+    // SA Query survival proves the IGTK was installed with a working
+    // BIP cipher (mac80211 protects/answers the action frame).
+    let sta_mac = client
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("SA_QUERY {sta_mac}"));
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(state)) => {
+                assert!(
+                    matches!(
+                        state,
+                        WifiState::ConnectedWithoutOffloadRekey
+                            | WifiState::ConnectedWithOffloadRekey
+                    ),
+                    "SA Query broke the connection: {state:?}"
+                );
+            }
+            Ok(Err(e)) => panic!("client error during SA Query: {e}"),
+            Err(_) => {} // 500 ms without an event: still connected
+        }
+    }
+    assert!(matches!(
+        client.state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
