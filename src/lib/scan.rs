@@ -3,8 +3,10 @@
 //! Scan flow: trigger a scan, wait for results, then pick the strongest BSS
 //! matching the configured SSID.
 
+use std::collections::HashMap;
+
 use futures::{StreamExt, TryStreamExt};
-use wl_nl80211::{Nl80211CipherSuite, Nl80211Event};
+use wl_nl80211::{Nl80211BssInfo, Nl80211CipherSuite, Nl80211Event};
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
@@ -107,6 +109,9 @@ pub struct BssInfo {
     pub(crate) group_mgmt_cipher: Nl80211CipherSuite,
     /// Mobility Domain (present only on FT-capable BSSes).
     pub mdie: Option<MdieInfo>,
+    /// Whether the AP hides its SSID in beacons while still answering
+    /// directed probe requests with the SSID.
+    pub hidden: bool,
 }
 
 impl Default for BssInfo {
@@ -120,6 +125,7 @@ impl Default for BssInfo {
             ap_rsnxe: Vec::new(),
             group_mgmt_cipher: Nl80211CipherSuite::BipCmac128,
             mdie: None,
+            hidden: false,
         }
     }
 }
@@ -395,6 +401,7 @@ impl WifiClient {
                     ap_rsnxe: bss_security.ap_rsnxe,
                     group_mgmt_cipher: bss_security.group_mgmt_cipher,
                     mdie: bss_security.mdie,
+                    hidden: false,
                 },
                 network,
             ));
@@ -606,12 +613,28 @@ pub async fn scan_wifi_with_ies(
     tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS)).await;
 
     let bss_list = get_scan_results(&handle, if_index).await?;
+    let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
+    for bss in &bss_list {
+        let Some(bssid) = extract_bssid(bss) else {
+            continue;
+        };
+        for info in bss {
+            if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info {
+                let ssid = extract_ssid_from_ies(ies);
+                beacon_has_ssid
+                    .insert(bssid, ssid.is_some_and(|s| !s.is_empty()));
+            }
+        }
+    }
     let mut results = Vec::new();
     for bss in &bss_list {
         let Some(ies) = extract_ies(bss) else {
             continue;
         };
-        if extract_ssid_from_ies(ies).is_none() {
+        let Some(ssid) = extract_ssid_from_ies(ies) else {
+            continue;
+        };
+        if ssid.is_empty() {
             continue;
         }
         let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) =
@@ -629,6 +652,7 @@ pub async fn scan_wifi_with_ies(
             ap_rsnxe: bss_security.ap_rsnxe,
             group_mgmt_cipher: bss_security.group_mgmt_cipher,
             mdie: bss_security.mdie,
+            hidden: beacon_has_ssid.get(&bssid) == Some(&false),
         };
         results.push((info, ies.to_vec()));
     }
