@@ -5,8 +5,9 @@
 use wl_nl80211::Nl80211CipherSuite;
 
 use crate::ieee80211::elements::{
-    negotiate_group_mgmt_cipher, parse_group_mgmt_cipher, wpa2_ent_ie_cipher,
-    wpa2_ent_sha256_ie_cipher, wpa2_psk_ie_with_pmkid_cipher,
+    negotiate_group_mgmt_cipher, parse_group_mgmt_cipher, rsne_set_ext_key_id,
+    wpa2_ent_ie_cipher, wpa2_ent_sha256_ie_cipher,
+    wpa2_psk_ie_with_pmkid_cipher,
 };
 
 /// RSN capabilities at body offset: version(2) group(4) pcount(2)
@@ -81,4 +82,15 @@ fn group_mgmt_cipher_negotiation_roundtrip() {
         Nl80211CipherSuite::BipCmac128,
         "missing group mgmt cipher defaults to BIP-CMAC-128"
     );
+}
+
+/// Stage 3 M11: the Extended Key ID capability bit (bit 13) can be set
+/// and cleared on a built RSNE.
+#[test]
+fn ext_key_id_rsne_bit() {
+    let mut ie = wpa2_ent_sha256_ie_cipher(Nl80211CipherSuite::BipCmac128);
+    rsne_set_ext_key_id(&mut ie, true);
+    assert_ne!(rsne_capabilities(&ie) & 0x2000, 0);
+    rsne_set_ext_key_id(&mut ie, false);
+    assert_eq!(rsne_capabilities(&ie) & 0x2000, 0);
 }

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M11 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M12 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -86,7 +86,10 @@
   `CONFIG_OCV`).
 * **M11 — Extended Key ID (Goal 5):** pairwise key id 0/1 rotation
   for lossless PTK rekey (AES-CC ciphers, driver support, two-phase
-  RX-then-TX install).
+  RX-then-TX install).  **Done 2026-08-14:** `ext_key_id` config +
+  RSN capability bit 13, Key ID KDE (type 10) parsing, and two-phase
+  RX-then-TX PTK install; also fixed the BIGTK KDE type (14, not 10).
+  Unit tests + hostapd `extended_key_id=1` integration test.
 * **M12 — SAE-EXT-KEY (Goal 5):** AKM `00-0F-AC:24` / FT `:25` with
   384/512-bit PMK and AKM-defined KDFs.
 * **M13 — SAE-PK (Goal 5):** SAE with Public Key (RSNXE capability

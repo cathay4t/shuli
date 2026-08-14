@@ -91,6 +91,10 @@ pub struct NetworkConfig {
     /// 4-way Message 2, and verifies the AP's OCI in Message 3 and
     /// group rekeys.  Defaults to `false`.
     pub ocv: bool,
+    /// Extended Key ID (Stage 3 M11): use pairwise key id 0/1 rotation
+    /// for lossless PTK rekeys.  Requires driver support and an
+    /// AES-CC pairwise cipher; opt-in per network, defaults to `false`.
+    pub ext_key_id: bool,
 }
 
 impl NetworkConfig {
@@ -105,6 +109,7 @@ impl NetworkConfig {
             sae_pwe: SaePwe::Auto,
             sae_password_id: None,
             ocv: false,
+            ext_key_id: false,
         }
     }
 
@@ -136,6 +141,12 @@ impl NetworkConfig {
     /// Enable or disable Operating Channel Validation (OCV).
     pub fn set_ocv(&mut self, enabled: bool) -> &mut Self {
         self.ocv = enabled;
+        self
+    }
+
+    /// Enable or disable Extended Key ID.
+    pub fn set_ext_key_id(&mut self, enabled: bool) -> &mut Self {
+        self.ext_key_id = enabled;
         self
     }
 }

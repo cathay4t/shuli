@@ -266,6 +266,24 @@ transition_disable=0x08
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Stage 3 M11: hostapd with Extended Key ID enabled for pairwise
+/// keys.
+const SAE_EXT_KEY_ID_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-EKID
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+sae_password=12345678
+extended_key_id=1
+ctrl_interface=/var/run/hostapd
+";
+
 const WPA2_PSK_PMF_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
 driver=nl80211
@@ -907,6 +925,35 @@ async fn wifi_client_sae_transition_disable() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-TD", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// Stage 3 M11: Extended Key ID SAE connection - the AP selects a
+/// pairwise key id and the client installs the PTK RX-then-TX.
+#[tokio::test]
+async fn wifi_client_sae_ext_key_id() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_ext_key_id: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_EXT_KEY_ID_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-EKID", Some("12345678"));
+    config.networks[0].ext_key_id = true;
     let mut client = WifiClient::init(config).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(

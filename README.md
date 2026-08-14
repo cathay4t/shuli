@@ -73,6 +73,8 @@ WPA3-Personal networks (H2E-only; mixed into the PWE and the commit).
 `ocv: true` enables Operating Channel Validation for the network
 (OCVC RSN capability, OCI in Message 2, AP OCI verified in Message 3
 and group rekeys).
+`ext_key_id: true` enables Extended Key ID (pairwise key id 0/1
+rotation for lossless PTK rekeys; requires driver support).
 
 Wired 802.1X ports go in their own `ethernets:` section: each entry
 authenticates one Ethernet NIC with EAP-TLS (no WiFi association or

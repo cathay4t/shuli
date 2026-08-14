@@ -166,6 +166,36 @@ pub fn rsne_set_ocvc(rsne: &mut [u8], enabled: bool) {
     rsne[cap_off..cap_off + 2].copy_from_slice(&capab.to_le_bytes());
 }
 
+/// Set or clear the Extended Key ID capability bit (bit 13) in the RSN
+/// capabilities of a built RSNE (Stage 3 M11).
+pub fn rsne_set_ext_key_id(rsne: &mut [u8], enabled: bool) {
+    if rsne.len() < 4 {
+        return;
+    }
+    let body = &rsne[2..];
+    if body.len() < 8 {
+        return;
+    }
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_off = 8 + pcount * 4;
+    if body.len() < akm_off + 2 {
+        return;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_off], body[akm_off + 1]]) as usize;
+    let cap_off = 2 + akm_off + 2 + acount * 4;
+    if rsne.len() < cap_off + 2 {
+        return;
+    }
+    let capab = u16::from_le_bytes([rsne[cap_off], rsne[cap_off + 1]]);
+    let capab = if enabled {
+        capab | 0x2000 // WPA_CAPABILITY_EXT_KEY_ID_FOR_UNICAST
+    } else {
+        capab & !0x2000
+    };
+    rsne[cap_off..cap_off + 2].copy_from_slice(&capab.to_le_bytes());
+}
+
 /// The RSNXE element advertising SAE Hash-to-Element support; included
 /// in FT Reassociation Requests (and their FTIE MIC) on FT-SAE.
 pub fn sae_rsnxe() -> Vec<u8> {

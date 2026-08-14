@@ -14,10 +14,10 @@ use wl_nl80211::{
     Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
     Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
     Nl80211Event, Nl80211EventCode, Nl80211EventReason, Nl80211Handle,
-    Nl80211Key, Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
-    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
-    Nl80211SchedScanPlanAttr, Nl80211UseMfp, Nl80211Wowlan,
-    Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
+    Nl80211Key, Nl80211KeyDefaultType, Nl80211MulticastGroup, Nl80211Pmksa,
+    Nl80211RekeyOffload, Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr,
+    Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr, Nl80211UseMfp,
+    Nl80211Wowlan, Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
 };
 
 use crate::{
@@ -1571,6 +1571,9 @@ impl WifiClient {
                     if self.network.ocv {
                         elements::rsne_set_ocvc(&mut rsne, true);
                     }
+                    if self.network.ext_key_id {
+                        elements::rsne_set_ext_key_id(&mut rsne, true);
+                    }
                     let mut fw = FourWayState::new_ft(
                         ft.pmk_r1.clone(),
                         self.mac,
@@ -1583,6 +1586,7 @@ impl WifiClient {
                         self.state = WifiState::Failed;
                         return;
                     }
+                    fw.set_ext_key_id(self.network.ext_key_id);
                     self.fourway = Some(fw);
                 } else {
                     let (pmk, mut rsne, mic_alg) = if let Some(entry) =
@@ -1702,6 +1706,9 @@ impl WifiClient {
                     if self.network.ocv {
                         elements::rsne_set_ocvc(&mut rsne, true);
                     }
+                    if self.network.ext_key_id {
+                        elements::rsne_set_ext_key_id(&mut rsne, true);
+                    }
                     let mut fw = FourWayState::new_with_ap_ies(
                         &pmk,
                         mic_alg,
@@ -1715,6 +1722,7 @@ impl WifiClient {
                         self.state = WifiState::Failed;
                         return;
                     }
+                    fw.set_ext_key_id(self.network.ext_key_id);
                     self.fourway = Some(fw);
                 }
             }
@@ -1791,6 +1799,33 @@ impl WifiClient {
                 );
             }
 
+            // Stage 3 M11: with Extended Key ID the pairwise key is
+            // installed in two phases - RX-only before Message 4 (so
+            // frames protected with the new key id decrypt), then
+            // activated (TX) after Message 4.
+            let ext_key_id = self.fourway.as_ref().and_then(|fw| fw.key_id());
+            if let Some(key_id) = ext_key_id
+                && let Some(tk) = self.fourway.as_ref().and_then(|fw| fw.tk())
+            {
+                let attrs = Nl80211Key::new_ptk(
+                    self.if_index,
+                    self.bss_info.bssid,
+                    tk.to_vec(),
+                )
+                .key_index(key_id)
+                .build();
+                if let Err(e) = drain_request(
+                    self.conn_handle.new_key(attrs).execute().await,
+                )
+                .await
+                {
+                    log::warn!("install PTK (RX) failed: {e}");
+                    self.state = WifiState::Failed;
+                    return;
+                }
+                log::info!("PTK installed for RX (key id {key_id})");
+            }
+
             if let Err(e) = send_ctrl_port_frame(
                 &mut self.conn_handle,
                 self.if_index,
@@ -1806,18 +1841,20 @@ impl WifiClient {
             log::info!("4-way: Message 4 sent");
 
             if let Some(tk) = self.fourway.as_ref().and_then(|fw| fw.tk()) {
+                let mut builder = Nl80211Key::new_ptk(
+                    self.if_index,
+                    self.bss_info.bssid,
+                    tk.to_vec(),
+                );
+                if let Some(key_id) = ext_key_id {
+                    // Activate the RX-installed key as the default
+                    // unicast TX key.
+                    builder = builder
+                        .key_index(key_id)
+                        .default_types(vec![Nl80211KeyDefaultType::Unicast]);
+                }
                 if let Err(e) = drain_request(
-                    self.conn_handle
-                        .new_key(
-                            Nl80211Key::new_ptk(
-                                self.if_index,
-                                self.bss_info.bssid,
-                                tk.to_vec(),
-                            )
-                            .build(),
-                        )
-                        .execute()
-                        .await,
+                    self.conn_handle.new_key(builder.build()).execute().await,
                 )
                 .await
                 {
@@ -1825,7 +1862,11 @@ impl WifiClient {
                     self.state = WifiState::Failed;
                     return;
                 }
-                log::info!("PTK installed");
+                if let Some(key_id) = ext_key_id {
+                    log::info!("PTK activated (key id {key_id})");
+                } else {
+                    log::info!("PTK installed");
+                }
             }
 
             if let Some((gtk_idx, gtk_data)) = &kdes.gtk {
@@ -2371,6 +2412,9 @@ impl WifiClient {
         // enabled for this network.
         if self.network.ocv {
             elements::rsne_set_ocvc(&mut ie, true);
+        }
+        if self.network.ext_key_id {
+            elements::rsne_set_ext_key_id(&mut ie, true);
         }
         let mut builder = Nl80211Associate::new(self.if_index)
             .ssid(&self.network.ssid)

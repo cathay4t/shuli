@@ -108,3 +108,13 @@ fn ocv_defaults_to_disabled_and_can_be_enabled() {
     network.set_ocv(false);
     assert!(!network.ocv);
 }
+
+#[test]
+fn ext_key_id_defaults_to_disabled_and_can_be_enabled() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(!network.ext_key_id, "Extended Key ID must be opt-in");
+    network.set_ext_key_id(true);
+    assert!(network.ext_key_id);
+    network.set_ext_key_id(false);
+    assert!(!network.ext_key_id);
+}

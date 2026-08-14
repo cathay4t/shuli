@@ -274,7 +274,9 @@ fn test_parse_key_data_kdes_all() {
     ];
     key_data.extend_from_slice(&gtk);
     key_data.extend_from_slice(&build_mgmt_key_kde(9, 4, &ipn, &igtk));
-    key_data.extend_from_slice(&build_mgmt_key_kde(10, 6, &ipn, &bigtk));
+    key_data.extend_from_slice(&build_mgmt_key_kde(14, 6, &ipn, &bigtk));
+    // Key ID KDE (Extended Key ID): OUI(3) type(2) key_id(2 LE).
+    key_data.extend_from_slice(&[0xDD, 6, 0x00, 0x0F, 0xAC, 10, 1, 0]);
     // Transition Disable KDE (WFA OUI 50:6F:9A, type 0x20, bitmap 0x09
     // = WPA3-Personal + WPA3-Enterprise disabled).
     key_data.extend_from_slice(&[0xDD, 5, 0x50, 0x6F, 0x9A, 0x20, 0x09]);
@@ -298,6 +300,7 @@ fn test_parse_key_data_kdes_all() {
     assert_eq!(kdes.rsne.as_deref(), Some(rsne.as_slice()));
     assert_eq!(kdes.rsnxe.as_deref(), Some(rsnxe.as_slice()));
     assert_eq!(kdes.transition_disable, Some(0x09));
+    assert_eq!(kdes.key_id, Some(1));
     // parse_gtk_kde keeps its GTK-only contract on top of the full parser.
     assert_eq!(parse_gtk_kde(&key_data), Some((2, gtk.to_vec())));
 }
@@ -588,6 +591,91 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         err.to_string().contains("no OCI"),
         "unexpected error: {err}"
     );
+}
+
+/// Stage 3 M11: with Extended Key ID enabled, Message 3 must carry a
+/// valid Key ID KDE (0/1); the active key id is recorded and invalid
+/// values fail the handshake.
+#[test]
+fn test_extended_key_id_handshake() {
+    let pmk = [0x01u8; 32];
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+
+    let run =
+        |key_data: Vec<u8>| -> Result<(FourWayState, KeyDataKdes), WifiError> {
+            let mut state = FourWayState::new_with_ap_ies(
+                &pmk,
+                MicAlg::AesCmac,
+                sta,
+                ap,
+                vec![],
+                vec![],
+                vec![],
+            );
+            state.set_ext_key_id(true);
+            let msg1 = eapol::build_eapol_key_pdu(
+                0x0080 | 0x0008,
+                16,
+                1,
+                &[0x55u8; 32],
+                &[0u8; 16],
+                &[0u8; 8],
+                &[0u8; 8],
+                &[0u8; 16],
+                b"",
+            );
+            let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+            state
+                .process_message_1(
+                    &parsed1.key_nonce,
+                    parsed1.replay_counter,
+                    parsed1.key_info,
+                )
+                .unwrap();
+            let kck = state.kck().unwrap();
+            let kek = state.kek().unwrap();
+            let mut padded = key_data;
+            while padded.len() < 16 || !padded.len().is_multiple_of(8) {
+                padded.push(0);
+            }
+            let wrapped = aes_key_wrap(&kek, &padded).unwrap();
+            let msg3_key_info =
+                0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+            let mut msg3 = eapol::build_eapol_key_pdu(
+                msg3_key_info,
+                16,
+                2,
+                &[0u8; 32],
+                &[0u8; 16],
+                &[0u8; 8],
+                &[0u8; 8],
+                &[0u8; 16],
+                &wrapped,
+            );
+            let msg3_mic =
+                aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
+            eapol::set_mic(&mut msg3, &msg3_mic);
+            let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+            let (_, kdes) = state.process_message_3(&parsed3)?;
+            Ok((state, kdes))
+        };
+
+    // Valid Key ID 1: accepted and recorded.
+    let key_data = vec![0xDD, 6, 0x00, 0x0F, 0xAC, 10, 1, 0];
+    let (state, _kdes) = run(key_data).unwrap();
+    assert_eq!(state.key_id(), Some(1));
+
+    // Invalid Key ID 2: rejected.
+    let key_data = vec![0xDD, 6, 0x00, 0x0F, 0xAC, 10, 2, 0];
+    let err = run(key_data).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+    assert!(err.to_string().contains("invalid Extended Key ID"));
+
+    // Missing Key ID KDE: rejected under Extended Key ID.
+    let err = run(Vec::new()).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+    assert!(err.to_string().contains("without a Key ID KDE"));
 }
 
 /// G1c: EAPOL-Key frames with the Request bit set are dropped by

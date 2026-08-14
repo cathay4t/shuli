@@ -68,6 +68,12 @@ pub struct FourWayState {
     oci: Option<[u8; 3]>,
     /// BSS frequency (MHz) the OCI must match.
     freq_mhz: u32,
+    /// Stage 3 M11: Extended Key ID for pairwise keys (driver must
+    /// support it; enabled per network).
+    ext_key_id: bool,
+    /// The active pairwise key id (0/1) selected by the AP's Key ID
+    /// KDE in Message 3, when Extended Key ID is in use.
+    key_id: Option<u8>,
 }
 
 impl FourWayState {
@@ -108,6 +114,8 @@ impl FourWayState {
             ocv: false,
             oci: None,
             freq_mhz: 0,
+            ext_key_id: false,
+            key_id: None,
         }
     }
 
@@ -146,6 +154,8 @@ impl FourWayState {
             ocv: false,
             oci: None,
             freq_mhz: 0,
+            ext_key_id: false,
+            key_id: None,
         }
     }
 
@@ -155,6 +165,17 @@ impl FourWayState {
         self.ocv = enabled;
         self.oci = Some(oci);
         self.freq_mhz = freq_mhz;
+    }
+
+    /// Stage 3 M11: enable Extended Key ID handling for this
+    /// handshake.
+    pub fn set_ext_key_id(&mut self, enabled: bool) {
+        self.ext_key_id = enabled;
+    }
+
+    /// The pairwise key id (0/1) selected by the AP's Key ID KDE.
+    pub fn key_id(&self) -> Option<u8> {
+        self.key_id
     }
 
     pub(crate) fn derive_ptk(&self) -> [u8; PTK_LEN] {
@@ -358,6 +379,26 @@ impl FourWayState {
                 crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
             }
             kdes = parse_key_data_kdes(&plain);
+            // Stage 3 M11: Extended Key ID - the AP must send a Key ID
+            // KDE (0/1) when it negotiated the feature; anything else
+            // fails the handshake.
+            if self.ext_key_id {
+                let key_id = kdes.key_id.ok_or_else(|| {
+                    WifiError::new(
+                        ErrorKind::HandshakeFailed,
+                        "Extended Key ID handshake without a Key ID KDE",
+                    )
+                })?;
+                if key_id > 1 {
+                    return Err(WifiError::new(
+                        ErrorKind::HandshakeFailed,
+                        format!("invalid Extended Key ID {key_id}"),
+                    ));
+                }
+                self.key_id = Some(key_id);
+            } else {
+                self.key_id = None;
+            }
             // G1b: fail the handshake when the AP's RSNE / RSNXE in
             // Message 3 differ from the beacon/probe response copies
             // (802.11-2020 §12.7.6.4 downgrade protection).
@@ -546,6 +587,9 @@ pub(crate) struct KeyDataKdes {
     pub rsne: Option<Vec<u8>>,
     /// The AP's RSNXE as a full element (ID 244 + length + body).
     pub rsnxe: Option<Vec<u8>>,
+    /// Extended Key ID KDE (type 10): the pairwise key id (0/1) the AP
+    /// selected (Stage 3 M11).
+    pub key_id: Option<u8>,
     /// Transition Disable KDE bitmap (WFA OUI 50:6F:9A, type 0x20):
     /// bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
     /// 3 = Enhanced Open (Stage 3 M9).
@@ -556,7 +600,8 @@ const KDE_OUI: [u8; 3] = [0x00, 0x0F, 0xAC];
 const WFA_OUI: [u8; 3] = [0x50, 0x6F, 0x9A];
 const GTK_KDE_TYPE: u8 = 1;
 const IGTK_KDE_TYPE: u8 = 9;
-const BIGTK_KDE_TYPE: u8 = 10;
+const KEY_ID_KDE_TYPE: u8 = 10;
+const BIGTK_KDE_TYPE: u8 = 14;
 const WFA_TRANSITION_DISABLE_TYPE: u8 = 0x20;
 const IE_ID_RSN: u8 = 48;
 const IE_ID_RSNXE: u8 = 244;
@@ -616,6 +661,11 @@ pub(crate) fn parse_key_data_kdes(key_data: &[u8]) -> KeyDataKdes {
                         } else {
                             kdes.bigtk = Some(mgmt_key);
                         }
+                    }
+                    KEY_ID_KDE_TYPE if body.len() >= 5 => {
+                        // Key ID KDE: OUI(3) type(1) key_id(2 LE); only
+                        // the low two bits of the first octet are used.
+                        kdes.key_id = Some(body[4] & 0x03);
                     }
                     _ => {}
                 }

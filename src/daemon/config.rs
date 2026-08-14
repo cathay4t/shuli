@@ -88,6 +88,10 @@ pub(crate) struct WifiEntry {
     /// Operating Channel Validation (OCV) for this network.
     #[serde(default)]
     pub ocv: bool,
+    /// Extended Key ID (pairwise key id 0/1 rotation) for this
+    /// network.  Requires driver support.
+    #[serde(default)]
+    pub ext_key_id: bool,
     /// Interface name to bind to.  `"any"` (or absent) picks the
     /// first available wifi interface.
     #[serde(default)]
@@ -201,6 +205,7 @@ impl ShuliConfig {
             network.wowlan = entry.wowlan;
             network.sae_password_id = entry.sae_password_id.clone();
             network.ocv = entry.ocv;
+            network.ext_key_id = entry.ext_key_id;
             if let Some(eap) = entry.eap.as_ref() {
                 network.eap = Some(eap.to_lib());
             }
@@ -377,5 +382,20 @@ wifis:
         );
         let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(wifi.networks[0].ocv);
+    }
+
+    #[test]
+    fn ext_key_id_maps_to_network() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    ext_key_id: true
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(wifi.networks[0].ext_key_id);
     }
 }
