@@ -1409,6 +1409,15 @@ impl WifiClient {
                         None,
                         self.bss_info.group_mgmt_cipher,
                     ),
+                    SecurityType::FtSaeExtKey => {
+                        elements::ft_sae_ext_key_ie_cipher(
+                            None,
+                            self.bss_info.group_mgmt_cipher,
+                        )
+                    }
+                    SecurityType::SaeExtKey => elements::sae_ext_key_ie_cipher(
+                        self.bss_info.group_mgmt_cipher,
+                    ),
                     _ => {
                         elements::sae_ie_cipher(self.bss_info.group_mgmt_cipher)
                     }
@@ -1417,8 +1426,10 @@ impl WifiClient {
                 // FT initial mobility domain association: the request
                 // carries the MDIE, which prompts the AP to answer with
                 // MDIE + FTIE (R0KH-ID / R1KH-ID).
-                if self.bss_info.security == SecurityType::FtSae
-                    && let Err(e) = self.append_ft_mdie(&mut ies)
+                if matches!(
+                    self.bss_info.security,
+                    SecurityType::FtSae | SecurityType::FtSaeExtKey
+                ) && let Err(e) = self.append_ft_mdie(&mut ies)
                 {
                     log::warn!("FT ASSOCIATE failed: {e}");
                     self.state = WifiState::Failed;
@@ -1560,6 +1571,12 @@ impl WifiClient {
                             Some(ft.pmk_r1.name),
                             self.bss_info.group_mgmt_cipher,
                         ),
+                        SecurityType::FtSaeExtKey => {
+                            elements::ft_sae_ext_key_ie_cipher(
+                                Some(ft.pmk_r1.name),
+                                self.bss_info.group_mgmt_cipher,
+                            )
+                        }
                         _ => elements::ft_psk_ie_cipher(
                             Some(ft.pmk_r1.name),
                             self.bss_info.group_mgmt_cipher,
@@ -1682,6 +1699,25 @@ impl WifiClient {
                                         self.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::AesCmac,
+                                )
+                            }
+                            SecurityType::SaeExtKey => {
+                                let Some(pmk) =
+                                    self.auth.as_ref().and_then(|a| a.pmk())
+                                else {
+                                    log::warn!(
+                                        "no SAE-EXT-KEY PMK for 4-way \
+                                         handshake"
+                                    );
+                                    self.state = WifiState::Failed;
+                                    return;
+                                };
+                                (
+                                    pmk,
+                                    elements::sae_ext_key_ie_cipher(
+                                        self.bss_info.group_mgmt_cipher,
+                                    ),
+                                    MicAlg::HmacSha256,
                                 )
                             }
                             _ => {
@@ -2447,7 +2483,17 @@ impl WifiClient {
                 pmkid,
                 self.bss_info.group_mgmt_cipher,
             ),
+            SecurityType::SaeExtKey => {
+                elements::sae_ext_key_ie_with_pmkid_cipher(
+                    pmkid,
+                    self.bss_info.group_mgmt_cipher,
+                )
+            }
             SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                pmkid,
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_ie_cipher(
                 pmkid,
                 self.bss_info.group_mgmt_cipher,
             ),
@@ -2491,7 +2537,9 @@ impl WifiClient {
         );
         let ie = self.rsne_with_pmkid(Some(entry.pmkid));
         let mfp = match self.bss_info.security {
-            SecurityType::Sae => Some(Nl80211UseMfp::Required),
+            SecurityType::Sae
+            | SecurityType::SaeExtKey
+            | SecurityType::FtSaeExtKey => Some(Nl80211UseMfp::Required),
             _ => self
                 .bss_info
                 .ap_mfp_capable()
@@ -2539,6 +2587,18 @@ impl WifiClient {
                             return;
                         };
                         (pmk, pmkid, MicAlg::AesCmac)
+                    }
+                    // SAE-EXT-KEY: same SAE PMK/PMKID derivation; the
+                    // 4-way MIC is HMAC-SHA256 (AKM-defined).
+                    SecurityType::SaeExtKey => {
+                        let Some((pmk, pmkid)) = self
+                            .auth
+                            .as_ref()
+                            .and_then(|a| a.pmk().zip(a.pmkid()))
+                        else {
+                            return;
+                        };
+                        (pmk, pmkid, MicAlg::HmacSha256)
                     }
                     // WPA2-PSK: PMKID = Truncate-128(HMAC-SHA1(PMK,
                     // "PMK Name" || AA || SPA)), 802.11-2020 §9.4.2.25.3.

@@ -246,6 +246,73 @@ pub fn sae_ie_with_pmkid_cipher(
     buf
 }
 
+/// Build the RSNE + RSNXE for SAE-EXT-KEY (AKM 00-0F-AC:24, Stage 3
+/// M12): same security policy as SAE (CCMP-128, MFP required, H2E),
+/// only the AKM differs.
+pub fn sae_ext_key_ie_cipher(mgmt_cipher: Nl80211CipherSuite) -> Vec<u8> {
+    sae_ext_key_ie_with_pmkid_cipher(None, mgmt_cipher)
+}
+
+/// [`sae_ext_key_ie_cipher`] carrying a PMKID.
+pub fn sae_ext_key_ie_with_pmkid_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
+    let elements = Nl80211Elements(vec![
+        Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::SaeGroupDependentHash],
+            rsn_capbilities: Some(
+                Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
+            ),
+            pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
+            group_mgmt_cipher: Some(mgmt_cipher),
+        }),
+        Nl80211Element::RsnExt(Nl80211ElementRsnExt {
+            capabilities: Nl80211RsnExtCapbilities::SaeH2e,
+        }),
+    ]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}
+
+/// Build the FT-SAE-EXT-KEY RSNE element only (AKM 00-0F-AC:25).
+pub fn ft_sae_ext_key_rsne_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
+    let elements =
+        Nl80211Elements(vec![Nl80211Element::Rsn(Nl80211ElementRsn {
+            version: 1,
+            group_cipher: Some(Nl80211CipherSuite::Ccmp128),
+            pairwise_ciphers: vec![Nl80211CipherSuite::Ccmp128],
+            akm_suits: vec![Nl80211AkmSuite::FtSaeGroupDependentHash],
+            rsn_capbilities: Some(
+                Nl80211RsnCapbilities::Mfpr | Nl80211RsnCapbilities::Mfpc,
+            ),
+            pmkids: pmkid.into_iter().map(Nl80211Pmkid).collect(),
+            group_mgmt_cipher: Some(mgmt_cipher),
+        })]);
+
+    let mut buf = vec![0u8; elements.buffer_len()];
+    elements.emit(&mut buf);
+    buf
+}
+
+/// Build the RSNE + RSNXE for FT-SAE-EXT-KEY (AKM 00-0F-AC:25).
+pub fn ft_sae_ext_key_ie_cipher(
+    pmkid: Option<[u8; 16]>,
+    mgmt_cipher: Nl80211CipherSuite,
+) -> Vec<u8> {
+    let mut buf = ft_sae_ext_key_rsne_cipher(pmkid, mgmt_cipher);
+    buf.extend_from_slice(&sae_rsnxe());
+    buf
+}
+
 /// Build the RSNE for OWE (AKM 00-0F-AC:18, CCMP-128, MFP required).
 /// No RSNXE — OWE does not use SAE H2E.
 /// [`owe_ie`] with a negotiated group management (BIP) cipher.

@@ -155,7 +155,7 @@ impl WifiClient {
         })?;
 
         let xxkey = match self.bss_info.security {
-            SecurityType::FtSae => {
+            SecurityType::FtSae | SecurityType::FtSaeExtKey => {
                 self.auth.as_ref().and_then(|a| a.pmk()).ok_or_else(|| {
                     WifiError::new(ErrorKind::Roaming, "no SAE PMK for FT")
                 })?
@@ -506,8 +506,18 @@ impl WifiClient {
         // request with INVALID_PMKID when the RSNE / PMKR0Name is
         // missing.
         let rsne = match self.bss_info.security {
-            SecurityType::FtSae => elements::ft_sae_rsne(Some(ft.pmk_r0.name)),
-            _ => elements::ft_psk_rsne(Some(ft.pmk_r0.name)),
+            SecurityType::FtSae => elements::ft_sae_rsne_cipher(
+                Some(ft.pmk_r0.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
+                Some(ft.pmk_r0.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
+            _ => elements::ft_psk_rsne_cipher(
+                Some(ft.pmk_r0.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
         };
         let mut ft_ies = rsne;
         ft_ies.extend_from_slice(&elements::mdie(
@@ -722,14 +732,27 @@ impl WifiClient {
         })?;
 
         let rsne = match target.security {
-            SecurityType::FtSae => elements::ft_sae_rsne(Some(pmk_r1.name)),
-            _ => elements::ft_psk_rsne(Some(pmk_r1.name)),
+            SecurityType::FtSae => elements::ft_sae_rsne_cipher(
+                Some(pmk_r1.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
+                Some(pmk_r1.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
+            _ => elements::ft_psk_rsne_cipher(
+                Some(pmk_r1.name),
+                self.bss_info.group_mgmt_cipher,
+            ),
         };
         let mdie = elements::mdie(target_mdie.mdid, target_mdie.ft_capab);
         // FT-SAE uses SAE H2E: the RSNXE participates in the FTIE MIC
         // (after the FTIE, 802.11-2020 §12.8.4).
-        let rsnxe =
-            (target.security == SecurityType::FtSae).then(elements::sae_rsnxe);
+        let rsnxe = matches!(
+            target.security,
+            SecurityType::FtSae | SecurityType::FtSaeExtKey
+        )
+        .then(elements::sae_rsnxe);
 
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
         let ftie = elements::ftie_reassoc_request(
@@ -755,7 +778,9 @@ impl WifiClient {
         ies.extend_from_slice(&ftie);
 
         let mfp = match target.security {
-            SecurityType::FtSae => Some(Nl80211UseMfp::Required),
+            SecurityType::FtSae | SecurityType::FtSaeExtKey => {
+                Some(Nl80211UseMfp::Required)
+            }
             _ => target.ap_mfp_capable().then_some(Nl80211UseMfp::Required),
         };
         let mut builder = Nl80211Associate::new(self.if_index)

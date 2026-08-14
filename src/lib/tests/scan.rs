@@ -72,6 +72,8 @@ fn test_supported_akms_are_recognized() {
         (4, SecurityType::FtPsk),
         (8, SecurityType::Sae),
         (9, SecurityType::FtSae),
+        (24, SecurityType::SaeExtKey),
+        (25, SecurityType::FtSaeExtKey),
         (18, SecurityType::Owe),
     ] {
         let sec = detect_security(&rsne_ie(akm));

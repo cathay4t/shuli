@@ -46,6 +46,11 @@ pub enum SecurityType {
     FtPsk,
     /// RSNE with AKM 00-0F-AC:9 — FT over WPA3-SAE (802.11r).
     FtSae,
+    /// RSNE with AKM 00-0F-AC:24 — SAE-EXT-KEY (SAE with the
+    /// AKM-defined 4-way key hierarchy).
+    SaeExtKey,
+    /// RSNE with AKM 00-0F-AC:25 — FT over SAE-EXT-KEY (802.11r).
+    FtSaeExtKey,
     /// Encrypted with a security mode shuli does not support (e.g.
     /// WPA-Enterprise / 802.1X, WPA1/TKIP). Never connect to such a
     /// BSS: it must not be treated as open.
@@ -55,7 +60,12 @@ pub enum SecurityType {
 impl SecurityType {
     /// Whether this security type supports Fast BSS Transition.
     pub(crate) fn is_ft(&self) -> bool {
-        matches!(self, SecurityType::FtPsk | SecurityType::FtSae)
+        matches!(
+            self,
+            SecurityType::FtPsk
+                | SecurityType::FtSae
+                | SecurityType::FtSaeExtKey
+        )
     }
 
     /// The non-FT counterpart of an FT AKM (used to match a roam
@@ -64,6 +74,7 @@ impl SecurityType {
         match self {
             SecurityType::FtPsk => SecurityType::Wpa2Psk,
             SecurityType::FtSae => SecurityType::Sae,
+            SecurityType::FtSaeExtKey => SecurityType::SaeExtKey,
             other => *other,
         }
     }
@@ -381,6 +392,8 @@ const AKM_FT_PSK: u8 = 4;
 const AKM_OWE: u8 = 18;
 const AKM_SAE: u8 = 8;
 const AKM_FT_SAE: u8 = 9;
+const AKM_SAE_EXT_KEY: u8 = 24;
+const AKM_FT_SAE_EXT_KEY: u8 = 25;
 /// WPA vendor IE OUI (Microsoft): 00:50:F2, type 1 = WPA (WPA1/TKIP).
 const WPA_IE_OUI: [u8; 3] = [0x00, 0x50, 0xF2];
 const WPA_IE_TYPE: u8 = 1;
@@ -472,8 +485,10 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
 fn akm_rank(security: SecurityType) -> u8 {
     match security {
         SecurityType::FtSae => 5,
+        SecurityType::FtSaeExtKey => 5,
         SecurityType::FtPsk => 4,
         SecurityType::Sae => 4,
+        SecurityType::SaeExtKey => 4,
         SecurityType::Wpa2PskSha256 => 3,
         SecurityType::Owe | SecurityType::Wpa2Psk => 2,
         SecurityType::Wpa2EntSha256 | SecurityType::Wpa2Ent => 1,
@@ -524,8 +539,10 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
         if body[off] == 0x00 && body[off + 1] == 0x0F && body[off + 2] == 0xAC {
             let candidate = match body[off + 3] {
                 AKM_FT_SAE => SecurityType::FtSae,
+                AKM_FT_SAE_EXT_KEY => SecurityType::FtSaeExtKey,
                 AKM_FT_PSK => SecurityType::FtPsk,
                 AKM_SAE => SecurityType::Sae,
+                AKM_SAE_EXT_KEY => SecurityType::SaeExtKey,
                 AKM_OWE => SecurityType::Owe,
                 AKM_PSK => SecurityType::Wpa2Psk,
                 AKM_PSK_SHA256 => SecurityType::Wpa2PskSha256,

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M12 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M13 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -91,7 +91,12 @@
   RX-then-TX PTK install; also fixed the BIGTK KDE type (14, not 10).
   Unit tests + hostapd `extended_key_id=1` integration test.
 * **M12 — SAE-EXT-KEY (Goal 5):** AKM `00-0F-AC:24` / FT `:25` with
-  384/512-bit PMK and AKM-defined KDFs.
+  384/512-bit PMK and AKM-defined KDFs.  **Done 2026-08-14:** AKM
+  24/25 classification + RSNE builders, SAE auth reused (32-byte PMK
+  for group 19), AKM-defined 4-way (KDV 0, KDF-Hash-Length PTK,
+  HMAC-SHA256 MIC), FT-SAE-EXT-KEY wired into the FT path, PMKSA
+  caching.  Unit tests (scan + handshake); hostapd integration N/A
+  (this build lacks `CONFIG_SAE_EXT_KEY`).
 * **M13 — SAE-PK (Goal 5):** SAE with Public Key (RSNXE capability
   bit, auth status 127, EC public key embedded in the password).
 

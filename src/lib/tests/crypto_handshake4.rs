@@ -9,6 +9,7 @@ use crate::{
             FourWayState, KEK_LEN, KeyDataKdes, MicAlg, aes_cmac,
             aes_key_unwrap, parse_gtk_kde, parse_key_data_kdes,
         },
+        kdf::hmac_sha256_mic,
         ocv::{build_oci_kde, parse_oci_kde},
     },
     ieee80211::eapol,
@@ -676,6 +677,74 @@ fn test_extended_key_id_handshake() {
     let err = run(Vec::new()).unwrap_err();
     assert_eq!(err.kind, ErrorKind::HandshakeFailed);
     assert!(err.to_string().contains("without a Key ID KDE"));
+}
+
+/// Stage 3 M12: SAE-EXT-KEY (AKM 24) uses the AKM-defined 4-way
+/// hierarchy - KDF-Hash-Length PTK with HMAC-SHA256 MIC and Key
+/// Descriptor Version 0.
+#[test]
+fn test_sae_ext_key_handshake() {
+    let pmk = [0x01u8; 32];
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::HmacSha256,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    let msg1 = eapol::build_eapol_key_pdu(
+        0x0080 | 0x0008, // ack + pairwise, KDV 0 (AKM-defined)
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let msg2 = state
+        .process_message_1(
+            &parsed1.key_nonce,
+            parsed1.replay_counter,
+            parsed1.key_info,
+        )
+        .unwrap();
+    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    assert_eq!(eapol::desc_version(m2.key_info), 0);
+    let kck = state.kck().unwrap();
+    let mic = hmac_sha256_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2));
+    assert_eq!(m2.key_mic, mic);
+
+    // Message 3 with HMAC-SHA256 MIC.
+    let mut empty = Vec::new();
+    while empty.len() < 16 || !empty.len().is_multiple_of(8) {
+        empty.push(0);
+    }
+    let kek = state.kek().unwrap();
+    let wrapped = aes_key_wrap(&kek, &empty).unwrap();
+    let msg3_key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+    let mut msg3 = eapol::build_eapol_key_pdu(
+        msg3_key_info,
+        16,
+        2,
+        &[0u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
+    );
+    let msg3_mic = hmac_sha256_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg3));
+    eapol::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    state.process_message_3(&parsed3).unwrap();
 }
 
 /// G1c: EAPOL-Key frames with the Request bit set are dropped by

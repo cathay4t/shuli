@@ -247,9 +247,11 @@ impl WifiClient {
         if matches!(
             self.bss_info.security,
             SecurityType::Sae
+                | SecurityType::SaeExtKey
                 | SecurityType::Wpa2Psk
                 | SecurityType::Wpa2PskSha256
                 | SecurityType::FtSae
+                | SecurityType::FtSaeExtKey
                 | SecurityType::FtPsk
         ) && let Some(entry) = self
             .pmksa_cache
@@ -267,7 +269,10 @@ impl WifiClient {
         if self.pmksa_in_use.is_some()
             || !matches!(
                 self.bss_info.security,
-                SecurityType::Sae | SecurityType::FtSae
+                SecurityType::Sae
+                    | SecurityType::SaeExtKey
+                    | SecurityType::FtSae
+                    | SecurityType::FtSaeExtKey
             )
         {
             // Open-system authentication: open, OWE, WPA2-PSK, FT-PSK,
