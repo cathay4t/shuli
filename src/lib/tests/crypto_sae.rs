@@ -6,7 +6,8 @@ use p256::{
 };
 
 use crate::crypto::sae::{
-    SaeAuth, compute_pwe_h2e, compute_pwe_hnp, parse_anti_clogging_token,
+    SaeAuth, compute_pwe_h2e, compute_pwe_h2e_with_id, compute_pwe_hnp,
+    parse_anti_clogging_token,
 };
 
 fn affine_x_bytes(point: &AffinePoint) -> [u8; 32] {
@@ -52,6 +53,82 @@ fn test_hnp_pwe_derivation() {
         affine_x_bytes(&h2e.to_affine()),
         "HnP and H2E PWE must differ"
     );
+}
+
+/// Stage 3 M7: an SAE password identifier changes the H2E PWE (it is
+/// mixed into `pwd-seed`), is carried in the commit's Password
+/// Identifier element, and must produce matching PMKs on both sides.
+#[test]
+fn test_sae_password_identifier() {
+    let (mac_sta, mac_ap) = test_macs();
+    let password = "12345678";
+    let ssid = "Test-WIFI";
+
+    let plain =
+        compute_pwe_h2e(password, ssid, &mac_sta, &mac_ap).expect("plain");
+    let with_id = compute_pwe_h2e_with_id(
+        password,
+        ssid,
+        &mac_sta,
+        &mac_ap,
+        Some("corp-id"),
+    )
+    .expect("with id");
+    assert_ne!(
+        affine_x_bytes(&plain.to_affine()),
+        affine_x_bytes(&with_id.to_affine()),
+        "password identifier must change the H2E PWE"
+    );
+
+    // Commit payload: group(2) || scalar(32) || element(64) ||
+    // FF || 1+len || 33 || id
+    let mut sae = SaeAuth::new_with_password_id(
+        password,
+        ssid,
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+        Some("corp-id"),
+    )
+    .unwrap();
+    let auth_data = sae.build_init_auth_msg();
+    let body = &auth_data[4..];
+    let id = b"corp-id";
+    assert_eq!(
+        &body[98..101],
+        &[0xff, 1 + id.len() as u8, 33],
+        "Password Identifier element header"
+    );
+    assert_eq!(&body[101..101 + id.len()], id, "identifier bytes");
+
+    // Same identifier on both sides -> matching PMK.
+    let mut rng = getrandom::SysRng;
+    let mut supp = SaeAuth::new_with_password_id(
+        password,
+        ssid,
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+        Some("corp-id"),
+    )
+    .unwrap();
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
+    let mut ap = SaeAuth::new_with_password_id(
+        password,
+        ssid,
+        mac_ap,
+        mac_sta,
+        true,
+        false,
+        Some("corp-id"),
+    )
+    .unwrap();
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
+    supp.process_commit(&ap_scalar, &ap_elem).unwrap();
+    ap.process_commit(&supp_scalar, &supp_elem).unwrap();
+    assert_eq!(supp.pmk(), ap.pmk(), "PMK must match with the same id");
 }
 
 /// G2b: a full SAE exchange where both sides derive the PWE with

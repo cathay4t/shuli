@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-14, M7 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M8 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -57,8 +57,11 @@
   integration test over a veth pair against an in-test EAP-TLS
   authenticator (the installed hostapd lacks `driver=wired`).
 * **M7 — SAE password identifiers (Goal 5):** optional per-network
-  password identifier sent in the H2E commit; status 123
-  (password-identifier-needed) handling.  Config: `sae_password_id`.
+  password identifier mixed into the H2E PWE and sent in the commit's
+  Password Identifier element; status 123 (unknown password
+  identifier) fails cleanly.  Config: `sae_password_id`.
+  **Done 2026-08-14:** unit tests (PWE difference, commit element,
+  matching PMK) + hostapd `sae_password=<pass>|id=<id>` integration.
 * **M8 — More BIP ciphers in the RSNE (Goal 5):** advertise and
   negotiate BIP-CMAC-128/256 and BIP-GMAC-128/256 (preference
   GMAC-256 > CMAC-256 > GMAC-128 > CMAC-128) and install IGTK/BIGTK

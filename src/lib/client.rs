@@ -1445,6 +1445,7 @@ impl WifiClient {
             self.bss_info.bssid,
             false, // h2e
             false, // no further fallback
+            None,  // HnP restart never carries a password identifier
         ) {
             Ok(auth) => auth,
             Err(e) => {

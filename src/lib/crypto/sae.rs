@@ -37,9 +37,15 @@ const SAE_PMK_LEN: usize = 32;
 const SAE_STATUS_H2E: u16 = 126;
 /// IEEE 802.11 status code 76: anti-clogging token required.
 pub(crate) const SAE_STATUS_ANTI_CLOGGING: u16 = 76;
+/// IEEE 802.11 status code 123: the AP does not know the SAE password
+/// identifier (missing when one was required, or wrong).
+pub(crate) const SAE_STATUS_UNKNOWN_PASSWORD_IDENTIFIER: u16 = 123;
 /// Element ID extension of the Anti-Clogging Token Container element
 /// (inside the `WLAN_EID_EXTENSION` = 255 element, 802.11-2020 §9.4.2.47.4).
 const EXT_ANTI_CLOGGING_TOKEN: u8 = 93;
+/// Element ID extension of the Password Identifier element (inside the
+/// `WLAN_EID_EXTENSION` = 255 element, 802.11-2020 §9.4.2.47.2).
+const EXT_PASSWORD_IDENTIFIER: u8 = 33;
 /// Number of hunting-and-pecking iterations before giving up (both
 /// reference implementations cap at 200; the PWE is found within a few).
 const HNP_MAX_ITER: u16 = 200;
@@ -70,9 +76,16 @@ pub(crate) struct SaeAuth {
     hnp_fallback: bool,
     own_scalar_bytes: [u8; 32],
     own_elem_bytes: [u8; 64], // x || y uncompressed
+    /// Optional SAE password identifier (Stage 3 M7): included in the
+    /// H2E PWE derivation and in the commit's Password Identifier
+    /// element.  H2E-only, like wpa_supplicant.
+    password_id: Option<String>,
 }
 
 impl SaeAuth {
+    /// Convenience constructor without a password identifier (used by
+    /// unit tests; production callers pass the identifier explicitly).
+    #[allow(dead_code)]
     pub(crate) fn new(
         password: &str,
         ssid: &str,
@@ -81,8 +94,40 @@ impl SaeAuth {
         h2e: bool,
         hnp_fallback: bool,
     ) -> Result<Self, WifiError> {
+        Self::new_with_password_id(
+            password,
+            ssid,
+            mac_sta,
+            mac_ap,
+            h2e,
+            hnp_fallback,
+            None,
+        )
+    }
+
+    /// Like [`new`](Self::new), with an optional SAE password
+    /// identifier (Stage 3 M7).
+    pub(crate) fn new_with_password_id(
+        password: &str,
+        ssid: &str,
+        mac_sta: [u8; 6],
+        mac_ap: [u8; 6],
+        h2e: bool,
+        hnp_fallback: bool,
+        password_id: Option<&str>,
+    ) -> Result<Self, WifiError> {
         let pwe = if h2e {
-            compute_pwe_h2e(password, ssid, &mac_sta, &mac_ap)?
+            if let Some(id) = password_id {
+                compute_pwe_h2e_with_id(
+                    password,
+                    ssid,
+                    &mac_sta,
+                    &mac_ap,
+                    Some(id),
+                )?
+            } else {
+                compute_pwe_h2e(password, ssid, &mac_sta, &mac_ap)?
+            }
         } else {
             compute_pwe_hnp(password, ssid, &mac_sta, &mac_ap)?
         };
@@ -101,6 +146,7 @@ impl SaeAuth {
             hnp_fallback,
             own_scalar_bytes: [0u8; 32],
             own_elem_bytes: [0u8; 64],
+            password_id: password_id.map(str::to_string),
         })
     }
 
@@ -325,6 +371,7 @@ impl SaeAuth {
             &scalar,
             &element,
             None,
+            self.password_id.as_deref().map(str::as_bytes),
         )
     }
 
@@ -351,6 +398,7 @@ impl SaeAuth {
             &scalar,
             &element,
             Some(token),
+            self.password_id.as_deref().map(str::as_bytes),
         ))
     }
 }
@@ -363,10 +411,13 @@ fn build_commit_auth_data(
     scalar: &[u8],
     element: &[u8],
     token: Option<&[u8]>,
+    password_id: Option<&[u8]>,
 ) -> Vec<u8> {
     let token_len = token.map_or(0, |t| t.len());
-    let mut auth_data =
-        Vec::with_capacity(6 + scalar.len() + element.len() + token_len + 3);
+    let id_len = password_id.map_or(0, |id| 3 + id.len());
+    let mut auth_data = Vec::with_capacity(
+        6 + scalar.len() + element.len() + token_len + id_len + 3,
+    );
     auth_data.extend_from_slice(&1u16.to_le_bytes()); // transaction = commit
     // status: SAE_HASH_TO_ELEMENT for H2E, 0 for hunting-and-pecking
     auth_data.extend_from_slice(
@@ -375,6 +426,13 @@ fn build_commit_auth_data(
     auth_data.extend_from_slice(&group.to_le_bytes());
     auth_data.extend_from_slice(scalar);
     auth_data.extend_from_slice(element);
+    if let Some(id) = password_id {
+        // Password Identifier element: FF || 1+len || 33 || id
+        auth_data.push(255);
+        auth_data.push(1 + id.len() as u8);
+        auth_data.push(EXT_PASSWORD_IDENTIFIER);
+        auth_data.extend_from_slice(id);
+    }
     if let Some(token) = token {
         if h2e {
             // Anti-Clogging Token Container: extended element
@@ -436,7 +494,19 @@ pub(crate) fn compute_pwe_h2e(
     mac_sta: &[u8; 6],
     mac_ap: &[u8; 6],
 ) -> Result<ProjectivePoint, WifiError> {
-    let pt = derive_pt_ecc(ssid.as_bytes(), password.as_bytes())?;
+    compute_pwe_h2e_with_id(password, ssid, mac_sta, mac_ap, None)
+}
+
+/// H2E PWE derivation with an optional SAE password identifier
+/// (Stage 3 M7): `pwd-seed = HKDF-Extract(ssid, password || id)`.
+pub(crate) fn compute_pwe_h2e_with_id(
+    password: &str,
+    ssid: &str,
+    mac_sta: &[u8; 6],
+    mac_ap: &[u8; 6],
+    password_id: Option<&str>,
+) -> Result<ProjectivePoint, WifiError> {
+    let pt = derive_pt_ecc(ssid.as_bytes(), password.as_bytes(), password_id)?;
     derive_pwe_from_pt(&pt, mac_sta, mac_ap)
 }
 
@@ -557,9 +627,14 @@ pub(crate) fn compute_pwe_hnp(
 fn derive_pt_ecc(
     ssid: &[u8],
     password: &[u8],
+    password_id: Option<&str>,
 ) -> Result<ProjectivePoint, WifiError> {
-    // pwd-seed = HKDF-Extract(ssid, password)
-    let pwd_seed = hkdf_extract_sha256(ssid, password);
+    // pwd-seed = HKDF-Extract(ssid, password [|| password identifier])
+    let mut ikm = password.to_vec();
+    if let Some(id) = password_id {
+        ikm.extend_from_slice(id.as_bytes());
+    }
+    let pwd_seed = hkdf_extract_sha256(ssid, &ikm);
 
     let p1 = sswu_from_label(&pwd_seed, b"SAE Hash to Element u1 P1")?;
     let p2 = sswu_from_label(&pwd_seed, b"SAE Hash to Element u2 P2")?;

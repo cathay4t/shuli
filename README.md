@@ -68,6 +68,8 @@ disconnect and GTK-rekey-failure triggers so the device can wake the
 host on suspend, and it reconnects after a GTK-rekey-failure wake.
 An `eap:` block (identity, CA/client certificates, server name) turns
 the network into WPA2-Enterprise with EAP-TLS (802.1X).
+`sae_password_id` sets an optional SAE password identifier for
+WPA3-Personal networks (H2E-only; mixed into the PWE and the commit).
 
 Wired 802.1X ports go in their own `ethernets:` section: each entry
 authenticates one Ethernet NIC with EAP-TLS (no WiFi association or

@@ -211,6 +211,23 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Stage 3 M7: the AP only accepts the SAE password with identifier
+/// `corp-id` (`sae_password=<pass>|id=<id>`).
+const SAE_PASSWORD_ID_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PWID
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=2
+sae_password=12345678|id=corp-id
+ctrl_interface=/var/run/hostapd
+";
+
 const WPA2_PSK_PMF_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
 driver=nl80211
@@ -727,6 +744,37 @@ async fn wifi_client_sae_hnp_fallback() {
         state.is_err(),
         "H2E-only network must not connect to an HnP-only AP"
     );
+    client.shutdown().await;
+}
+
+/// Stage 3 M7: with `sae_password_id` configured, the client mixes the
+/// identifier into the H2E PWE and the commit's Password Identifier
+/// element, so hostapd (which only knows `12345678|id=corp-id`)
+/// accepts the connection.
+#[tokio::test]
+async fn wifi_client_sae_password_identifier() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_password_identifier: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_PASSWORD_ID_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PWID", Some("12345678"));
+    config.networks[0].set_sae_password_id(Some("corp-id"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
     client.shutdown().await;
 }
 

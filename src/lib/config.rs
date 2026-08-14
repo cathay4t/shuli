@@ -81,6 +81,11 @@ pub struct NetworkConfig {
     /// [`SaePwe::Auto`]: hash-to-element first, hunting-and-pecking
     /// fallback for HnP-only APs.
     pub sae_pwe: SaePwe,
+    /// Optional SAE password identifier (Stage 3 M7).  When set, the
+    /// client derives the H2E PWE with the identifier, includes it in
+    /// the SAE commit, and never falls back to hunting-and-pecking
+    /// (password identifiers are H2E-only).
+    pub sae_password_id: Option<String>,
 }
 
 impl NetworkConfig {
@@ -93,6 +98,7 @@ impl NetworkConfig {
             wowlan: false,
             eap: None,
             sae_pwe: SaePwe::Auto,
+            sae_password_id: None,
         }
     }
 
@@ -112,6 +118,12 @@ impl NetworkConfig {
     /// Attach EAP credentials to this network (802.1X).
     pub fn set_eap(&mut self, eap: EapConfig) -> &mut Self {
         self.eap = Some(eap);
+        self
+    }
+
+    /// Set the optional SAE password identifier (WPA3-Personal).
+    pub fn set_sae_password_id(&mut self, id: Option<&str>) -> &mut Self {
+        self.sae_password_id = id.map(str::to_string);
         self
     }
 }

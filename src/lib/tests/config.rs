@@ -85,3 +85,16 @@ fn eap_config_defaults_to_none_and_can_be_set() {
         Some(std::path::Path::new("/etc/shuli/client.pem"))
     );
 }
+
+#[test]
+fn sae_password_id_defaults_to_none_and_can_be_set() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(
+        network.sae_password_id.is_none(),
+        "SAE password identifier must be opt-in"
+    );
+    network.set_sae_password_id(Some("corp-id"));
+    assert_eq!(network.sae_password_id.as_deref(), Some("corp-id"));
+    network.set_sae_password_id(None);
+    assert!(network.sae_password_id.is_none());
+}

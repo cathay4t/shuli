@@ -430,6 +430,7 @@ mod tests {
             wowlan: false,
             eap: None,
             sae_pwe: config::SaePweConfig::Auto,
+            sae_password_id: None,
             interface: interface.map(|s| s.to_string()),
             dns: None,
             ipv4: None,

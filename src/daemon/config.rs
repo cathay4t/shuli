@@ -82,6 +82,9 @@ pub(crate) struct WifiEntry {
     /// H2E with hunting-and-pecking fallback), `h2e`, or `hnp`.
     #[serde(default)]
     pub sae_pwe: SaePweConfig,
+    /// Optional SAE password identifier (WPA3-Personal, H2E-only).
+    #[serde(default)]
+    pub sae_password_id: Option<String>,
     /// Interface name to bind to.  `"any"` (or absent) picks the
     /// first available wifi interface.
     #[serde(default)]
@@ -193,6 +196,7 @@ impl ShuliConfig {
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
             network.wowlan = entry.wowlan;
+            network.sae_password_id = entry.sae_password_id.clone();
             if let Some(eap) = entry.eap.as_ref() {
                 network.eap = Some(eap.to_lib());
             }
@@ -336,5 +340,23 @@ ethernets:
         assert_eq!(entry.name, "eth0");
         assert_eq!(entry.eap.identity, "user@example.org");
         assert!(entry.dns.is_none());
+    }
+
+    #[test]
+    fn sae_password_id_maps_to_network() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    sae_password_id: corp-id
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert_eq!(
+            wifi.networks[0].sae_password_id.as_deref(),
+            Some("corp-id")
+        );
     }
 }

@@ -45,14 +45,16 @@ impl AuthMethod {
         bssid: [u8; ETH_ALEN],
         h2e: bool,
         hnp_fallback: bool,
+        password_id: Option<&str>,
     ) -> Result<Self, WifiError> {
-        Ok(AuthMethod::Sae(SaeAuth::new(
+        Ok(AuthMethod::Sae(SaeAuth::new_with_password_id(
             password,
             ssid,
             sta_mac,
             bssid,
             h2e,
             hnp_fallback,
+            password_id,
         )?))
     }
 
@@ -126,6 +128,19 @@ fn process_sae_frame(
             payload,
         )?;
         return Ok(AuthAction::SendCommitWithToken(token));
+    }
+
+    // Stage 3 M7: status 123 = unknown password identifier (missing or
+    // wrong).  Fail cleanly instead of retrying: the identifier is
+    // included in every commit when configured, so a 123 here means the
+    // AP does not accept our identifier.
+    if auth_seq == 1
+        && status == crate::crypto::sae::SAE_STATUS_UNKNOWN_PASSWORD_IDENTIFIER
+    {
+        return Err(WifiError::new(
+            ErrorKind::AuthFailed,
+            "SAE auth failed: unknown password identifier",
+        ));
     }
 
     const SAE_STATUS_H2E: u16 = 126;
@@ -306,8 +321,11 @@ impl WifiClient {
             &self.network.ssid,
             self.mac,
             self.bss_info.bssid,
-            self.network.sae_pwe.starts_h2e(),
-            self.network.sae_pwe.allows_hnp_fallback(),
+            self.network.sae_pwe.starts_h2e()
+                || self.network.sae_password_id.is_some(),
+            self.network.sae_pwe.allows_hnp_fallback()
+                && self.network.sae_password_id.is_none(),
+            self.network.sae_password_id.as_deref(),
         )?);
 
         let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
