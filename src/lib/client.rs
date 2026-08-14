@@ -332,20 +332,24 @@ impl WifiClient {
         Ok(client)
     }
 
-    /// Advance the connection flow by one step and return the current state.
-    /// The caller (daemon loop) keeps calling this; on transient errors the
-    /// client falls back to a retry state instead of failing hard.
+    /// Drive the connection flow until the state changes and return it.
+    /// On transient errors the client falls back to a retry state instead
+    /// of failing hard.
     pub async fn run(&mut self) -> Result<WifiState, WifiError> {
-        if let Err(e) = self._run().await {
-            log::warn!("WPA process error: {e}");
-            self.state = if self.state == WifiState::Authenticating {
-                WifiState::FailedAuthentication
-            } else {
-                WifiState::Failed
-            };
-            Err(e)
-        } else {
-            Ok(self.state)
+        loop {
+            let prev_state = self.state;
+            if let Err(e) = self._run().await {
+                log::warn!("WPA process error: {e}");
+                self.state = if self.state == WifiState::Authenticating {
+                    WifiState::FailedAuthentication
+                } else {
+                    WifiState::Failed
+                };
+                return Err(e);
+            }
+            if self.state != prev_state {
+                return Ok(self.state);
+            }
         }
     }
 
