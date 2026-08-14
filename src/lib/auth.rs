@@ -331,12 +331,22 @@ impl WifiClient {
                 "password required for encrypted network",
             )
         })?;
+        // G2b: `Auto` follows the AP's RSNXE from the scan instead of
+        // guessing H2E first - an AP that never advertises H2E support
+        // (or advertises none at all) gets hunting-and-pecking on the
+        // very first commit, instead of one shuli discovers only after
+        // the H2E commit is silently dropped and times out.
+        let ap_supports_h2e = self.bss_info.ap_supports_sae_h2e();
+        log::debug!(
+            "AP RSNXE advertises SAE H2E: {ap_supports_h2e} (sae_pwe={:?})",
+            self.network.sae_pwe
+        );
         self.auth = Some(AuthMethod::new_sae(
             password,
             &self.network.ssid,
             self.mac,
             self.bss_info.bssid,
-            self.network.sae_pwe.starts_h2e()
+            self.network.sae_pwe.starts_h2e(ap_supports_h2e)
                 || self.network.sae_password_id.is_some(),
             self.network.sae_pwe.allows_hnp_fallback()
                 && self.network.sae_password_id.is_none(),

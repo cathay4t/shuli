@@ -136,6 +136,31 @@ impl BssInfo {
     pub(crate) fn ap_mfp_capable(&self) -> bool {
         rsne_mfp_capable(&self.ap_rsne)
     }
+
+    /// Whether the AP's RSNXE (beacon/probe response) advertises SAE
+    /// Hash-to-Element support. Used to pick H2E vs. hunting-and-pecking
+    /// up front instead of guessing (Stage 2 G2b).
+    pub(crate) fn ap_supports_sae_h2e(&self) -> bool {
+        crate::ieee80211::elements::ap_rsnxe_supports_sae_h2e(&self.ap_rsnxe)
+    }
+
+    /// Whether the AP advertises the OCVC RSN capability (Operating
+    /// Channel Validation, Stage 3 M10). Enabling OCV against an AP
+    /// that doesn't advertise this always fails the 4-way handshake
+    /// (no OCI KDE in Message 3), so it must be gated on this check
+    /// rather than on local network config alone.
+    pub(crate) fn ap_ocv_capable(&self) -> bool {
+        crate::ieee80211::elements::ap_rsne_supports_ocv(&self.ap_rsne)
+    }
+
+    /// Whether the AP advertises the Extended Key ID RSN capability
+    /// (Stage 3 M11). Requesting Extended Key ID against an AP that
+    /// doesn't advertise this always fails the 4-way handshake (no Key
+    /// ID KDE in Message 3), so it must be gated on this check rather
+    /// than on local network config alone.
+    pub(crate) fn ap_ext_key_id_capable(&self) -> bool {
+        crate::ieee80211::elements::ap_rsne_supports_ext_key_id(&self.ap_rsne)
+    }
 }
 
 /// Parse an RSNE element (ID + length + body) and report the MFPC/MFPR

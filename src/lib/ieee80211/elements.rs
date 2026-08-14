@@ -115,6 +115,70 @@ pub(crate) fn parse_group_mgmt_cipher(
     Some(Nl80211CipherSuite::from(u32::from_le_bytes(bytes)))
 }
 
+/// Whether the AP's RSNXE (full element: ID || length || body, as
+/// stored in `BssInfo::ap_rsnxe`) advertises SAE Hash-to-Element
+/// support. An empty slice (no RSNXE in the beacon/probe response) or
+/// a malformed element both mean "not advertised": `SaePwe::Auto`
+/// uses this to pick hunting-and-pecking up front for APs that never
+/// claim H2E support, instead of sending an H2E commit the AP will
+/// silently drop and only discovering the mismatch after the commit
+/// times out.
+pub fn ap_rsnxe_supports_sae_h2e(ap_rsnxe: &[u8]) -> bool {
+    if ap_rsnxe.len() < 3 {
+        return false;
+    }
+    Nl80211ElementRsnExt::parse(&ap_rsnxe[2..]).is_ok_and(|rsnxe| {
+        rsnxe
+            .capabilities
+            .contains(Nl80211RsnExtCapbilities::SaeH2e)
+    })
+}
+
+/// The RSN capabilities field (2 octets) of an RSNE body, if present.
+fn rsne_capabilities_field(body: &[u8]) -> Option<u16> {
+    if body.len() < 8 {
+        return None;
+    }
+    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_offset = 8 + pcount * 4;
+    if body.len() < akm_offset + 2 {
+        return None;
+    }
+    let acount =
+        u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
+    let cap_offset = akm_offset + 2 + acount * 4;
+    if body.len() < cap_offset + 2 {
+        return None;
+    }
+    Some(u16::from_le_bytes([body[cap_offset], body[cap_offset + 1]]))
+}
+
+/// Whether the AP's RSNE (full element: ID || length || body, as stored
+/// in `BssInfo::ap_rsne`) advertises the OCVC RSN capability (bit 14,
+/// 802.11-2020 §9.4.2.25). Used to enable Operating Channel Validation
+/// (Stage 3 M10) only when the AP actually supports it, instead of
+/// enforcing OCI verification against an AP that will never include an
+/// OCI KDE in Message 3 - which would otherwise always fail the 4-way
+/// handshake.
+pub fn ap_rsne_supports_ocv(ap_rsne: &[u8]) -> bool {
+    if ap_rsne.len() < 2 {
+        return false;
+    }
+    rsne_capabilities_field(&ap_rsne[2..]).is_some_and(|c| c & 0x4000 != 0)
+}
+
+/// Whether the AP's RSNE advertises the Extended Key ID for
+/// Individually Addressed Frames RSN capability (bit 13,
+/// 802.11-2020 §9.4.2.25). Used to request Extended Key ID (Stage 3
+/// M11) only when the AP actually supports it, instead of requiring a
+/// Key ID KDE in Message 3 that a non-supporting AP will never send.
+pub fn ap_rsne_supports_ext_key_id(ap_rsne: &[u8]) -> bool {
+    if ap_rsne.len() < 2 {
+        return false;
+    }
+    rsne_capabilities_field(&ap_rsne[2..]).is_some_and(|c| c & 0x2000 != 0)
+}
+
 /// Negotiate the group management (BIP) cipher with the AP: the best
 /// supported suite the AP advertises, defaulting to BIP-CMAC-128.
 /// Preference order matches iwd: GMAC-256 > CMAC-256 > GMAC-128 >

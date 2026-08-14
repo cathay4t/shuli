@@ -8,27 +8,36 @@ pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
 /// WPA3 APs derive the SAE password element either with hash-to-element
 /// (H2E, RFC 9380) or with hunting-and-pecking (HnP, RFC 7664); an
 /// H2E-only STA cannot connect to an HnP-only AP. `Auto` (the default)
-/// sends an H2E commit and falls back to HnP when the AP rejects it,
-/// which keeps existing H2E APs on the fast path.
+/// follows the AP's RSNXE from the scan: H2E when the AP advertises it,
+/// hunting-and-pecking otherwise. Either way it still falls back to the
+/// other method if the first commit is rejected or silently dropped, so
+/// a missing/misleading RSNXE cannot strand the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaePwe {
     /// Hash-to-element only (the Stage-1 behaviour).
     H2E,
     /// Hunting-and-pecking only (RFC 7664), for HnP-only APs.
     HnP,
-    /// Try hash-to-element first, fall back to hunting-and-pecking when
-    /// the H2E commit is rejected.
+    /// Follow the AP's advertised RSNXE Hash-to-Element capability,
+    /// falling back to the other method when the first commit fails.
     #[default]
     Auto,
 }
 
 impl SaePwe {
-    /// Whether the initial commit should use hash-to-element.
-    pub(crate) fn starts_h2e(self) -> bool {
-        !matches!(self, SaePwe::HnP)
+    /// Whether the initial commit should use hash-to-element. Explicit
+    /// `H2E`/`HnP` override the AP; `Auto` follows `ap_supports_h2e`,
+    /// which the caller derives from the selected BSS's RSNXE.
+    pub(crate) fn starts_h2e(self, ap_supports_h2e: bool) -> bool {
+        match self {
+            SaePwe::H2E => true,
+            SaePwe::HnP => false,
+            SaePwe::Auto => ap_supports_h2e,
+        }
     }
 
-    /// Whether a rejected H2E commit may fall back to hunting-and-pecking.
+    /// Whether a rejected/timed-out commit may fall back to the other
+    /// PWE derivation method.
     pub(crate) fn allows_hnp_fallback(self) -> bool {
         matches!(self, SaePwe::Auto)
     }
@@ -57,7 +66,7 @@ pub struct WifiConfig {
 /// policy to the implementation. The threshold is deliberately
 /// band-agnostic: per-band thresholds are added only if users ask for
 /// them. BTM (802.11v) Requests are honoured regardless of `roaming`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NetworkConfig {
     pub ssid: String,
     pub password: Option<String>,
@@ -153,7 +162,7 @@ impl NetworkConfig {
 
 /// EAP credential configuration (Stage 3 M3): identity, certificate
 /// paths, and the TLS server name used for certificate validation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EapConfig {
     /// EAP identity (outer identity) sent in the Identity exchange.
     pub identity: String,

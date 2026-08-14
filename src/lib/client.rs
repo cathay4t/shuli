@@ -350,6 +350,14 @@ impl WifiClient {
     }
 
     async fn _run(&mut self) -> Result<(), WifiError> {
+        // With no configured networks the client idles: never start a
+        // scan with an empty SSID list. The owner (nipart wifi plugin)
+        // keeps calling run() only while networks are configured, this
+        // guard just makes an accidental call harmless.
+        if self.config.networks.is_empty() {
+            self.state = WifiState::Init;
+            return Ok(());
+        }
         match self.state {
             WifiState::Init => {
                 self.send_out_scan_request().await?;
@@ -507,6 +515,24 @@ impl WifiClient {
                                     &self.sae_commit_auth_data.clone(),
                                 )
                                 .await;
+                                continue;
+                            }
+                            // Some APs silently drop the H2E commit
+                            // instead of answering with a rejection
+                            // status.  Retry once with
+                            // hunting-and-pecking before giving up.
+                            if let Some(AuthMethod::Sae(sae)) =
+                                self.auth.as_ref()
+                                && sae.is_h2e()
+                                && sae.hnp_fallback_allowed()
+                                && !self.sae_hnp_attempted
+                            {
+                                log::info!(
+                                    "SAE commit timed out with no AP \
+                                     response; retrying with \
+                                     hunting-and-pecking"
+                                );
+                                self.restart_sae_with_hnp().await;
                                 continue;
                             }
                             log::warn!("authentication timed out; will retry");
@@ -1395,6 +1421,7 @@ impl WifiClient {
                         return;
                     }
                 };
+                self.sae_sync = 0;
                 self.send_sae_commit(&auth_data).await;
             }
             AuthAction::RetryWithHnp => {
@@ -1465,7 +1492,6 @@ impl WifiClient {
             return;
         }
         self.sae_commit_sent = true;
-        self.sae_sync = 0;
         self.sae_commit_auth_data = auth_data.to_vec();
         log::info!("SAE commit sent");
     }
@@ -1506,6 +1532,7 @@ impl WifiClient {
             }
         };
         log::info!("SAE restarted with hunting-and-pecking");
+        self.sae_sync = 0;
         self.send_sae_commit(&auth_data).await;
     }
 
@@ -1603,7 +1630,7 @@ impl WifiClient {
                         self.state = WifiState::Failed;
                         return;
                     }
-                    fw.set_ext_key_id(self.network.ext_key_id);
+                    fw.set_ext_key_id(self.ext_key_id_enabled());
                     self.fourway = Some(fw);
                 } else {
                     let (pmk, mut rsne, mic_alg) = if let Some(entry) =
@@ -1758,7 +1785,7 @@ impl WifiClient {
                         self.state = WifiState::Failed;
                         return;
                     }
-                    fw.set_ext_key_id(self.network.ext_key_id);
+                    fw.set_ext_key_id(self.ext_key_id_enabled());
                     self.fourway = Some(fw);
                 }
             }
@@ -2192,6 +2219,105 @@ impl WifiClient {
         &self.network.ssid
     }
 
+    /// Replace the configured network list at runtime, reusing the same
+    /// client (nl80211 socket, wiphy capability probes and PMKSA cache).
+    ///
+    /// * An unchanged list is a no-op: idempotent re-apply keeps the current
+    ///   connection.
+    /// * If the currently connected network is dropped from the list (or the
+    ///   list becomes empty), the client disconnects cleanly, stops any
+    ///   scheduled scan and resets to `Init` so the next `run()` starts a fresh
+    ///   scan for the new SSIDs.
+    /// * If the list changes while not connected, the same reset makes the next
+    ///   `run()` probe the new SSIDs immediately.
+    /// * If the connected network is still in the new list, the connection is
+    ///   kept; only the scan/match list changes.
+    pub async fn update_networks(
+        &mut self,
+        networks: Vec<NetworkConfig>,
+    ) -> Result<(), WifiError> {
+        if networks == self.config.networks {
+            log::debug!("network list unchanged");
+            return Ok(());
+        }
+
+        let old_ssid = self.network.ssid.clone();
+        let connected = matches!(
+            self.state,
+            WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        );
+        let connected_network_kept = connected
+            && networks.iter().any(|network| network.ssid == old_ssid);
+
+        if connected && connected_network_kept {
+            self.config.networks = networks;
+            log::info!(
+                "network list updated, keeping connection to {old_ssid}: [{}]",
+                self.config.ssids().collect::<Vec<_>>().join(", ")
+            );
+            return Ok(());
+        }
+
+        self.config.networks = networks;
+
+        if connected {
+            log::info!(
+                "network list update drops current SSID {old_ssid}; \
+                 disconnecting"
+            );
+            self.stop_sched_scan().await?;
+            if self.wowlan_armed {
+                self.disarm_wowlan().await?;
+            }
+            if let Err(e) =
+                connect::disconnect(&mut self.conn_handle, self.if_index).await
+            {
+                log::debug!("disconnect on network update: {e}");
+            }
+        } else {
+            // A scheduled scan's match set can only be changed by
+            // restarting it; stop it so the next host scan probes the
+            // new list.
+            self.stop_sched_scan().await?;
+        }
+
+        // Reset every per-attempt field; keep the PMKSA cache so a later
+        // return to a known network can skip full authentication.
+        self.network = self
+            .config
+            .networks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| NetworkConfig::new(""));
+        self.bss_info = BssInfo::default();
+        self.auth = None;
+        self.owe = None;
+        self.psk_pmk = None;
+        self.eap_peer = None;
+        self.eap_pmk = None;
+        self.fourway = None;
+        self.pmksa_in_use = None;
+        self.ft = None;
+        self.ft_roam = None;
+        self.roam_scan = false;
+        self.roam_target = None;
+        self.last_scan_candidates.clear();
+        self.pending_ft_msg1 = None;
+        self.last_roam = None;
+        self.sae_commit_sent = false;
+        self.sae_sync = 0;
+        self.sae_commit_auth_data.clear();
+        self.sae_hnp_attempted = false;
+        self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
+        self.state = WifiState::Init;
+        log::info!(
+            "network list updated: [{}]",
+            self.config.ssids().collect::<Vec<_>>().join(", ")
+        );
+        Ok(())
+    }
+
     /// Whether the wiphy advertises WoWLAN triggers shuli can arm
     /// (disconnect and/or GTK rekey failure).
     pub fn wowlan_supported(&self) -> bool {
@@ -2412,10 +2538,23 @@ async fn send_ctrl_port_frame(
 
 impl WifiClient {
     /// Stage 3 M10: enable OCV on the 4-way state with our OCI derived
-    /// from the BSS frequency.  Returns false (and logs) when the
-    /// frequency cannot be mapped to an OCI.
+    /// from the BSS frequency, but only when the AP's RSNE actually
+    /// advertises OCVC support. Otherwise Message 3 will never carry an
+    /// OCI KDE and `verify_oci()` would unconditionally fail the
+    /// handshake, so proceed without OCV instead (matches
+    /// wpa_supplicant's `wpa_sm_ocv_enabled()`, which requires both the
+    /// local config and the AP's OCVC bit). Returns false (and logs)
+    /// only when OCV is otherwise usable but the frequency cannot be
+    /// mapped to an OCI.
     fn enable_ocv(&self, fw: &mut FourWayState) -> bool {
         if !self.network.ocv {
+            return true;
+        }
+        if !self.bss_info.ap_ocv_capable() {
+            log::warn!(
+                "OCV requested but AP does not advertise OCVC support; \
+                 proceeding without OCV"
+            );
             return true;
         }
         match crate::crypto::ocv::oci_from_freq(self.bss_info.freq_mhz) {
@@ -2431,6 +2570,26 @@ impl WifiClient {
                 false
             }
         }
+    }
+
+    /// Stage 3 M11: whether Extended Key ID should be requested for
+    /// this 4-way handshake - both the network config and the AP's
+    /// advertised RSN capability (bit 13) must agree, otherwise Message
+    /// 3 will never carry a Key ID KDE and the handshake would
+    /// unconditionally fail. Proceed without it (with a warning)
+    /// instead, matching the same opportunistic gating as OCV.
+    fn ext_key_id_enabled(&self) -> bool {
+        if !self.network.ext_key_id {
+            return false;
+        }
+        if !self.bss_info.ap_ext_key_id_capable() {
+            log::warn!(
+                "Extended Key ID requested but AP does not advertise support \
+                 for it; proceeding without it"
+            );
+            return false;
+        }
+        true
     }
 
     /// Send `NL80211_CMD_ASSOCIATE` for the selected BSS.

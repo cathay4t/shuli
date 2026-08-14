@@ -753,11 +753,16 @@ async fn wifi_client_sae_anti_clogging() {
     client.shutdown().await;
 }
 
-/// G2b: hunting-and-pecking fallback. `sae_pwe=0` makes hostapd accept
-/// only HnP commits (`sae_status_success()` rejects the H2E status 126
-/// with UNSPECIFIED_FAILURE). With the default `SaePwe::Auto` the client
-/// must detect the rejection, restart with HnP and connect; with an
-/// H2E-only network it must fail instead.
+/// G2b: hunting-and-pecking fallback. `sae_pwe=0` makes hostapd both
+/// omit SAE H2E support from its RSNXE and accept only HnP commits
+/// (`sae_status_success()` rejects the H2E status 126 with
+/// UNSPECIFIED_FAILURE). With the default `SaePwe::Auto` the client
+/// reads that from the scan's RSNXE up front and connects directly
+/// with HnP - no H2E commit is sent, so the reactive
+/// rejection-triggered restart (`sae_hnp_attempted`) never fires for a
+/// well-behaved AP; that restart remains a safety net for APs that
+/// omit/misreport RSNXE yet still only accept HnP. An H2E-only network
+/// must fail instead.
 #[tokio::test]
 async fn wifi_client_sae_hnp_fallback() {
     init_logger();
@@ -772,8 +777,9 @@ async fn wifi_client_sae_hnp_fallback() {
     let _guard = WIFI_LOCK.lock().await;
     let _env = WifiTestEnv::setup(SAE_HNP_ONLY_HOSTAPD_CONF);
 
-    // Auto (default): H2E commit is rejected, the exchange restarts with
-    // hunting-and-pecking and the connection succeeds.
+    // Auto (default): the AP's RSNXE doesn't advertise H2E, so the
+    // client picks hunting-and-pecking up front and connects without
+    // ever needing the reactive restart.
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
     let mut client = WifiClient::init(config).await.expect("init");
@@ -784,9 +790,9 @@ async fn wifi_client_sae_hnp_fallback() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        client.sae_hnp_attempted,
-        "expected the H2E commit to be rejected and the exchange restarted \
-         with hunting-and-pecking"
+        !client.sae_hnp_attempted,
+        "expected the RSNXE up-front check to pick hunting-and-pecking \
+         directly, without needing an H2E-rejection restart"
     );
     client.shutdown().await;
 
