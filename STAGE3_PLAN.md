@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 书立 (shuli) — Stage 3 Goals (notes only)
 
-> **Status: IN PROGRESS (2026-08-13, M7 next).** Stage 2 has completed
+> **Status: IN PROGRESS (2026-08-14, M7 next).** Stage 2 has completed
 > (all exit criteria met, M1-M8; M9 removed). This document records
 > goals, protocol names, authentication workflows, and the milestone
 > plan below. Spec references are to `~/Source/wifi_docs/`
@@ -56,14 +56,28 @@
   daemon `ethernets:` section with per-port IP config, and an
   integration test over a veth pair against an in-test EAP-TLS
   authenticator (the installed hostapd lacks `driver=wired`).
-* **M7 — Hardening picks (Goal 5):** per deployment need (SAE password
-  identifiers, Transition Disable, OCV, Extended Key ID, more BIP
-  ciphers); each picked item ships with its own tests.  Not started -
-  pick items per deployment.
+* **M7 — SAE password identifiers (Goal 5):** optional per-network
+  password identifier sent in the H2E commit; status 123
+  (password-identifier-needed) handling.  Config: `sae_password_id`.
+* **M8 — More BIP ciphers in the RSNE (Goal 5):** advertise and
+  negotiate BIP-CMAC-128/256 and BIP-GMAC-128/256 (preference
+  GMAC-256 > CMAC-256 > GMAC-128 > CMAC-128) and install IGTK/BIGTK
+  with the negotiated cipher/key length.
+* **M9 — Transition Disable (Goal 5):** parse the Transition Disable
+  KDE from 4-way Message 3 and persist/log the disabled AKM groups.
+* **M10 — OCV (Goal 5):** operating class/channel validation for
+  non-FT AKMs (`ocv` config), validating rekeys and handshakes.
+* **M11 — Extended Key ID (Goal 5):** pairwise key id 0/1 rotation
+  for lossless PTK rekey (AES-CC ciphers, driver support, two-phase
+  RX-then-TX install).
+* **M12 — SAE-EXT-KEY (Goal 5):** AKM `00-0F-AC:24` / FT `:25` with
+  384/512-bit PMK and AKM-defined KDFs.
+* **M13 — SAE-PK (Goal 5):** SAE with Public Key (RSNXE capability
+  bit, auth status 127, EC public key embedded in the password).
 
-**Exit criteria:** M1-M6 implemented with unit + integration tests
-where the test hardware supports them; M7 items tracked as chosen.
-**All of M1-M6 are now done.**
+**Exit criteria:** M1-M13 implemented with unit + integration tests
+where the test hardware supports them.  M1-M6 are done; M7-M13 are
+in progress.
 
 ## Goal 1 - WPA2-Personal: PSK-SHA256
 
