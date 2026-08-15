@@ -11,13 +11,14 @@
 
 use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{
-    Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
-    Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
-    Nl80211Event, Ieee80211StatusCode, Ieee80211ReasonCode, Nl80211Handle,
-    Nl80211Key, Nl80211KeyDefaultType, Nl80211MulticastGroup, Nl80211Pmksa,
-    Nl80211RekeyOffload, Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr,
-    Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr, Nl80211UseMfp,
-    Nl80211Wowlan, Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
+    Ieee80211ReasonCode, Ieee80211StatusCode, Nl80211Associate, Nl80211Attr,
+    Nl80211AuthType, Nl80211Authenticate, Nl80211Command,
+    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Event,
+    Nl80211Handle, Nl80211Key, Nl80211KeyDefaultType, Nl80211MulticastGroup,
+    Nl80211Pmksa, Nl80211RekeyOffload, Nl80211SchedScanMatch,
+    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
+    Nl80211UseMfp, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
+    Nl80211WowlanWakeup,
 };
 
 use crate::{
@@ -170,6 +171,11 @@ pub struct WifiClient {
     /// to connect); its results go through the roam decision instead of
     /// the normal authentication flow.
     pub(crate) roam_scan: bool,
+    /// The connected state the client was in when the roam scan started;
+    /// restored when the roam scan decides to stay on the current BSS
+    /// (otherwise the state machine would fall through into a fresh
+    /// authentication to the AP it is already connected to).
+    pub(crate) pre_roam_state: Option<WifiState>,
     /// BSSID the next connection attempt should prefer (set before a
     /// roam-induced disconnect steers the retry loop to the target).
     pub(crate) roam_target: Option<[u8; ETH_ALEN]>,
@@ -325,6 +331,7 @@ impl WifiClient {
             ft: None,
             ft_roam: None,
             roam_scan: false,
+            pre_roam_state: None,
             roam_target: None,
             last_scan_candidates: Vec::new(),
             pending_ft_msg1: None,
@@ -390,6 +397,19 @@ impl WifiClient {
                     // current BSS.
                     self.roam_scan = false;
                     self.process_roam_scan_results().await;
+                    // When the roam scan stays on the current BSS (or
+                    // failed to gather candidates), restore the connected
+                    // state recorded before the scan. Otherwise the next
+                    // `run()` iteration would treat the scan results as a
+                    // fresh connection attempt and re-authenticate to the
+                    // AP the client is already connected to, which the
+                    // kernel rejects with -EALREADY.
+                    if self.state == WifiState::Scanning
+                        && let Some(prev) = self.pre_roam_state.take()
+                    {
+                        self.state = prev;
+                    }
+                    self.pre_roam_state = None;
                     return Ok(());
                 }
                 if let Err(e) = self.process_scan_results().await {
@@ -2337,6 +2357,7 @@ impl WifiClient {
         self.ft = None;
         self.ft_roam = None;
         self.roam_scan = false;
+        self.pre_roam_state = None;
         self.roam_target = None;
         self.last_scan_candidates.clear();
         self.pending_ft_msg1 = None;

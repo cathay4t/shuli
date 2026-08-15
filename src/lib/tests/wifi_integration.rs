@@ -1998,6 +1998,109 @@ async fn wifi_client_ft_psk_signal_roam() {
     client.shutdown().await;
 }
 
+/// G8 regression: a signal-triggered roam scan that finds no better BSS
+/// must keep the client connected on the current BSS. Previously the
+/// "staying" path left the state machine in `Scanning`, so the next
+/// `run()` iteration fell through into a fresh authentication to the AP
+/// the client was already connected to - which the kernel rejects with
+/// -EALREADY ("Operation already in progress"), and the client spun in a
+/// scan -> select -> SAE -> EALREADY retry loop forever.
+#[tokio::test]
+async fn wifi_client_roam_scan_stays_connected() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_roam_scan_stays_connected: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    // Single-BSS AP: a roam scan can never find a better candidate, so it
+    // must decide to stay.
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    // hwsim reports a fixed (weak) signal; any threshold above it starts
+    // the roam engine.
+    config.networks[0].roaming_threshold = -10;
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    let start_bssid = client.bss_info.bssid;
+    let start_ssid = client.current_ssid().to_string();
+
+    drain_pending_events(&mut client).await;
+
+    // Let the roam engine run several signal-check rounds. With no better
+    // BSS on air the roam scan must "stay" and the client must return to
+    // connected on the same BSS - never fall through into a fresh
+    // authentication to the AP it is already on.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut roam_scans = 0;
+    loop {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(WifiState::Scanning)) => {
+                // A roam scan is running; it must resolve back to
+                // Connected, not into a fresh authentication.
+                roam_scans += 1;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                panic!("client error while roam scan stays connected: {e}")
+            }
+            Err(_) => {} // 15 s without a state change
+        }
+        assert!(
+            client.state == WifiState::Scanning
+                || matches!(
+                    client.state,
+                    WifiState::ConnectedWithoutOffloadRekey
+                        | WifiState::ConnectedWithOffloadRekey
+                ),
+            "client must stay connected after a roam scan that finds no \
+             better BSS, got state {:?}",
+            client.state
+        );
+        assert_eq!(
+            client.bss_info.bssid, start_bssid,
+            "the client must stay on its current BSS"
+        );
+        assert_eq!(
+            client.current_ssid(),
+            start_ssid,
+            "the client must stay on its current network"
+        );
+        assert!(
+            client.auth.is_none(),
+            "no new authentication may start while the roam scan stays"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        // Give the roam engine time to run its 5 s signal check and the
+        // resulting scan, then keep polling.
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    }
+    assert!(
+        roam_scans > 0,
+        "the weak-signal roam engine must have run at least one scan"
+    );
+    client.shutdown().await;
+}
+
 // --- helpers ---
 
 /// Whether the test process runs with root privileges (needed to touch the

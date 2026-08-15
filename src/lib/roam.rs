@@ -251,9 +251,15 @@ impl WifiClient {
              scanning for roam candidates"
         );
         self.roam_scan = true;
+        // Remember the connected state so a roam scan that decides to
+        // stay can restore it instead of leaving the state machine in
+        // Scanning (which would re-authenticate the already-connected
+        // AP and fail with -EALREADY).
+        self.pre_roam_state = Some(self.state);
         if let Err(e) = self.send_out_scan_request().await {
             log::warn!("roam scan trigger failed: {e}");
             self.roam_scan = false;
+            self.pre_roam_state = None;
             return;
         }
         self.state = WifiState::Scanning;
