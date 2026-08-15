@@ -23,6 +23,7 @@ use wl_nl80211::{
 use crate::{
     ETH_ALEN, ErrorKind, WifiClient, WifiError, WifiState,
     client::drain_request,
+    config::SaePwe,
     crypto::ft::{
         FT_PTK_LEN, PmkR0, PmkR1, derive_ft_ptk, derive_pmk_r0, derive_pmk_r1,
     },
@@ -67,6 +68,23 @@ pub(crate) struct FtRoam {
     pub pmk_r1: Option<PmkR1>,
     pub r1kh_id: Option<[u8; 6]>,
     pub ptk: Option<[u8; FT_PTK_LEN]>,
+}
+
+/// Whether the FT Reassociation Request must carry the SAE-H2E RSNXE
+/// (and mark it in the FTIE MIC control). The RSNXE is only meaningful
+/// when the SAE exchange actually used hash-to-element: an explicit
+/// `H2E` setting, an H2E-advertising AP under `Auto`, or an SAE password
+/// identifier (which forces H2E). Sending it on an HnP exchange makes
+/// strict APs reject the FT reassociation; wpa_supplicant omits it when
+/// the AP has no RSNXE (`wpa_ft_gen_req_ies(..., !sm->ap_rsnxe)`).
+fn ft_reassoc_uses_rsnxe(
+    security: SecurityType,
+    sae_pwe: SaePwe,
+    ap_supports_h2e: bool,
+    sae_password_id: Option<&str>,
+) -> bool {
+    matches!(security, SecurityType::FtSae | SecurityType::FtSaeExtKey)
+        && (sae_password_id.is_some() || sae_pwe.starts_h2e(ap_supports_h2e))
 }
 
 impl WifiClient {
@@ -746,11 +764,14 @@ impl WifiClient {
             ),
         };
         let mdie = elements::mdie(target_mdie.mdid, target_mdie.ft_capab);
-        // FT-SAE uses SAE H2E: the RSNXE participates in the FTIE MIC
-        // (after the FTIE, 802.11-2020 §12.8.4).
-        let rsnxe = matches!(
+        // The RSNXE participates in the FTIE MIC (after the FTIE,
+        // 802.11-2020 §12.8.4) and is included only when SAE H2E was
+        // actually used for the exchange.
+        let rsnxe = ft_reassoc_uses_rsnxe(
             target.security,
-            SecurityType::FtSae | SecurityType::FtSaeExtKey
+            self.network.sae_pwe,
+            target.ap_supports_sae_h2e(),
+            self.network.sae_password_id.as_deref(),
         )
         .then(elements::sae_rsnxe);
 
@@ -771,11 +792,11 @@ impl WifiClient {
         let mut ies =
             Vec::with_capacity(rsne.len() + mdie.len() + ftie.len() + 8);
         ies.extend_from_slice(&rsne);
-        if let Some(ref rsnxe) = rsnxe {
-            ies.extend_from_slice(rsnxe);
-        }
         ies.extend_from_slice(&mdie);
         ies.extend_from_slice(&ftie);
+        if let Some(rsnxe) = rsnxe {
+            ies.extend_from_slice(&rsnxe);
+        }
 
         let mfp = match target.security {
             SecurityType::FtSae | SecurityType::FtSaeExtKey => {
@@ -1053,5 +1074,32 @@ impl WifiClient {
             })?;
         log::info!("FT roam: PTK installed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SaePwe;
+
+    #[test]
+    fn ft_reassoc_rsnxe_follows_sae_pwe_mode() {
+        let cases = [
+            (SecurityType::FtSae, SaePwe::Auto, false, None, false),
+            (SecurityType::FtSae, SaePwe::Auto, true, None, true),
+            (SecurityType::FtSae, SaePwe::H2E, false, None, true),
+            (SecurityType::FtSae, SaePwe::HnP, true, None, false),
+            (SecurityType::FtSaeExtKey, SaePwe::Auto, true, None, true),
+            (SecurityType::FtSae, SaePwe::Auto, false, Some("corp"), true),
+            (SecurityType::FtPsk, SaePwe::Auto, true, None, false),
+        ];
+        for (security, sae_pwe, ap_h2e, password_id, expected) in cases {
+            assert_eq!(
+                ft_reassoc_uses_rsnxe(security, sae_pwe, ap_h2e, password_id),
+                expected,
+                "security={security:?} sae_pwe={sae_pwe:?} ap_h2e={ap_h2e} \
+                 password_id={password_id:?}"
+            );
+        }
     }
 }

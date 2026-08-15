@@ -1617,8 +1617,12 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
 
 /// Two-BSS FT-SAE topology on a single radio: both BSSes share the
 /// SSID and mobility domain, and r0kh/r1kh entries cross-connect them
-/// so PMK-R1 is available on both (pmk_r1_push=1).
-const FT_SAE_HOSTAPD_CONF: &str = r"
+/// so PMK-R1 is available on both (pmk_r1_push=1). `sae_pwe` selects the
+/// AP-side PWE mode: 2 (H2E) for the H2E tests, 0 (HnP-only) for the HnP
+/// FT roam test.
+fn ft_sae_hostapd_conf(sae_pwe: u8) -> String {
+    format!(
+        r"
 interface=wifi_ap
 driver=nl80211
 hw_mode=g
@@ -1628,7 +1632,7 @@ wpa=2
 wpa_key_mgmt=FT-SAE
 rsn_pairwise=CCMP
 ieee80211w=2
-sae_pwe=2
+sae_pwe={sae_pwe}
 sae_password=12345678
 nas_identifier=ap1
 mobility_domain=a1b2
@@ -1645,7 +1649,7 @@ wpa=2
 wpa_key_mgmt=FT-SAE
 rsn_pairwise=CCMP
 ieee80211w=2
-sae_pwe=2
+sae_pwe={sae_pwe}
 sae_password=12345678
 nas_identifier=ap2
 mobility_domain=a1b2
@@ -1654,7 +1658,9 @@ pmk_r1_push=1
 r0kh=02:00:00:00:01:00 ap1 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
 r1kh=02:00:00:00:01:00 02:00:00:00:01:00 000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f
 ctrl_interface=/var/run/hostapd
-";
+"
+    )
+}
 
 /// Same topology with FT-PSK (WPA2, optional PMF).
 const FT_PSK_HOSTAPD_CONF: &str = r"
@@ -1698,17 +1704,30 @@ ctrl_interface=/var/run/hostapd
 /// over-the-air Fast BSS Transition, no new SAE exchange.
 #[tokio::test]
 async fn wifi_client_ft_sae_btm_roam() {
+    ft_sae_btm_roam_with(2, "wifi_client_ft_sae_btm_roam").await;
+}
+
+/// Same BTM roam on an FT-SAE ESS configured with hunting-and-pecking
+/// only (`sae_pwe=0`, no SAE-H2E RSNXE in beacons). Mirrors the
+/// SweatHome5G topology from the roam failure: the FT Reassociation
+/// Request must not carry the H2E RSNXE when the SAE exchange used HnP.
+#[tokio::test]
+async fn wifi_client_ft_sae_hnp_btm_roam() {
+    ft_sae_btm_roam_with(0, "wifi_client_ft_sae_hnp_btm_roam").await;
+}
+
+async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     init_logger();
     if !is_root() {
         eprintln!(
-            "skipping wifi_client_ft_sae_btm_roam: test binary not running as \
-             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
-             `cargo test` is root)"
+            "skipping {test_name}: test binary not running as root \
+             (`.cargo/config.toml` runs tests via `sudo`, so plain `cargo \
+             test` is root)"
         );
         return;
     }
     let _guard = WIFI_LOCK.lock().await;
-    let _env = WifiTestEnv::setup(FT_SAE_HOSTAPD_CONF);
+    let _env = WifiTestEnv::setup(&ft_sae_hostapd_conf(sae_pwe));
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));
@@ -1814,7 +1833,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         return;
     }
     let _guard = WIFI_LOCK.lock().await;
-    let _env = WifiTestEnv::setup(FT_SAE_HOSTAPD_CONF);
+    let _env = WifiTestEnv::setup(&ft_sae_hostapd_conf(2));
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));

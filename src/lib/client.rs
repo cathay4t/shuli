@@ -13,7 +13,7 @@ use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{
     Nl80211Associate, Nl80211Attr, Nl80211AuthType, Nl80211Authenticate,
     Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
-    Nl80211Event, Nl80211EventCode, Nl80211EventReason, Nl80211Handle,
+    Nl80211Event, Ieee80211StatusCode, Ieee80211ReasonCode, Nl80211Handle,
     Nl80211Key, Nl80211KeyDefaultType, Nl80211MulticastGroup, Nl80211Pmksa,
     Nl80211RekeyOffload, Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr,
     Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr, Nl80211UseMfp,
@@ -820,7 +820,7 @@ impl WifiClient {
                     // the RSNE. An AP without the matching PMKSA rejects
                     // the association, which triggers the full-auth
                     // fallback.
-                    if status == Nl80211EventCode::Success {
+                    if status == Ieee80211StatusCode::Success {
                         self.associate_with_pmksa().await;
                     } else {
                         log::warn!(
@@ -835,7 +835,7 @@ impl WifiClient {
                 ) {
                     // Open-system auth (open + OWE): no frame, just
                     // a status.
-                    if status == Nl80211EventCode::Success {
+                    if status == Ieee80211StatusCode::Success {
                         if self.bss_info.security == SecurityType::Owe {
                             // OWE: associate with DH element.
                             let owe_auth = OweAuth::new();
@@ -1009,7 +1009,7 @@ impl WifiClient {
                     // SAE: the auth frame carries the AP's commit
                     // (transaction 1) or confirm (transaction 2).
                     self.handle_auth_frame(&frame).await;
-                } else if status != Nl80211EventCode::Success {
+                } else if status != Ieee80211StatusCode::Success {
                     log::warn!("AUTHENTICATE failed: status={status}");
                     self.state = WifiState::FailedAuthentication;
                 } else {
@@ -1024,7 +1024,7 @@ impl WifiClient {
                     // On failure the old AP is already disconnected
                     // (CMD_AUTHENTICATE did that), so the retry loop
                     // reconnects.
-                    if status == Nl80211EventCode::Success {
+                    if status == Ieee80211StatusCode::Success {
                         if let Err(e) = self
                             .handle_ft_assoc_response(
                                 ies.as_deref().unwrap_or(&[]),
@@ -1042,7 +1042,7 @@ impl WifiClient {
                         self.ft_roam = None;
                         self.state = WifiState::Failed;
                     }
-                } else if status == Nl80211EventCode::Success {
+                } else if status == Ieee80211StatusCode::Success {
                     if self.bss_info.security == SecurityType::Open {
                         log::info!(
                             "ASSOCIATED - open network, connection established"
@@ -1109,7 +1109,7 @@ impl WifiClient {
             }
 
             Nl80211Event::ConnectResult { status } => {
-                if status == Nl80211EventCode::Success {
+                if status == Ieee80211StatusCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
                     );
@@ -1238,7 +1238,7 @@ impl WifiClient {
     /// transient.
     async fn handle_ap_disconnect(
         &mut self,
-        reason: Option<Nl80211EventReason>,
+        reason: Option<Ieee80211ReasonCode>,
     ) {
         // Only act while connected: the kernel delivers the same
         // disconnect as several events with a long delay between them,
@@ -2526,11 +2526,11 @@ fn wowlan_wakeup_requires_reconnect(reasons: &[Nl80211WowlanWakeup]) -> bool {
 /// credential/PMKSA problem (retry with the long authentication
 /// backoff) instead of a transient failure (short backoff). `None`
 /// (no reason was available) is transient.
-fn is_fatal_disconnect_reason(reason: Option<Nl80211EventReason>) -> bool {
+fn is_fatal_disconnect_reason(reason: Option<Ieee80211ReasonCode>) -> bool {
     matches!(
         reason,
-        Some(Nl80211EventReason::PrevAuthNotValid)
-            | Some(Nl80211EventReason::Ieee8021xFailed)
+        Some(Ieee80211ReasonCode::PrevAuthNotValid)
+            | Some(Ieee80211ReasonCode::Ieee8021xFailed)
     )
 }
 
@@ -3017,7 +3017,7 @@ async fn wiphy_wowlan_support(
 #[cfg(test)]
 mod tests {
     use wl_nl80211::{
-        Nl80211EventReason, Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
+        Ieee80211ReasonCode, Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
     };
 
     use super::{
@@ -3032,21 +3032,21 @@ mod tests {
     #[test]
     fn fatal_disconnect_reasons_are_2_and_23() {
         assert!(is_fatal_disconnect_reason(Some(
-            Nl80211EventReason::PrevAuthNotValid
+            Ieee80211ReasonCode::PrevAuthNotValid
         )));
         assert!(is_fatal_disconnect_reason(Some(
-            Nl80211EventReason::Ieee8021xFailed
+            Ieee80211ReasonCode::Ieee8021xFailed
         )));
     }
 
     #[test]
     fn transient_disconnect_reasons() {
         for reason in [
-            Nl80211EventReason::Unspecified,
-            Nl80211EventReason::DeauthLeaving,
-            Nl80211EventReason::DisassocDueToInactivity,
-            Nl80211EventReason::MicFailure,
-            Nl80211EventReason::GroupKeyHandshakeTimeout,
+            Ieee80211ReasonCode::Unspecified,
+            Ieee80211ReasonCode::DeauthLeaving,
+            Ieee80211ReasonCode::DisassocDueToInactivity,
+            Ieee80211ReasonCode::MicFailure,
+            Ieee80211ReasonCode::GroupKeyHandshakeTimeout,
         ] {
             assert!(
                 !is_fatal_disconnect_reason(Some(reason)),
