@@ -57,11 +57,13 @@ pub fn extract_ssid_from_ies(ies: &[u8]) -> Option<String> {
     None
 }
 
-/// Extract signal strength (SignalMbm) from a BSS info entry list.
-pub fn extract_signal(bss: &[Nl80211BssInfo]) -> Option<i32> {
+/// Extract signal strength in dBm from a BSS info entry list. The kernel
+/// reports scan BSS signal in mBm (100 * dBm); convert it to dBm so the
+/// value matches its name everywhere it is stored and logged.
+pub fn extract_signal_dbm(bss: &[Nl80211BssInfo]) -> Option<i32> {
     for info in bss {
         if let Nl80211BssInfo::SignalMbm(signal) = info {
-            return Some(*signal);
+            return Some(*signal / 100);
         }
     }
     None

@@ -2,7 +2,12 @@
 
 //! Unit tests for the scan-phase security classification (G5/M7).
 
-use crate::scan::{SecurityType, detect_security};
+use wl_nl80211::Nl80211BssInfo;
+
+use crate::{
+    nl80211::scan::extract_signal_dbm,
+    scan::{SecurityType, detect_security},
+};
 
 /// Build an RSNE element (ID 48 + length + body) advertising a single
 /// AKM suite 00-0F-AC:`akm`, CCMP group + pairwise ciphers.
@@ -59,6 +64,16 @@ fn test_open_bss_without_security_ies() {
     let sec = detect_security(&[]);
     assert_eq!(sec.security, SecurityType::Open);
     assert!(sec.ap_rsne.is_empty());
+}
+
+#[test]
+fn test_extract_signal_dbm_converts_mbm_to_dbm() {
+    // NL80211_BSS_SIGNAL_MBM is mBm (100 * dBm); the extracted value
+    // must be dBm so BssInfo::signal_dbm and its log lines match the
+    // unit.
+    let bss = vec![Nl80211BssInfo::SignalMbm(-5500)];
+    assert_eq!(extract_signal_dbm(&bss), Some(-55));
+    assert_eq!(extract_signal_dbm(&[]), None);
 }
 
 #[test]

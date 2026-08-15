@@ -11,7 +11,7 @@ use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
     nl80211::scan::{
-        extract_bssid, extract_freq, extract_ies, extract_signal,
+        extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
         extract_ssid_from_ies, get_scan_results, trigger_scan,
     },
 };
@@ -94,6 +94,8 @@ pub struct MdieInfo {
 pub struct BssInfo {
     pub bssid: [u8; ETH_ALEN],
     pub freq_mhz: u32,
+    /// Signal strength of the BSS in dBm (converted from the kernel's
+    /// mBm scan signal).
     pub signal_dbm: i32,
     pub security: SecurityType,
     /// The AP's RSNE as a full element (ID + length + body) from the
@@ -369,9 +371,11 @@ impl WifiClient {
             else {
                 continue;
             };
-            let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) =
-                (extract_bssid(bss), extract_freq(bss), extract_signal(bss))
-            else {
+            let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
+                extract_bssid(bss),
+                extract_freq(bss),
+                extract_signal_dbm(bss),
+            ) else {
                 log::trace!("BSS missing bssid/freq/signal; skipping");
                 continue;
             };
@@ -637,9 +641,11 @@ pub async fn scan_wifi_with_ies(
         if ssid.is_empty() {
             continue;
         }
-        let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) =
-            (extract_bssid(bss), extract_freq(bss), extract_signal(bss))
-        else {
+        let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
+            extract_bssid(bss),
+            extract_freq(bss),
+            extract_signal_dbm(bss),
+        ) else {
             continue;
         };
         let bss_security = detect_security(ies);
