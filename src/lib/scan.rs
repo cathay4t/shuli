@@ -318,14 +318,26 @@ impl WifiClient {
     }
 
     /// Roam scan results: pick the best roam candidate (a different BSS
-    /// of the same security family) and start roaming to it; stay put
-    /// when no candidate qualifies.
+    /// of the same security family that is not weaker than the current
+    /// one) and start roaming to it; stay put when no candidate
+    /// qualifies.
     pub(crate) async fn process_roam_scan_results(&mut self) {
         if let Err(e) = self.collect_scan_candidates().await {
             log::warn!("roam scan failed: {e}");
             return;
         }
         let current_base = self.bss_info.security.base();
+        // Freshly measured signal of the current BSS from this same scan
+        // dump (identical measurement source as the candidates), so the
+        // "not weaker" comparison is apples-to-apples. When the current
+        // BSS is absent from the dump (it went off-channel / hidden),
+        // fall back to the signal recorded when it was selected.
+        let current_signal = self
+            .last_scan_candidates
+            .iter()
+            .find(|(bss, _)| bss.bssid == self.bss_info.bssid)
+            .map(|(bss, _)| bss.signal_dbm)
+            .unwrap_or(self.bss_info.signal_dbm);
         let best = self
             .last_scan_candidates
             .iter()
@@ -333,6 +345,7 @@ impl WifiClient {
             .filter(|bss| {
                 bss.bssid != self.bss_info.bssid
                     && bss.security.base() == current_base
+                    && bss.signal_dbm >= current_signal
             })
             .max();
         let Some(target) = best.cloned() else {
