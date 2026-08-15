@@ -6,7 +6,7 @@ use p256::{
 };
 
 use crate::{
-    auth::AuthMethod,
+    auth::{AuthAction, AuthMethod},
     crypto::sae::{
         SaeAuth, compute_pwe_h2e, compute_pwe_h2e_with_id, compute_pwe_hnp,
         parse_anti_clogging_token,
@@ -155,6 +155,34 @@ fn test_sae_pk_status_127_fails_cleanly() {
     };
     assert_eq!(err.kind, crate::ErrorKind::AuthFailed);
     assert!(err.to_string().contains("SAE-PK"));
+}
+
+/// A transient SAE commit rejection (status 30 "refused temporarily")
+/// must not be treated as a fatal credential failure: 802.11-2020
+/// §12.4.8.6.4 discards the frame and retransmits the commit on the
+/// SAE retransmission timer. Regression: a home AP answered the commit
+/// with status 30 and shuli backed off for 10 minutes, so the
+/// connection only came up after a daemon restart.
+#[test]
+fn test_sae_status_30_retries_temporarily() {
+    let (mac_sta, mac_ap) = test_macs();
+    let mut auth = AuthMethod::new_sae(
+        "12345678",
+        "Test-WIFI",
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+        None,
+    )
+    .unwrap();
+    let action = auth
+        .process_frame(1, 30, &[])
+        .expect("status 30 must be retryable, not fatal");
+    assert!(
+        matches!(action, AuthAction::RetryTemporarily),
+        "status 30 must map to RetryTemporarily"
+    );
 }
 
 /// G2b: a full SAE exchange where both sides derive the PWE with

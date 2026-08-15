@@ -58,14 +58,23 @@ const SCHED_SCAN_INTERVAL_SEC: u32 = 10;
 /// silently stopped). Longer than the firmware's scan interval, so a
 /// match (present AP) always wakes us first.
 const SCHED_SCAN_WATCHDOG_SECS: u64 = 60;
-const RETRY_AUTH_SEC: u64 = 600;
+/// Backoff (seconds) after a fatal authentication failure (wrong
+/// password, unknown SAE password identifier, SAE-PK required, ...):
+/// retrying is futile, but the wait must stay short enough that the
+/// connection recovers without operator intervention when the AP-side
+/// state changes. Transient rejections (e.g. status 30) do not use
+/// this; they retry on the short `Failed` backoff.
+const RETRY_AUTH_SEC: u64 = 120;
 /// Max time to wait for the next authentication event (SAE frame, association
 /// result, 4-way handshake message) before giving up and retrying.
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
-/// G2c: while the SAE commit is in flight (before the AP's commit
-/// arrives) a lost frame is answered with a retransmission after this
-/// many seconds instead of the full `AUTH_EVENT_TIMEOUT_SECS` + rescan.
-const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 5;
+/// SAE retransmission period (seconds): 802.11-2020 §12.4.8.6.2 sets
+/// the t0 (retransmission) timer to `dot11RSNASAERetransPeriod`, whose
+/// MIB default is 2000 ms (iwd uses the same 2 s). While the SAE
+/// commit is in flight, a lost frame - or a rejection with a temporary
+/// status (see §12.4.8.6.4) - is answered with a retransmission after
+/// this period instead of the full `AUTH_EVENT_TIMEOUT_SECS` + rescan.
+const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 2;
 /// G2c: maximum SAE Sync counter (commit retransmissions), matching
 /// iwd's `SAE_SYNC_MAX` of 3.
 const SAE_SYNC_MAX: u8 = 3;
@@ -1432,6 +1441,29 @@ impl WifiClient {
                 // G2b: the AP rejected the H2E commit; restart the
                 // exchange with hunting-and-pecking.
                 self.restart_sae_with_hnp().await;
+            }
+            AuthAction::RetryTemporarily => {
+                // 802.11-2020 §12.4.8.6.4 (Committed state): a nonzero
+                // status is silently discarded and the t0
+                // (retransmission) timer set - the Authenticating wait
+                // loop re-sends the same commit on expiry and
+                // increments the Sync counter. Only once Sync is
+                // exhausted does the protocol instance give up (Del),
+                // which the retry loop turns into a short-backoff
+                // reconnect.
+                if self.sae_sync < SAE_SYNC_MAX {
+                    log::debug!(
+                        "SAE commit temporarily rejected; waiting for the \
+                         retransmission timer"
+                    );
+                } else {
+                    log::warn!(
+                        "SAE commit temporarily rejected {} times; giving up, \
+                         will reconnect",
+                        self.sae_sync
+                    );
+                    self.state = WifiState::Failed;
+                }
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");

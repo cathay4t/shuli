@@ -26,6 +26,13 @@ pub(crate) enum AuthAction {
     /// network allows it: restart the SAE exchange with
     /// hunting-and-pecking.
     RetryWithHnp,
+    /// The AP rejected the SAE commit with a transient status (e.g. 30
+    /// "refused temporarily"). Per 802.11-2020 §12.4.8.6.4 (Committed
+    /// state) the rejection is silently discarded and the commit is
+    /// retransmitted on the SAE retransmission timer; only after the
+    /// Sync counter is exhausted does the instance give up and the
+    /// client restart the connection on the short backoff.
+    RetryTemporarily,
     /// Authentication succeeded; proceed to association.
     Complete,
 }
@@ -153,6 +160,25 @@ fn process_sae_frame(
         ));
     }
 
+    // Some APs answer the SAE commit with a status that only means
+    // "try again shortly" - e.g. 30 (refused temporarily), 17 (no more
+    // STAs), or 802.11e channel-condition refusals. 802.11-2020
+    // §12.4.8.6.4: "If the Status is some other nonzero value, the
+    // frame shall be silently discarded and the t0 (retransmission)
+    // timer shall be set" - the SAE layer re-sends the same commit on
+    // the retransmission timer (dot11RSNASAERetransPeriod, 2 s) up to
+    // `dot11RSNASAESync` times, it does not fail the whole connection
+    // on the first rejection. The previous behavior instead backed off
+    // for the long `RETRY_AUTH_SEC` interval, which made the client
+    // look hung until the daemon was restarted.
+    if auth_seq == 1 && is_temporary_reject_status(status) {
+        log::info!(
+            "SAE commit temporarily rejected (status {status}); \
+             retransmitting on the SAE retransmission timer"
+        );
+        return Ok(AuthAction::RetryTemporarily);
+    }
+
     const SAE_STATUS_H2E: u16 = 126;
     let status_ok = match auth_seq {
         1 => status == 0 || status == SAE_STATUS_H2E,
@@ -201,6 +227,21 @@ fn process_sae_frame(
         }
         _ => Ok(AuthAction::Continue),
     }
+}
+
+/// Statuses an AP uses to refuse authentication/association
+/// temporarily; the client should retry after a short backoff instead
+/// of treating them as fatal credential failures.
+fn is_temporary_reject_status(status: u16) -> bool {
+    matches!(
+        status,
+        17  // AP unable to handle additional STAs
+        | 30 // refused temporarily / association rejected temporarily
+        | 32 // unspecified QoS failure
+        | 33 // denied due to insufficient bandwidth
+        | 34 // denied due to poor channel conditions
+        | 35 // denied because QoS is not supported
+    )
 }
 
 impl WifiClient {
