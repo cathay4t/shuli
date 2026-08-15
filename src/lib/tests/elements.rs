@@ -2,7 +2,7 @@
 
 //! Unit tests for RSNE builders (Stage 3 M5: WPA3-Enterprise PMF).
 
-use wl_nl80211::Nl80211CipherSuite;
+use wl_nl80211::Ieee80211CipherSuite;
 
 use crate::ieee80211::elements::{
     negotiate_group_mgmt_cipher, parse_group_mgmt_cipher, rsne_set_ext_key_id,
@@ -24,7 +24,7 @@ fn rsne_capabilities(ie: &[u8]) -> u16 {
 #[test]
 fn wpa3_enterprise_rsne_requires_mfp() {
     // WPA3-Enterprise (AKM 5): MFPR + MFPC both set.
-    let ie = wpa2_ent_sha256_ie_cipher(Nl80211CipherSuite::BipCmac128);
+    let ie = wpa2_ent_sha256_ie_cipher(Ieee80211CipherSuite::BipCmac128);
     assert_eq!(
         &ie[16..20],
         &[0x00, 0x0F, 0xAC, 0x05],
@@ -38,7 +38,7 @@ fn wpa3_enterprise_rsne_requires_mfp() {
 #[test]
 fn wpa2_enterprise_rsne_keeps_pmf_optional() {
     // WPA2-Enterprise (AKM 1): MFPC only - PMF optional.
-    let ie = wpa2_ent_ie_cipher(Nl80211CipherSuite::BipCmac128);
+    let ie = wpa2_ent_ie_cipher(Ieee80211CipherSuite::BipCmac128);
     let capab = rsne_capabilities(&ie);
     assert_eq!(capab & 0x40, 0, "AKM 1 must not require PMF");
     assert_ne!(capab & 0x80, 0, "AKM 1 offers PMF (MFPC)");
@@ -48,38 +48,38 @@ fn wpa2_enterprise_rsne_keeps_pmf_optional() {
 /// RSNEs (with and without a PMKID) and defaults to BIP-CMAC-128.
 #[test]
 fn group_mgmt_cipher_negotiation_roundtrip() {
-    let gmac256 = wpa2_ent_sha256_ie_cipher(Nl80211CipherSuite::BipGmac256);
+    let gmac256 = wpa2_ent_sha256_ie_cipher(Ieee80211CipherSuite::BipGmac256);
     assert_eq!(
         parse_group_mgmt_cipher(&gmac256),
-        Some(Nl80211CipherSuite::BipGmac256)
+        Some(Ieee80211CipherSuite::BipGmac256)
     );
     assert_eq!(
         negotiate_group_mgmt_cipher(&gmac256),
-        Nl80211CipherSuite::BipGmac256
+        Ieee80211CipherSuite::BipGmac256
     );
 
     let cmac256 = wpa2_psk_ie_with_pmkid_cipher(
         Some([0xAB; 16]),
-        Nl80211CipherSuite::BipCmac256,
+        Ieee80211CipherSuite::BipCmac256,
     );
     assert_eq!(
         parse_group_mgmt_cipher(&cmac256),
-        Some(Nl80211CipherSuite::BipCmac256),
+        Some(Ieee80211CipherSuite::BipCmac256),
         "parse must skip the PMKID list before the mgmt cipher"
     );
     assert_eq!(
         negotiate_group_mgmt_cipher(&cmac256),
-        Nl80211CipherSuite::BipCmac256
+        Ieee80211CipherSuite::BipCmac256
     );
 
-    let cmac128 = wpa2_ent_ie_cipher(Nl80211CipherSuite::BipCmac128);
+    let cmac128 = wpa2_ent_ie_cipher(Ieee80211CipherSuite::BipCmac128);
     assert_eq!(
         negotiate_group_mgmt_cipher(&cmac128),
-        Nl80211CipherSuite::BipCmac128
+        Ieee80211CipherSuite::BipCmac128
     );
     assert_eq!(
         negotiate_group_mgmt_cipher(&[]),
-        Nl80211CipherSuite::BipCmac128,
+        Ieee80211CipherSuite::BipCmac128,
         "missing group mgmt cipher defaults to BIP-CMAC-128"
     );
 }
@@ -88,7 +88,7 @@ fn group_mgmt_cipher_negotiation_roundtrip() {
 /// and cleared on a built RSNE.
 #[test]
 fn ext_key_id_rsne_bit() {
-    let mut ie = wpa2_ent_sha256_ie_cipher(Nl80211CipherSuite::BipCmac128);
+    let mut ie = wpa2_ent_sha256_ie_cipher(Ieee80211CipherSuite::BipCmac128);
     rsne_set_ext_key_id(&mut ie, true);
     assert_ne!(rsne_capabilities(&ie) & 0x2000, 0);
     rsne_set_ext_key_id(&mut ie, false);

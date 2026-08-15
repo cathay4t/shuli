@@ -870,7 +870,7 @@ async fn wifi_client_sae_bip_gmac256() {
     ));
     assert_eq!(
         client.bss_info.group_mgmt_cipher,
-        wl_nl80211::Nl80211CipherSuite::BipGmac256,
+        wl_nl80211::Ieee80211CipherSuite::BipGmac256,
         "BIP-GMAC-256 must be negotiated"
     );
 

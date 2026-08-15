@@ -3,7 +3,8 @@
 use futures::TryStreamExt;
 use netlink_packet_core::Parseable;
 use wl_nl80211::{
-    Nl80211Attr, Nl80211BssInfo, Nl80211Element, Nl80211Elements, Nl80211Handle,
+    Ieee80211Element, Ieee80211Elements, Nl80211Attr, Nl80211BssInfo,
+    Nl80211Handle,
 };
 
 use crate::WifiError;
@@ -47,9 +48,9 @@ pub async fn get_scan_results(
 }
 
 pub fn extract_ssid_from_ies(ies: &[u8]) -> Option<String> {
-    let elements = Nl80211Elements::parse(ies).ok()?;
+    let elements = Ieee80211Elements::parse(ies).ok()?;
     for element in elements.0 {
-        if let Nl80211Element::Ssid(ssid) = element {
+        if let Ieee80211Element::Ssid(ssid) = element {
             return Some(ssid);
         }
     }

@@ -126,7 +126,7 @@ fn test_rsne_pmkid_builder_roundtrip() {
     let pmkid = [0xAB; 16];
     let ie = elements::sae_ie_with_pmkid_cipher(
         Some(pmkid),
-        wl_nl80211::Nl80211CipherSuite::BipCmac128,
+        wl_nl80211::Ieee80211CipherSuite::BipCmac128,
     );
     // RSNE element: id(1) len(1) version(2) group(4) pcount(2) pcipher(4)
     // acount(2) akm(4) capab(2) pmkid_count(2) pmkid(16) ...
@@ -136,7 +136,7 @@ fn test_rsne_pmkid_builder_roundtrip() {
     // No PMKID: count must be zero.
     let ie = elements::sae_ie_with_pmkid_cipher(
         None,
-        wl_nl80211::Nl80211CipherSuite::BipCmac128,
+        wl_nl80211::Ieee80211CipherSuite::BipCmac128,
     );
     assert_eq!(u16::from_le_bytes([ie[22], ie[23]]), 0);
 }

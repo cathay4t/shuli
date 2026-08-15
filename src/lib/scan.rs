@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use futures::{StreamExt, TryStreamExt};
-use wl_nl80211::{Nl80211BssInfo, Nl80211CipherSuite, Nl80211Event};
+use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
@@ -106,7 +106,7 @@ pub struct BssInfo {
     /// Negotiated group management (BIP) cipher (Stage 3 M8):
     /// best supported suite the AP advertises, defaulting to
     /// BIP-CMAC-128.
-    pub(crate) group_mgmt_cipher: Nl80211CipherSuite,
+    pub(crate) group_mgmt_cipher: Ieee80211CipherSuite,
     /// Mobility Domain (present only on FT-capable BSSes).
     pub mdie: Option<MdieInfo>,
     /// Whether the AP hides its SSID in beacons while still answering
@@ -123,7 +123,7 @@ impl Default for BssInfo {
             security: SecurityType::Open,
             ap_rsne: Vec::new(),
             ap_rsnxe: Vec::new(),
-            group_mgmt_cipher: Nl80211CipherSuite::BipCmac128,
+            group_mgmt_cipher: Ieee80211CipherSuite::BipCmac128,
             mdie: None,
             hidden: false,
         }
@@ -437,7 +437,7 @@ pub(crate) struct BssScanSecurity {
     pub(crate) security: SecurityType,
     pub(crate) ap_rsne: Vec<u8>,
     pub(crate) ap_rsnxe: Vec<u8>,
-    pub(crate) group_mgmt_cipher: Nl80211CipherSuite,
+    pub(crate) group_mgmt_cipher: Ieee80211CipherSuite,
     pub(crate) mdie: Option<MdieInfo>,
 }
 
@@ -498,7 +498,7 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let group_mgmt_cipher = if rsne.len() > 2 {
         crate::ieee80211::elements::negotiate_group_mgmt_cipher(&rsne)
     } else {
-        Nl80211CipherSuite::BipCmac128
+        Ieee80211CipherSuite::BipCmac128
     };
     BssScanSecurity {
         security,
