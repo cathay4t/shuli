@@ -27,7 +27,7 @@ netlink-packet-generic = "0.4"
 genetlink = "0.2"
 netlink-proto = "0.12"
 netlink-sys = "0.8"
-netlink-packet-route = { path = "../netlink/netlink-packet-route" }
+netlink-packet-route = "0.32"
 mozim = { version = "0.3.2", default-features = false, features = ["netlink"] }
 p256 = { version = "0.14", features = ["arithmetic", "hash2curve", "ecdh", "getrandom"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
