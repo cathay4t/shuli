@@ -259,6 +259,12 @@ impl WifiClient {
     ) -> Result<(), WifiError> {
         self.auth = None;
         self.fourway = None;
+        // A new connection attempt starts a fresh SAE/PSK exchange, so the
+        // previous attempt's FT key hierarchy (PMK-R0/R1, derived from the
+        // old PMK) is invalid. Keeping it would let an early 4-way Message 1
+        // (arriving before the association response) answer with a stale
+        // PMK-R1 and stall the handshake.
+        self.ft = None;
         self.psk_pmk = None;
         self.pmksa_in_use = None;
         self.pending_ft_msg1 = None;

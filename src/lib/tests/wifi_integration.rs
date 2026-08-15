@@ -41,7 +41,9 @@ use crate::{
         EAP_TLS_FLAG_START, build_tls_message, cert_from_pem, key_from_pem,
         parse_tls_message,
     },
-    ieee80211::eapol::{build_eapol_eap_frame, parse_eapol_eap_frame},
+    ieee80211::eapol::{
+        build_eapol_eap_frame, build_eapol_key_pdu, parse_eapol_eap_frame,
+    },
     wired::{open_eapol_socket, recv_eapol_frame, send_eapol_frame},
 };
 
@@ -1790,6 +1792,91 @@ async fn wifi_client_ft_sae_btm_roam() {
             "the client must stay on the BTM candidate BSS"
         );
     }
+    client.shutdown().await;
+}
+
+/// Regression test for the SweatHome5G failure: an FT-SAE reconnect must
+/// not reuse the previous connection's FT context. The AP sent 4-way
+/// Message 1 before the association response event, shuli answered with a
+/// Message 2 built from the stale PMK-R1, the AP retransmitted Message 1
+/// (replay 2..4) and never sent Message 3 - ending in "authentication
+/// timed out". An early Message 1 must be buffered until the new
+/// association response establishes the fresh FT context.
+#[tokio::test]
+async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_ft_sae_reconnect_buffers_early_msg1: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(FT_SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-FT", Some("12345678"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert!(client.ft.is_some(), "FT context expected after connecting");
+    drain_pending_events(&mut client).await;
+
+    // Begin a reconnect attempt like the retry loop does: tear down the
+    // kernel association, then start a fresh authentication. This resets
+    // the per-attempt 4-way state, but the previous FT context (PMK-R1
+    // derived from the old SAE PMK) must not survive into the new attempt.
+    crate::nl80211::connect::disconnect(
+        &mut client.conn_handle,
+        client.if_index,
+    )
+    .await
+    .expect("disconnect before reconnect");
+    client
+        .send_out_auth_request()
+        .await
+        .expect("start reconnect authentication");
+    assert!(
+        client.ft.is_none(),
+        "stale FT context must be cleared when a new attempt starts"
+    );
+    assert!(client.fourway.is_none(), "4-way state must be reset");
+
+    // The AP's first EAPOL-Key (Message 1, ANonce) arrives before the
+    // association response event, as seen against SweatHome5G. With no FT
+    // context yet, it must be buffered - never answered with a Message 2
+    // carrying the old PMKR1Name.
+    let msg1 = build_eapol_key_pdu(
+        0x0088, // ACK | Pairwise, KDV 0 (AKM-defined for FT-SAE)
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    client
+        .handle_event(wl_nl80211::Nl80211Event::ControlPortFrame {
+            frame: msg1,
+        })
+        .await;
+
+    assert!(
+        client.pending_ft_msg1.is_some(),
+        "early Message 1 must be buffered until the new FT context exists"
+    );
+    assert!(
+        client.fourway.is_none(),
+        "no 4-way state may be built from a stale FT context"
+    );
     client.shutdown().await;
 }
 
