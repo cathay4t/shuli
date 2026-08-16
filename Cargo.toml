@@ -40,5 +40,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 version = "0.21"
 
 [workspace.dependencies.wl-nl80211]
-version = "0.5"
-git = "https://github.com/rust-netlink/wl-nl80211"
+version = "0.6"
