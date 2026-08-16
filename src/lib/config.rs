@@ -10,7 +10,7 @@ pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
 /// *different* configured SSID. Matches iwd's `CriticalRoamThreshold`.
 pub const DEFAULT_SWITCH_SSID_LOWER_THAN_DBM: i32 = -80;
 
-/// SAE PWE derivation mode for a WPA3-Personal network (Stage 2 G2b).
+/// SAE PWE derivation mode for a WPA3-Personal network.
 ///
 /// WPA3 APs derive the SAE password element either with hash-to-element
 /// (H2E, RFC 9380) or with hunting-and-pecking (HnP, RFC 7664); an
@@ -21,7 +21,7 @@ pub const DEFAULT_SWITCH_SSID_LOWER_THAN_DBM: i32 = -80;
 /// a missing/misleading RSNXE cannot strand the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaePwe {
-    /// Hash-to-element only (the Stage-1 behaviour).
+    /// Hash-to-element only.
     H2E,
     /// Hunting-and-pecking only (RFC 7664), for HnP-only APs.
     HnP,
@@ -109,17 +109,17 @@ pub struct NetworkConfig {
     /// [`SaePwe::Auto`]: hash-to-element first, hunting-and-pecking
     /// fallback for HnP-only APs.
     pub sae_pwe: SaePwe,
-    /// Optional SAE password identifier (Stage 3 M7).  When set, the
+    /// Optional SAE password identifier.  When set, the
     /// client derives the H2E PWE with the identifier, includes it in
     /// the SAE commit, and never falls back to hunting-and-pecking
     /// (password identifiers are H2E-only).
     pub sae_password_id: Option<String>,
-    /// Operating Channel Validation (OCV, Stage 3 M10): when `true`,
+    /// Operating Channel Validation (OCV): when `true`,
     /// the STA advertises the OCVC RSN capability, sends its OCI in
     /// 4-way Message 2, and verifies the AP's OCI in Message 3 and
     /// group rekeys.  Defaults to `false`.
     pub ocv: bool,
-    /// Extended Key ID (Stage 3 M11): use pairwise key id 0/1 rotation
+    /// Extended Key ID: use pairwise key id 0/1 rotation
     /// for lossless PTK rekeys.  Requires driver support and an
     /// AES-CC pairwise cipher; opt-in per network, defaults to `false`.
     pub ext_key_id: bool,
@@ -190,7 +190,7 @@ impl NetworkConfig {
     }
 }
 
-/// EAP credential configuration (Stage 3 M3): identity, certificate
+/// EAP credential configuration: identity, certificate
 /// paths, and the TLS server name used for certificate validation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EapConfig {

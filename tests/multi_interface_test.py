@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""M7 (G5): the daemon runs one `WifiClient` per configured interface, so
+"""The daemon runs one `WifiClient` per configured interface, so
 two interfaces connect to two APs concurrently.  Each interface gets its
 own static IP config applied.
 

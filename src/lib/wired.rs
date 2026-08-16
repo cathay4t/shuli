@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wired 802.1X supplicant (Stage 3 Goal 6): EAPOL over an Ethernet
+//! Wired 802.1X supplicant: EAPOL over an Ethernet
 //! NIC with a raw AF_PACKET socket.
 //!
 //! Unlike WiFi there is no association, no 4-way handshake and no key

@@ -193,7 +193,7 @@ fn rsne_capabilities_field(body: &[u8]) -> Option<u16> {
 /// Whether the AP's RSNE (full element: ID || length || body, as stored
 /// in `BssInfo::ap_rsne`) advertises the OCVC RSN capability (bit 14,
 /// 802.11-2020 §9.4.2.25). Used to enable Operating Channel Validation
-/// (Stage 3 M10) only when the AP actually supports it, instead of
+/// only when the AP actually supports it, instead of
 /// enforcing OCI verification against an AP that will never include an
 /// OCI KDE in Message 3 - which would otherwise always fail the 4-way
 /// handshake.
@@ -206,8 +206,8 @@ pub fn ap_rsne_supports_ocv(ap_rsne: &[u8]) -> bool {
 
 /// Whether the AP's RSNE advertises the Extended Key ID for
 /// Individually Addressed Frames RSN capability (bit 13,
-/// 802.11-2020 §9.4.2.25). Used to request Extended Key ID (Stage 3
-/// M11) only when the AP actually supports it, instead of requiring a
+/// 802.11-2020 §9.4.2.25). Used to request Extended Key ID only when
+/// the AP actually supports it, instead of requiring a
 /// Key ID KDE in Message 3 that a non-supporting AP will never send.
 pub fn ap_rsne_supports_ext_key_id(ap_rsne: &[u8]) -> bool {
     if ap_rsne.len() < 2 {
@@ -219,7 +219,7 @@ pub fn ap_rsne_supports_ext_key_id(ap_rsne: &[u8]) -> bool {
 /// Negotiate the group management (BIP) cipher with the AP: the best
 /// supported suite the AP advertises, defaulting to BIP-CMAC-128.
 /// Preference order matches iwd: GMAC-256 > CMAC-256 > GMAC-128 >
-/// CMAC-128 (Stage 3 M8).
+/// CMAC-128.
 pub fn negotiate_group_mgmt_cipher(ap_rsne: &[u8]) -> Ieee80211CipherSuite {
     let Some(ap) = parse_group_mgmt_cipher(ap_rsne) else {
         return Ieee80211CipherSuite::BipCmac128;
@@ -238,7 +238,7 @@ pub fn negotiate_group_mgmt_cipher(ap_rsne: &[u8]) -> Ieee80211CipherSuite {
 }
 
 /// Set or clear the OCV capability bit (bit 14) in the RSN
-/// capabilities of a built RSNE (Stage 3 M10).
+/// capabilities of a built RSNE.
 pub fn rsne_set_ocvc(rsne: &mut [u8], enabled: bool) {
     if rsne.len() < 4 {
         return;
@@ -268,7 +268,7 @@ pub fn rsne_set_ocvc(rsne: &mut [u8], enabled: bool) {
 }
 
 /// Set or clear the Extended Key ID capability bit (bit 13) in the RSN
-/// capabilities of a built RSNE (Stage 3 M11).
+/// capabilities of a built RSNE.
 pub fn rsne_set_ext_key_id(rsne: &mut [u8], enabled: bool) {
     if rsne.len() < 4 {
         return;
@@ -321,7 +321,7 @@ pub fn sae_ie_cipher(mgmt_cipher: Ieee80211CipherSuite) -> Vec<u8> {
 }
 
 /// [`sae_ie_with_pmkid`] with a negotiated group management (BIP)
-/// cipher (Stage 3 M8).
+/// cipher.
 pub fn sae_ie_with_pmkid_cipher(
     pmkid: Option<[u8; 16]>,
     mgmt_cipher: Ieee80211CipherSuite,
@@ -348,8 +348,8 @@ pub fn sae_ie_with_pmkid_cipher(
     buf
 }
 
-/// Build the RSNE + RSNXE for SAE-EXT-KEY (AKM 00-0F-AC:24, Stage 3
-/// M12): same security policy as SAE (CCMP-128, MFP required, H2E),
+/// Build the RSNE + RSNXE for SAE-EXT-KEY (AKM 00-0F-AC:24): same
+/// security policy as SAE (CCMP-128, MFP required, H2E),
 /// only the AKM differs.
 pub fn sae_ext_key_ie_cipher(mgmt_cipher: Ieee80211CipherSuite) -> Vec<u8> {
     sae_ext_key_ie_with_pmkid_cipher(None, mgmt_cipher)

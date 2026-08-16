@@ -80,7 +80,7 @@ pub(crate) const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
 /// status (see §12.4.8.6.4) - is answered with a retransmission after
 /// this period instead of the full `AUTH_EVENT_TIMEOUT_SECS` + rescan.
 const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 2;
-/// G2c: maximum SAE Sync counter (commit retransmissions), matching
+/// maximum SAE Sync counter (commit retransmissions), matching
 /// iwd's `SAE_SYNC_MAX` of 3.
 const SAE_SYNC_MAX: u8 = 3;
 
@@ -127,12 +127,12 @@ pub struct WifiClient {
     pub(crate) sched_scan_supported: bool,
     /// Whether a scheduled scan is currently running in the firmware.
     pub(crate) sched_scan_active: bool,
-    /// G9: the WoWLAN triggers the wiphy advertises (e.g.
+    /// the WoWLAN triggers the wiphy advertises (e.g.
     /// `GtkRekeyFailure`), as reported by
     /// `NL80211_ATTR_WOWLAN_TRIGGERS_SUPPORTED`. Empty when the driver
     /// has no WoWLAN support.
     pub(crate) wowlan_supported_triggers: Vec<Nl80211WowlanTriggersSupport>,
-    /// G9: whether WoWLAN triggers are currently armed on the device.
+    /// whether WoWLAN triggers are currently armed on the device.
     pub(crate) wowlan_armed: bool,
     /// A stop was requested and the kernel's `SCHED_SCAN_STOPPED` echo
     /// has not been consumed yet. The kernel multicasts that event for
@@ -154,14 +154,14 @@ pub struct WifiClient {
     pub(crate) owe: Option<OweAuth>,
     /// WPA2-PSK PMK derived via PBKDF2 (only for WPA2-PSK networks).
     pub(crate) psk_pmk: Option<[u8; 32]>,
-    /// Stage 3 M4: EAP peer state machine for 802.1X networks
+    /// EAP peer state machine for 802.1X networks
     /// (WPA2-Enterprise / later wired 802.1X).
     pub(crate) eap_peer: Option<EapPeer>,
     /// PMK derived from the EAP MSK after EAP-Success (enterprise).
     pub(crate) eap_pmk: Option<[u8; 32]>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
-    /// PMKSA cache (Stage 2 G4): reconnects and roams to a cached BSS
+    /// PMKSA cache: reconnects and roams to a cached BSS
     /// skip the full authentication.
     pub(crate) pmksa_cache: PmksaCache,
     /// The PMKSA entry of the connection attempt in flight, when the
@@ -224,7 +224,7 @@ pub struct WifiClient {
     /// the integration tests to observe scans that `run()` now keeps
     /// internal (no `Scanning` state is surfaced when the scan stays).
     pub(crate) roam_scan_count: u64,
-    /// G2c: SAE commit retransmission state. `sae_commit_sent` is true
+    /// SAE commit retransmission state. `sae_commit_sent` is true
     /// while we await the AP's commit; on a timeout the same commit is
     /// re-sent (the 802.11 SAE Sync counter, max 3) instead of paying a
     /// full rescan cycle for one lost frame.
@@ -233,7 +233,7 @@ pub struct WifiClient {
     pub(crate) sae_sync: u8,
     /// The last SAE commit auth_data, re-sent verbatim on a timeout.
     pub(crate) sae_commit_auth_data: Vec<u8>,
-    /// G2b: an H2E commit was rejected and the exchange restarted with
+    /// an H2E commit was rejected and the exchange restarted with
     /// hunting-and-pecking (never retried a second time).
     pub(crate) sae_hnp_attempted: bool,
 }
@@ -287,7 +287,7 @@ impl WifiClient {
                 }
             };
 
-        // G9: detect WoWLAN trigger support once, so arming a
+        // detect WoWLAN trigger support once, so arming a
         // `wowlan: true` network is a no-op (and clearly logged) on
         // drivers without it.
         let wowlan_supported_triggers =
@@ -313,7 +313,7 @@ impl WifiClient {
 
         let mut conn_handle = handle.connection();
 
-        // G9: clear any WoWLAN triggers a previous (possibly crashed)
+        // clear any WoWLAN triggers a previous (possibly crashed)
         // run left armed. The daemon arms them again right before the
         // next suspend; a leftover configuration would keep the device
         // in WoWLAN mode with nobody handling the wake.
@@ -604,7 +604,7 @@ impl WifiClient {
                             if self.sae_commit_sent
                                 && self.sae_sync < SAE_SYNC_MAX
                             {
-                                // G2c: retransmit the pending SAE commit.
+                                // retransmit the pending SAE commit.
                                 self.sae_sync += 1;
                                 log::info!(
                                     "SAE commit timed out - retransmitting \
@@ -935,7 +935,7 @@ impl WifiClient {
                     )
                     .await;
                 } else if self.pmksa_in_use.is_some() {
-                    // G4 PMKSA caching: the open-system authentication
+                    // PMKSA caching: the open-system authentication
                     // already succeeded; associate with the cached PMKID in
                     // the RSNE. An AP without the matching PMKSA rejects
                     // the association, which triggers the full-auth
@@ -1272,7 +1272,7 @@ impl WifiClient {
                     // cfg80211-style drivers (e.g. brcmfmac) report the
                     // AP-initiated disconnect through CMD_DISCONNECT
                     // with the same IEEE 802.11 reason code; classify
-                    // it like the deauth/disassoc events (M7).
+                    // it like the deauth/disassoc events.
                     log::warn!("DISCONNECT: reason={reason}");
                     self.state = if is_fatal_disconnect_reason(Some(reason)) {
                         WifiState::FailedAuthentication
@@ -1293,7 +1293,7 @@ impl WifiClient {
                 }
             }
 
-            // M7 (G5): AP-initiated deauth/disassoc with the IEEE 802.11
+            // AP-initiated deauth/disassoc with the IEEE 802.11
             // reason code parsed out of the management frame by
             // wl-nl80211. The reason tells a fatal credential problem
             // (retry with the long authentication backoff) apart from a
@@ -1415,7 +1415,7 @@ impl WifiClient {
         }
     }
 
-    /// G9: the device woke the host while it was suspended. Clear the
+    /// the device woke the host while it was suspended. Clear the
     /// per-suspend triggers, and when the wake means the connection is
     /// no longer trustworthy (GTK rekey failure / disconnect) tear it
     /// down so the retry loop rebuilds it.
@@ -1460,7 +1460,7 @@ impl WifiClient {
         }
     }
 
-    /// G9: arm WoWLAN when the connected network opted in
+    /// arm WoWLAN when the connected network opted in
     /// (`NetworkConfig::wowlan`). WoWLAN is off by default; this keeps
     /// the feature opt-in per network.
     pub(crate) async fn arm_wowlan_if_enabled(&mut self) {
@@ -1546,7 +1546,7 @@ impl WifiClient {
                 }
             }
             AuthAction::SendCommitWithToken(token) => {
-                // G2a: the AP demanded an anti-clogging token - re-send
+                // the AP demanded an anti-clogging token - re-send
                 // the commit (fresh scalar/element) with the token.
                 let auth_data = match self.auth.as_mut() {
                     Some(auth) => match auth.commit_with_token(&token) {
@@ -1566,7 +1566,7 @@ impl WifiClient {
                 self.send_sae_commit(&auth_data).await;
             }
             AuthAction::RetryWithHnp => {
-                // G2b: the AP rejected the H2E commit; restart the
+                // the AP rejected the H2E commit; restart the
                 // exchange with hunting-and-pecking.
                 self.restart_sae_with_hnp().await;
             }
@@ -1637,7 +1637,7 @@ impl WifiClient {
     }
 
     /// Send an SAE commit auth_data via `NL80211_CMD_AUTHENTICATE` and
-    /// record it for G2c retransmission (SAE Sync). The commit being
+    /// record it for retransmission (SAE Sync). The commit being
     /// (re)sent stays in flight until the AP's commit arrives.
     async fn send_sae_commit(&mut self, auth_data: &[u8]) {
         let attrs = Nl80211Authenticate::new(self.if_index)
@@ -1660,7 +1660,7 @@ impl WifiClient {
         log::info!("SAE commit sent");
     }
 
-    /// G2b: the AP rejected the H2E commit (an HnP-only AP); restart the
+    /// the AP rejected the H2E commit (an HnP-only AP); restart the
     /// SAE exchange with a hunting-and-pecking commit. Only attempted
     /// once per connection attempt (`sae_hnp_attempted`).
     async fn restart_sae_with_hnp(&mut self) {
@@ -1702,7 +1702,7 @@ impl WifiClient {
 
     /// Handle an EAPOL-Key frame (4-way handshake / group rekey).
     async fn handle_control_port_frame(&mut self, frame: &[u8]) {
-        // Stage 3 M4: 802.1X EAP frames (EAPOL type 0) arrive on the
+        // 802.1X EAP frames (EAPOL type 0) arrive on the
         // same control port as EAPOL-Key frames.
         if let Some(eap_pdu) = eapol::parse_eapol_eap_frame(frame) {
             self.handle_eap_frame(eap_pdu).await;
@@ -1800,7 +1800,7 @@ impl WifiClient {
                     let (pmk, mut rsne, mic_alg) = if let Some(entry) =
                         self.pmksa_in_use.as_ref()
                     {
-                        // G4: 4-way over a cached PMK. The RSNE must be
+                        // 4-way over a cached PMK. The RSNE must be
                         // the same one the association request carried
                         // (with the PMKID) - the AP verifies that.
                         let rsne = self.rsne_with_pmkid(Some(entry.pmkid));
@@ -2015,7 +2015,7 @@ impl WifiClient {
                 }
             };
 
-            // Stage 3 M9: the AP can tell the STA to stop using legacy
+            // the AP can tell the STA to stop using legacy
             // AKMs via the Transition Disable KDE.  shuli's config is
             // file-driven (no runtime profile update), so record it in
             // the log; future reconnects pick up a config change.
@@ -2026,7 +2026,7 @@ impl WifiClient {
                 );
             }
 
-            // Stage 3 M11: with Extended Key ID the pairwise key is
+            // with Extended Key ID the pairwise key is
             // installed in two phases - RX-only before Message 4 (so
             // frames protected with the new key id decrypt), then
             // activated (TX) after Message 4.
@@ -2119,7 +2119,7 @@ impl WifiClient {
                 log::info!("GTK[{gtk_idx}] installed");
             }
 
-            // G1a: install the IGTK (and BIGTK when the AP delivers one)
+            // install the IGTK (and BIGTK when the AP delivers one)
             // from the Message 3 KDEs. Without the IGTK, mac80211 drops
             // every protected management frame (SA Query, BTM, channel
             // switch announcements) the AP sends. Failures are logged but
@@ -2173,7 +2173,7 @@ impl WifiClient {
                 }
             }
 
-            // G4: the handshake proved the PMK - cache the PMKSA for the
+            // the handshake proved the PMK - cache the PMKSA for the
             // next reconnect/roam (and hand it to the driver's cache).
             self.cache_pmksa().await;
 
@@ -2220,7 +2220,7 @@ impl WifiClient {
                 self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.state = WifiState::ConnectedWithoutOffloadRekey;
             }
-            // G9 (wpa_supplicant model): arm WoWLAN triggers when the
+            // (wpa_supplicant model): arm WoWLAN triggers when the
             // connection lands and leave them armed. The kernel only
             // uses them while the host is suspended; the wake handler
             // clears them after a WoWLAN wake and this arms again on
@@ -2296,7 +2296,7 @@ impl WifiClient {
         }
     }
 
-    /// Stage 3 M4: feed an EAP packet into the 802.1X peer state
+    /// feed an EAP packet into the 802.1X peer state
     /// machine and act on its output (response / Success / Failure).
     async fn handle_eap_frame(&mut self, eap_pdu: &[u8]) {
         let Some(packet) = EapPacket::parse(eap_pdu) else {
@@ -2493,7 +2493,7 @@ impl WifiClient {
         !desired_wowlan_triggers(&self.wowlan_supported_triggers).is_empty()
     }
 
-    /// G9: arm WoWLAN triggers (`NL80211_CMD_SET_WOWLAN`) so the device
+    /// arm WoWLAN triggers (`NL80211_CMD_SET_WOWLAN`) so the device
     /// can wake the host while it is suspended. Arms `Disconnect` and
     /// `GtkRekeyFailure` when the wiphy advertises them; returns `true`
     /// when triggers were armed and `false` when the wiphy has no
@@ -2527,7 +2527,7 @@ impl WifiClient {
         }
     }
 
-    /// G9: clear WoWLAN triggers (`NL80211_CMD_SET_WOWLAN` with an
+    /// clear WoWLAN triggers (`NL80211_CMD_SET_WOWLAN` with an
     /// empty trigger set), e.g. after a WoWLAN wake or before
     /// shutdown. Best-effort.
     pub async fn disarm_wowlan(&mut self) -> Result<(), WifiError> {
@@ -2621,7 +2621,7 @@ impl Drop for WifiClient {
     }
 }
 
-/// G9: the WoWLAN triggers shuli wants to arm, filtered down to what
+/// the WoWLAN triggers shuli wants to arm, filtered down to what
 /// the wiphy advertises. GTK-rekey-failure is the motivating trigger:
 /// while the host is suspended the device must wake it when the AP
 /// rekeys the group key (otherwise the association silently loses the
@@ -2641,7 +2641,7 @@ fn desired_wowlan_triggers(
     triggers
 }
 
-/// G9: a WoWLAN wake that invalidates the current connection: the GTK
+/// a WoWLAN wake that invalidates the current connection: the GTK
 /// rekey failed while the host was suspended (the group key is unknown,
 /// so the old association must be rebuilt) or the device woke on a
 /// disconnect.
@@ -2667,7 +2667,7 @@ fn is_fatal_disconnect_reason(reason: Option<Ieee80211ReasonCode>) -> bool {
     )
 }
 
-/// Stage 3 M9: human-readable names for the Transition Disable KDE
+/// human-readable names for the Transition Disable KDE
 /// bitmap bits (bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
 /// 3 = Enhanced Open).
 fn fmt_transition_disable(bitmap: u8) -> String {
@@ -2706,7 +2706,7 @@ async fn send_ctrl_port_frame(
 }
 
 impl WifiClient {
-    /// Stage 3 M10: enable OCV on the 4-way state with our OCI derived
+    /// enable OCV on the 4-way state with our OCI derived
     /// from the BSS frequency, but only when the AP's RSNE actually
     /// advertises OCVC support. Otherwise Message 3 will never carry an
     /// OCI KDE and `verify_oci()` would unconditionally fail the
@@ -2741,7 +2741,7 @@ impl WifiClient {
         }
     }
 
-    /// Stage 3 M11: whether Extended Key ID should be requested for
+    /// whether Extended Key ID should be requested for
     /// this 4-way handshake - both the network config and the AP's
     /// advertised RSN capability (bit 13) must agree, otherwise Message
     /// 3 will never carry a Key ID KDE and the handshake would
@@ -2772,7 +2772,7 @@ impl WifiClient {
         mut ie: Vec<u8>,
         mfp: Option<Nl80211UseMfp>,
     ) -> Result<(), WifiError> {
-        // Stage 3 M10: advertise the OCVC RSN capability when OCV is
+        // advertise the OCVC RSN capability when OCV is
         // enabled for this network.
         if self.network.ocv {
             elements::rsne_set_ocvc(&mut ie, true);
@@ -2852,7 +2852,7 @@ impl WifiClient {
         }
     }
 
-    /// G4: associate with the cached PMKID in the RSNE so the AP can
+    /// associate with the cached PMKID in the RSNE so the AP can
     /// skip the full authentication. MFP stays required for SAE and is
     /// requested on MFP-capable WPA2-PSK APs, matching the full-auth
     /// association.
@@ -2879,7 +2879,7 @@ impl WifiClient {
         }
     }
 
-    /// G4 fallback: the AP rejected the cached PMKID (association
+    /// fallback: the AP rejected the cached PMKID (association
     /// rejected) or the handshake over the cached PMK failed (stale
     /// entry). Drop the entry from both caches and retry immediately
     /// with full authentication.
@@ -2896,7 +2896,7 @@ impl WifiClient {
         }
     }
 
-    /// G4: the 4-way handshake proved the PMK - remember the PMKSA for
+    /// the 4-way handshake proved the PMK - remember the PMKSA for
     /// the next reconnect/roam and hand it to the driver's PMKSA cache.
     /// A reused entry simply gets a fresh lifetime.
     async fn cache_pmksa(&mut self) {
@@ -3120,7 +3120,7 @@ async fn wiphy_supports_sched_scan(
     Ok(false)
 }
 
-/// G9: the WoWLAN triggers the wiphy owning `wiphy_idx` advertises via
+/// the WoWLAN triggers the wiphy owning `wiphy_idx` advertises via
 /// `NL80211_ATTR_WOWLAN_TRIGGERS_SUPPORTED` (empty when the driver has
 /// no WoWLAN support).
 async fn wiphy_wowlan_support(
@@ -3158,7 +3158,7 @@ mod tests {
         is_fatal_disconnect_reason, wowlan_wakeup_requires_reconnect,
     };
 
-    /// M7 (G5): reasons 2 (PREV_AUTH_NOT_VALID) and 23
+    /// reasons 2 (PREV_AUTH_NOT_VALID) and 23
     /// (IEEE_802_1X_AUTH_FAILED) mean a fatal credential/PMKSA problem
     /// and must use the long authentication backoff; every other
     /// reason (and a missing one) is transient.
@@ -3190,7 +3190,7 @@ mod tests {
         assert!(!is_fatal_disconnect_reason(None));
     }
 
-    /// G9: only triggers the wiphy actually advertises are armed, and
+    /// only triggers the wiphy actually advertises are armed, and
     /// GTK-rekey-failure alone is enough to enable WoWLAN.
     #[test]
     fn wowlan_desired_triggers_filtered_by_support() {
@@ -3210,7 +3210,7 @@ mod tests {
         assert!(desired_wowlan_triggers(&none).is_empty());
     }
 
-    /// G9: a GTK-rekey-failure or disconnect wake must rebuild the
+    /// a GTK-rekey-failure or disconnect wake must rebuild the
     /// connection; any other wake (magic packet, rfkill, ...) does not
     /// invalidate it.
     #[test]
@@ -3230,7 +3230,7 @@ mod tests {
         assert!(!wowlan_wakeup_requires_reconnect(&[]));
     }
 
-    /// Stage 3 M9: the Transition Disable bitmap maps to the AKM group
+    /// the Transition Disable bitmap maps to the AKM group
     /// names (bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
     /// 3 = Enhanced Open).
     #[test]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for OCV (Stage 3 M10): OCI derivation, KDE framing and
+//! Unit tests for OCV: OCI derivation, KDE framing and
 //! verification.
 
 use crate::{

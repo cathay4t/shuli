@@ -57,7 +57,7 @@ fn test_ptk_derivation() {
     assert_eq!(state.tk().unwrap().len(), 16);
 }
 
-/// Stage 3 M1: PSK-SHA256 (AKM 00-0F-AC:6) uses KDF-Hash-Length for
+/// PSK-SHA256 (AKM 00-0F-AC:6) uses KDF-Hash-Length for
 /// the PTK and AES-CMAC MIC with Key Descriptor Version 3, and echoes
 /// KDV 3 in Messages 2 and 4.
 #[test]
@@ -237,7 +237,7 @@ fn test_group_rekey() {
     assert_eq!(m2.key_mic, m2_mic);
 }
 
-// --- G1 tests ---
+// --- tests ---
 
 /// Build an IGTK or BIGTK KDE: OUI 00-0F-AC, type 9 / 10, KeyID (2 LE),
 /// IPN (6), key (16).
@@ -428,7 +428,7 @@ fn test_msg3_rsnxe_downgrade_rejected() {
     assert!(err.to_string().contains("RSNXE downgrade"));
 }
 
-/// G1c: an AP-initiated PTK rekey arrives as a fresh Message 1
+/// an AP-initiated PTK rekey arrives as a fresh Message 1
 /// mid-connection; the supplicant must derive a fresh SNonce/PTK and
 /// answer with a valid Message 2.
 #[test]
@@ -465,7 +465,7 @@ fn test_ptk_rekey_fresh_snonce() {
     assert_eq!(m2_1.replay_counter, 1);
 }
 
-/// Stage 3 M10: with OCV enabled, Message 2 carries our OCI KDE and
+/// with OCV enabled, Message 2 carries our OCI KDE and
 /// Message 3 is accepted only when the AP's OCI matches the BSS
 /// frequency.
 #[test]
@@ -594,7 +594,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
     );
 }
 
-/// Stage 3 M11: with Extended Key ID enabled, Message 3 must carry a
+/// with Extended Key ID enabled, Message 3 must carry a
 /// valid Key ID KDE (0/1); the active key id is recorded and invalid
 /// values fail the handshake.
 #[test]
@@ -679,7 +679,7 @@ fn test_extended_key_id_handshake() {
     assert!(err.to_string().contains("without a Key ID KDE"));
 }
 
-/// Stage 3 M12: SAE-EXT-KEY (AKM 24) uses the AKM-defined 4-way
+/// SAE-EXT-KEY (AKM 24) uses the AKM-defined 4-way
 /// hierarchy - KDF-Hash-Length PTK with HMAC-SHA256 MIC and Key
 /// Descriptor Version 0.
 #[test]
@@ -747,7 +747,7 @@ fn test_sae_ext_key_handshake() {
     state.process_message_3(&parsed3).unwrap();
 }
 
-/// G1c: EAPOL-Key frames with the Request bit set are dropped by
+/// EAPOL-Key frames with the Request bit set are dropped by
 /// supplicants; shuli must recognise them so the client can drop them
 /// before any handshake processing.
 #[test]

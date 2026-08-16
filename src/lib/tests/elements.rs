@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for RSNE builders (Stage 3 M5: WPA3-Enterprise PMF).
+//! Unit tests for RSNE builders (WPA3-Enterprise PMF).
 
 use wl_nl80211::Ieee80211CipherSuite;
 
@@ -44,7 +44,7 @@ fn wpa2_enterprise_rsne_keeps_pmf_optional() {
     assert_ne!(capab & 0x80, 0, "AKM 1 offers PMF (MFPC)");
 }
 
-/// Stage 3 M8: the negotiated BIP cipher is parsed back from built
+/// the negotiated BIP cipher is parsed back from built
 /// RSNEs (with and without a PMKID) and defaults to BIP-CMAC-128.
 #[test]
 fn group_mgmt_cipher_negotiation_roundtrip() {
@@ -84,7 +84,7 @@ fn group_mgmt_cipher_negotiation_roundtrip() {
     );
 }
 
-/// Stage 3 M11: the Extended Key ID capability bit (bit 13) can be set
+/// the Extended Key ID capability bit (bit 13) can be set
 /// and cleared on a built RSNE.
 #[test]
 fn ext_key_id_rsne_bit() {

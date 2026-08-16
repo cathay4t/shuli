@@ -3,8 +3,8 @@
 //! EAP (Extensible Authentication Protocol, RFC 3748) peer framing and
 //! state machine.
 //!
-//! Shared by WiFi 802.1X (Stage 3 Goal 2, EAP over the nl80211 control
-//! port) and wired 802.1X (Goal 6, EAPOL over Ethernet).  The EAPOL
+//! Shared by WiFi 802.1X (EAP over the nl80211 control
+//! port) and wired 802.1X (EAPOL over Ethernet).  The EAPOL
 //! framing itself lives in [`crate::ieee80211::eapol`]; this module
 //! handles the EAP packet codec and the peer state machine.
 
@@ -97,7 +97,7 @@ impl EapPacket {
     }
 }
 
-/// One EAP method (e.g. EAP-TLS in M3).  The peer hands every
+/// One EAP method (e.g. EAP-TLS).  The peer hands every
 /// method-type Request to the active method; the method returns the
 /// Response body (EAP framing is applied by [`EapPeer`]).
 pub trait EapMethod: Send {
@@ -169,7 +169,7 @@ impl EapPeer {
         self.state
     }
 
-    /// Install the active EAP method (e.g. EAP-TLS in M3).
+    /// Install the active EAP method (e.g. EAP-TLS).
     pub fn set_method(&mut self, method: Box<dyn EapMethod>) {
         self.method = Some(method);
     }

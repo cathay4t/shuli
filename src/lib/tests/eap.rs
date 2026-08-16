@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the EAP transport (Stage 3 M2): EAP packet codec,
+//! Unit tests for the EAP transport: EAP packet codec,
 //! EAPOL type-0 framing, and the peer state machine.
 
 use crate::{
@@ -125,7 +125,7 @@ fn test_peer_nak_unsupported_method() {
 }
 
 /// A minimal EAP-TLS stand-in for state machine tests; the real
-/// rustls-backed method lands in M3.
+/// rustls-backed method lands.
 struct FakeMethod {
     done: bool,
 }

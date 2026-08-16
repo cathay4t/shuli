@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Roaming (Stage 2 G8): IEEE 802.11r Fast BSS Transition (over the
+//! Roaming: IEEE 802.11r Fast BSS Transition (over the
 //! air), IEEE 802.11v BSS Transition Management and the roam decision
 //! engine (signal-threshold triggered scans + candidate selection).
 //!
@@ -1505,7 +1505,7 @@ impl WifiClient {
             target.bssid,
             target.freq_mhz
         );
-        // G9: a roam is still a connected state - keep WoWLAN armed
+        // a roam is still a connected state - keep WoWLAN armed
         // (wpa_supplicant model: triggers stay set for the interface).
         self.arm_wowlan_if_enabled().await;
         Ok(())

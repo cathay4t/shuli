@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the scan-phase security classification (G5/M7).
+//! Unit tests for the scan-phase security classification.
 
 use wl_nl80211::Nl80211BssInfo;
 

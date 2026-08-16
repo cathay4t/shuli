@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Operating Channel Validation (OCV) for non-FT AKMs (Stage 3 M10).
+//! Operating Channel Validation (OCV) for non-FT AKMs.
 //!
 //! Basic supplicant support: when enabled, the STA advertises the
 //! OCVC RSN capability, includes its Operating Channel Information

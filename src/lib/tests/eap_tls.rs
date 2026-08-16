@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the EAP-TLS method (Stage 3 M3): RFC 5216 framing
+//! Unit tests for the EAP-TLS method: RFC 5216 framing
 //! and an in-process TLS 1.3 handshake deriving the RFC 9190 MSK.
 
 use std::{io::Cursor, sync::Arc};

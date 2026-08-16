@@ -33,7 +33,7 @@ fn test_pwe_derivation() {
     assert!(!bool::from(pwe.unwrap().is_identity()));
 }
 
-/// G2b: the hunting-and-pecking PWE derivation must be deterministic,
+/// the hunting-and-pecking PWE derivation must be deterministic,
 /// land on a real curve point, and differ from the H2E point (the two
 /// methods deliberately pick different password elements).
 #[test]
@@ -58,7 +58,7 @@ fn test_hnp_pwe_derivation() {
     );
 }
 
-/// Stage 3 M7: an SAE password identifier changes the H2E PWE (it is
+/// an SAE password identifier changes the H2E PWE (it is
 /// mixed into `pwd-seed`), is carried in the commit's Password
 /// Identifier element, and must produce matching PMKs on both sides.
 #[test]
@@ -134,7 +134,7 @@ fn test_sae_password_identifier() {
     assert_eq!(supp.pmk(), ap.pmk(), "PMK must match with the same id");
 }
 
-/// Stage 3 M13: an AP that requires SAE-PK (status 127) fails cleanly
+/// an AP that requires SAE-PK (status 127) fails cleanly
 /// with a clear error - the SAE-PK crypto itself is not implemented.
 #[test]
 fn test_sae_pk_status_127_fails_cleanly() {
@@ -185,7 +185,7 @@ fn test_sae_status_30_retries_temporarily() {
     );
 }
 
-/// G2b: a full SAE exchange where both sides derive the PWE with
+/// a full SAE exchange where both sides derive the PWE with
 /// hunting-and-pecking must yield the same PMK (RFC 7664 interop path).
 #[test]
 fn test_hnp_full_exchange() {
@@ -212,7 +212,7 @@ fn test_hnp_full_exchange() {
     supp.process_confirm(&ap_confirm_body).unwrap();
 }
 
-/// G2a: the anti-clogging token container format - an extended element
+/// the anti-clogging token container format - an extended element
 /// `FF || 1+len || 0x5D || token` after the commit element (matching
 /// hostapd's `auth_build_token_req` / wpa_supplicant `sae_write_commit`),
 /// and the raw-token form for hunting-and-pecking.
@@ -241,7 +241,7 @@ fn test_commit_with_token_format() {
     assert_eq!(&body[101..], &token[..], "token bytes");
 }
 
-/// G2a: parse the AP's status-76 response payload back into the token.
+/// parse the AP's status-76 response payload back into the token.
 #[test]
 fn test_parse_anti_clogging_token() {
     let _ = test_macs();

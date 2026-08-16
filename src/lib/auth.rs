@@ -104,7 +104,7 @@ impl AuthMethod {
     }
 
     /// PMKID of the completed authentication; consumed by the PMKSA
-    /// cache (Stage 2 G4).
+    /// cache.
     #[allow(dead_code)]
     pub(crate) fn pmkid(&self) -> Option<[u8; 16]> {
         match self {
@@ -126,7 +126,7 @@ fn process_sae_frame(
         return Ok(AuthAction::Continue);
     }
 
-    // G2a: anti-clogging token required (status 76): re-send the commit
+    // anti-clogging token required (status 76): re-send the commit
     // with the token, which sits after the group in the payload (in the
     // Anti-Clogging Token Container element for H2E).
     if auth_seq == 1 && status == crate::crypto::sae::SAE_STATUS_ANTI_CLOGGING {
@@ -137,7 +137,7 @@ fn process_sae_frame(
         return Ok(AuthAction::SendCommitWithToken(token));
     }
 
-    // Stage 3 M7: status 123 = unknown password identifier (missing or
+    // status 123 = unknown password identifier (missing or
     // wrong).  Fail cleanly instead of retrying: the identifier is
     // included in every commit when configured, so a 123 here means the
     // AP does not accept our identifier.
@@ -150,7 +150,7 @@ fn process_sae_frame(
         ));
     }
 
-    // Stage 3 M13: status 127 = SAE-PK required.  shuli does not
+    // status 127 = SAE-PK required.  shuli does not
     // implement the SAE-PK crypto (PWE + ECDSA confirm signature) yet,
     // so fail cleanly instead of looping with regular SAE.
     if auth_seq == 1 && status == 127 {
@@ -185,7 +185,7 @@ fn process_sae_frame(
         _ => status == 0,
     };
     if !status_ok {
-        // G2b: an HnP-only AP rejects the H2E commit with a failure
+        // an HnP-only AP rejects the H2E commit with a failure
         // status; fall back to hunting-and-pecking when allowed.
         if auth_seq == 1 && sae.is_h2e() && sae.hnp_fallback_allowed() {
             log::info!(
@@ -247,7 +247,7 @@ fn is_temporary_reject_status(status: u16) -> bool {
 impl WifiClient {
     /// Start authentication with the selected BSS.
     ///
-    /// PMKSA cache hit (Stage 2 G4): send open-system AUTHENTICATE and
+    /// PMKSA cache hit: send open-system AUTHENTICATE and
     /// associate with the cached PMKID, skipping the full SAE exchange.
     ///
     /// Open networks: send open-system AUTHENTICATE (no auth method, no
@@ -276,7 +276,7 @@ impl WifiClient {
         self.eap_peer = None;
         self.eap_pmk = None;
 
-        // Stage 3 M4: WPA2-Enterprise runs EAP over the control port
+        // WPA2-Enterprise runs EAP over the control port
         // after association.  Prepare the EAP peer + EAP-TLS method
         // now, so the first EAP-Request/Identity finds it ready.
         if matches!(
@@ -298,7 +298,7 @@ impl WifiClient {
             self.eap_peer = Some(peer);
         }
 
-        // G4: a cached PMKSA for the selected BSS replaces the full
+        // a cached PMKSA for the selected BSS replaces the full
         // authentication (SAE) with open-system auth + a PMKID-bearing
         // RSNE at association time.
         if matches!(
@@ -378,7 +378,7 @@ impl WifiClient {
                 "password required for encrypted network",
             )
         })?;
-        // G2b: `Auto` follows the AP's RSNXE from the scan instead of
+        // `Auto` follows the AP's RSNXE from the scan instead of
         // guessing H2E first - an AP that never advertises H2E support
         // (or advertises none at all) gets hunting-and-pecking on the
         // very first commit, instead of one shuli discovers only after
@@ -413,7 +413,7 @@ impl WifiClient {
             self.conn_handle.authenticate(attrs).execute().await,
         )
         .await?;
-        // G2c: remember the commit so a lost frame is answered with a
+        // remember the commit so a lost frame is answered with a
         // retransmission (SAE Sync) instead of a full rescan cycle.
         self.sae_commit_sent = true;
         self.sae_sync = 0;

@@ -105,7 +105,7 @@ pub struct BssInfo {
     /// The AP's RSNXE as a full element (ID 244), empty when the AP
     /// advertises none.
     pub ap_rsnxe: Vec<u8>,
-    /// Negotiated group management (BIP) cipher (Stage 3 M8):
+    /// Negotiated group management (BIP) cipher:
     /// best supported suite the AP advertises, defaulting to
     /// BIP-CMAC-128.
     pub(crate) group_mgmt_cipher: Ieee80211CipherSuite,
@@ -155,13 +155,13 @@ impl BssInfo {
 
     /// Whether the AP's RSNXE (beacon/probe response) advertises SAE
     /// Hash-to-Element support. Used to pick H2E vs. hunting-and-pecking
-    /// up front instead of guessing (Stage 2 G2b).
+    /// up front instead of guessing.
     pub(crate) fn ap_supports_sae_h2e(&self) -> bool {
         crate::ieee80211::elements::ap_rsnxe_supports_sae_h2e(&self.ap_rsnxe)
     }
 
     /// Whether the AP advertises the OCVC RSN capability (Operating
-    /// Channel Validation, Stage 3 M10). Enabling OCV against an AP
+    /// Channel Validation). Enabling OCV against an AP
     /// that doesn't advertise this always fails the 4-way handshake
     /// (no OCI KDE in Message 3), so it must be gated on this check
     /// rather than on local network config alone.
@@ -169,8 +169,8 @@ impl BssInfo {
         crate::ieee80211::elements::ap_rsne_supports_ocv(&self.ap_rsne)
     }
 
-    /// Whether the AP advertises the Extended Key ID RSN capability
-    /// (Stage 3 M11). Requesting Extended Key ID against an AP that
+    /// Whether the AP advertises the Extended Key ID RSN capability.
+    /// Requesting Extended Key ID against an AP that
     /// doesn't advertise this always fails the 4-way handshake (no Key
     /// ID KDE in Message 3), so it must be gated on this check rather
     /// than on local network config alone.
@@ -550,7 +550,7 @@ impl WifiClient {
                  freq={freq_mhz} MHz, signal={signal_dbm}"
             );
             let bss_security = detect_security(ies);
-            // M7 (G5): never present an AP shuli cannot actually join
+            // never present an AP shuli cannot actually join
             // (WPA1/TKIP, ...) as a connection candidate - classifying
             // it open would make the client associate without
             // encryption.

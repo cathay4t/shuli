@@ -61,14 +61,14 @@ pub struct FourWayState {
     /// AKM), the PTK comes from PMK-R1 instead of the PMK
     /// (802.11-2020 §12.8.2.3).
     ft_pmk_r1: Option<super::ft::PmkR1>,
-    /// Stage 3 M10: OCV enabled (verify the AP's OCI in Messages 3 and
+    /// OCV enabled (verify the AP's OCI in Messages 3 and
     /// group rekeys, and send our OCI in Message 2).
     ocv: bool,
     /// Our OCI (operating class, channel, segment) for OCV.
     oci: Option<[u8; 3]>,
     /// BSS frequency (MHz) the OCI must match.
     freq_mhz: u32,
-    /// Stage 3 M11: Extended Key ID for pairwise keys (driver must
+    /// Extended Key ID for pairwise keys (driver must
     /// support it; enabled per network).
     ext_key_id: bool,
     /// The active pairwise key id (0/1) selected by the AP's Key ID
@@ -159,7 +159,7 @@ impl FourWayState {
         }
     }
 
-    /// Stage 3 M10: enable OCV for this handshake with our OCI and the
+    /// enable OCV for this handshake with our OCI and the
     /// BSS frequency to validate against.
     pub fn set_ocv(&mut self, enabled: bool, oci: [u8; 3], freq_mhz: u32) {
         self.ocv = enabled;
@@ -167,7 +167,7 @@ impl FourWayState {
         self.freq_mhz = freq_mhz;
     }
 
-    /// Stage 3 M11: enable Extended Key ID handling for this
+    /// enable Extended Key ID handling for this
     /// handshake.
     pub fn set_ext_key_id(&mut self, enabled: bool) {
         self.ext_key_id = enabled;
@@ -373,13 +373,13 @@ impl FourWayState {
             } else {
                 frame.key_data.clone()
             };
-            // Stage 3 M10: verify the AP's OCI before accepting the
+            // verify the AP's OCI before accepting the
             // message.
             if self.ocv {
                 crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
             }
             kdes = parse_key_data_kdes(&plain);
-            // Stage 3 M11: Extended Key ID - the AP must send a Key ID
+            // Extended Key ID - the AP must send a Key ID
             // KDE (0/1) when it negotiated the feature; anything else
             // fails the handshake.
             if self.ext_key_id {
@@ -399,7 +399,7 @@ impl FourWayState {
             } else {
                 self.key_id = None;
             }
-            // G1b: fail the handshake when the AP's RSNE / RSNXE in
+            // fail the handshake when the AP's RSNE / RSNXE in
             // Message 3 differ from the beacon/probe response copies
             // (802.11-2020 §12.7.6.4 downgrade protection).
             self.validate_ap_ies(&kdes)?;
@@ -421,7 +421,7 @@ impl FourWayState {
         Ok((msg4, kdes))
     }
 
-    /// RSNE / RSNXE downgrade check for Message 3 (G1b). Skipped when no
+    /// RSNE / RSNXE downgrade check for Message 3. Skipped when no
     /// AP RSNE was recorded (e.g. unit tests building handshakes by hand).
     fn validate_ap_ies(&self, kdes: &KeyDataKdes) -> Result<(), WifiError> {
         if self.ap_rsne.is_empty() {
@@ -519,7 +519,7 @@ impl FourWayState {
         } else {
             frame.key_data.clone()
         };
-        // Stage 3 M10: verify the AP's OCI in the group rekey too.
+        // verify the AP's OCI in the group rekey too.
         if self.ocv {
             crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
         }
@@ -588,11 +588,11 @@ pub(crate) struct KeyDataKdes {
     /// The AP's RSNXE as a full element (ID 244 + length + body).
     pub rsnxe: Option<Vec<u8>>,
     /// Extended Key ID KDE (type 10): the pairwise key id (0/1) the AP
-    /// selected (Stage 3 M11).
+    /// selected.
     pub key_id: Option<u8>,
     /// Transition Disable KDE bitmap (WFA OUI 50:6F:9A, type 0x20):
     /// bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
-    /// 3 = Enhanced Open (Stage 3 M9).
+    /// 3 = Enhanced Open.
     pub transition_disable: Option<u8>,
 }
 

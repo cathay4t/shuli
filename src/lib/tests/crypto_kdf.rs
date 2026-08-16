@@ -28,7 +28,7 @@ fn test_hkdf_expand() {
     assert_eq!(okm.len(), 48);
 }
 
-/// M2/G3: WPA2-PSK PMK derivation against published vectors.
+/// WPA2-PSK PMK derivation against published vectors.
 ///
 /// `PBKDF2(HMAC-SHA1, password, SSID, 4096, 256)`. The expected PMKs are
 /// wpa_supplicant's passphrase test table
@@ -69,7 +69,7 @@ fn test_pbkdf2_pmk_published_vectors() {
     );
 }
 
-/// M2/G3: 802.11 PRF-384 PTK derivation (WPA2-PSK AKM) against a vector
+/// 802.11 PRF-384 PTK derivation (WPA2-PSK AKM) against a vector
 /// computed with an independent HMAC-SHA1 PRF implementation.
 ///
 /// `PTK = PRF-384(PMK, "Pairwise key expansion", min(AA,SPA) ||`
@@ -116,7 +116,7 @@ fn test_prf_sha1_ptk_384() {
     );
 }
 
-/// M2/G3: WPA2-PSK EAPOL-Key MIC against a vector computed with an
+/// WPA2-PSK EAPOL-Key MIC against a vector computed with an
 /// independent HMAC-SHA1 implementation:
 /// `MIC = Truncate-128(HMAC-SHA1(KCK, data))` (KCK = PTK[0..16]).
 #[test]

@@ -76,7 +76,7 @@ pub(crate) struct SaeAuth {
     hnp_fallback: bool,
     own_scalar_bytes: [u8; 32],
     own_elem_bytes: [u8; 64], // x || y uncompressed
-    /// Optional SAE password identifier (Stage 3 M7): included in the
+    /// Optional SAE password identifier: included in the
     /// H2E PWE derivation and in the commit's Password Identifier
     /// element.  H2E-only, like wpa_supplicant.
     password_id: Option<String>,
@@ -106,7 +106,7 @@ impl SaeAuth {
     }
 
     /// Like [`new`](Self::new), with an optional SAE password
-    /// identifier (Stage 3 M7).
+    /// identifier.
     pub(crate) fn new_with_password_id(
         password: &str,
         ssid: &str,
@@ -497,8 +497,8 @@ pub(crate) fn compute_pwe_h2e(
     compute_pwe_h2e_with_id(password, ssid, mac_sta, mac_ap, None)
 }
 
-/// H2E PWE derivation with an optional SAE password identifier
-/// (Stage 3 M7): `pwd-seed = HKDF-Extract(ssid, password || id)`.
+/// H2E PWE derivation with an optional SAE password identifier.
+/// `pwd-seed = HKDF-Extract(ssid, password || id)`.
 pub(crate) fn compute_pwe_h2e_with_id(
     password: &str,
     ssid: &str,

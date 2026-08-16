@@ -44,7 +44,7 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
         ));
     }
 
-    // M7 (G5): run one WifiClient per distinct interface. Entries with
+    // run one WifiClient per distinct interface. Entries with
     // `interface: any` (or absent) all bind to the first WiFi NIC found;
     // entries with an explicit interface bind to that one.
     let needs_any = wifis
@@ -95,7 +95,7 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
             run_interface(&iface_name, &entries, client, shutdown_rx).await
         }));
     }
-    // Stage 3 M6: one wired 802.1X task per configured Ethernet port.
+    // one wired 802.1X task per configured Ethernet port.
     for entry in &shuli_config.ethernets {
         let shutdown_rx = shutdown_rx.clone();
         let entry = entry.clone();
@@ -396,7 +396,7 @@ async fn run_wired_interface(
     }
 }
 
-/// Group configured networks by their resolved interface (M7): one
+/// Group configured networks by their resolved interface: one
 /// `WifiClient` per distinct interface. `any_iface` is the concrete
 /// NIC that `interface: any` / absent entries bind to.
 fn group_by_interface(

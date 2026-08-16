@@ -56,7 +56,7 @@ wifis:
       auto: true
     ipv6:
       auto: true
-# Wired 802.1X (Stage 3 M6): EAP-TLS over Ethernet, then the same IP
+# Wired 802.1X: EAP-TLS over Ethernet, then the same IP
 # config as WiFi entries.
 # ethernets:
 #   - name: eth0

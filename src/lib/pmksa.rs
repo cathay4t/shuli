@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Userspace PMKSA cache (Stage 2 G4).
+//! Userspace PMKSA cache.
 //!
 //! After a successful 4-way handshake the (PMK, PMKID) pair is cached per
 //! (SSID, BSSID). On a later connection to the same BSS the PMKID is put

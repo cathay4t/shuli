@@ -181,7 +181,7 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// G2a: `anti_clogging_threshold=0` makes hostapd require an
+/// `anti_clogging_threshold=0` makes hostapd require an
 /// anti-clogging token for every SAE commit.
 const SAE_ANTI_CLOGGING_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
@@ -199,7 +199,7 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// G2b: `sae_pwe=0` restricts hostapd to hunting-and-pecking commits,
+/// `sae_pwe=0` restricts hostapd to hunting-and-pecking commits,
 /// so an H2E commit is rejected with UNSPECIFIED_FAILURE.
 const SAE_HNP_ONLY_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
@@ -216,7 +216,7 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M7: the AP only accepts the SAE password with identifier
+/// the AP only accepts the SAE password with identifier
 /// `corp-id` (`sae_password=<pass>|id=<id>`).
 const SAE_PASSWORD_ID_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
@@ -233,7 +233,7 @@ sae_password=12345678|id=corp-id
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M8: hostapd with a non-default BIP group management cipher
+/// hostapd with a non-default BIP group management cipher
 /// (BIP-GMAC-256).  shuli must advertise the same cipher in its RSNE
 /// and install the IGTK with it for protected frames to work.
 const SAE_BIP_GMAC256_HOSTAPD_CONF: &str = r"
@@ -252,7 +252,7 @@ sae_password=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M9: hostapd sends the Transition Disable KDE (bitmap 0x08 =
+/// hostapd sends the Transition Disable KDE (bitmap 0x08 =
 /// Enhanced Open disabled) in 4-way Message 3.  The connection must
 /// still complete.
 const SAE_TRANSITION_DISABLE_HOSTAPD_CONF: &str = r"
@@ -271,7 +271,7 @@ transition_disable=0x08
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M11: hostapd with Extended Key ID enabled for pairwise
+/// hostapd with Extended Key ID enabled for pairwise
 /// keys.
 const SAE_EXT_KEY_ID_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
@@ -303,7 +303,7 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Plain WPA2-PSK (no PMF) - the M2/G3 "full 4-way + data path" case.
+/// Plain WPA2-PSK (no PMF) - "full 4-way + data path" case.
 /// `ieee80211w` defaults to 0 here, so the handshake is the classic
 /// WPA2-PSK 4-way (PRF-384 PTK + HMAC-SHA1 MIC, no IGTK KDE).
 const WPA2_PSK_HOSTAPD_CONF: &str = r"
@@ -321,7 +321,7 @@ rrm_neighbor_report=1
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M1: WPA2-Personal with SHA-256 algorithms (AKM 6).
+/// WPA2-Personal with SHA-256 algorithms (AKM 6).
 const WPA2_PSK_SHA256_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
 driver=nl80211
@@ -335,7 +335,7 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
-/// Stage 3 M4: WPA2-Enterprise (AKM 1) with hostapd's internal
+/// WPA2-Enterprise (AKM 1) with hostapd's internal
 /// EAP-TLS server.  Certificate paths are filled in by the test.
 fn wpa2_eap_hostapd_conf() -> &'static str {
     r"
@@ -358,7 +358,7 @@ ctrl_interface=/var/run/hostapd
 "
 }
 
-/// Stage 3 M5: WPA3-Enterprise (AKM 5, mandatory PMF).
+/// WPA3-Enterprise (AKM 5, mandatory PMF).
 fn wpa3_eap_hostapd_conf() -> &'static str {
     r"
 interface=wifi_ap
@@ -666,7 +666,7 @@ async fn wifi_client_open_connect() {
     client.shutdown().await;
 }
 
-/// G9: mac80211_hwsim has no WoWLAN support, so arming (with
+/// mac80211_hwsim has no WoWLAN support, so arming (with
 /// `wowlan: true` configured) must degrade gracefully (report
 /// unsupported, keep connecting) instead of failing. WoWLAN is opt-in
 /// and defaults to off.
@@ -730,7 +730,7 @@ async fn wifi_client_sae_connect() {
     client.shutdown().await;
 }
 
-/// G2a: anti-clogging token. `anti_clogging_threshold=0` makes hostapd
+/// anti-clogging token. `anti_clogging_threshold=0` makes hostapd
 /// demand a token on every SAE commit (`use_anti_clogging()` returns 1
 /// unconditionally), so a successful connection proves the client
 /// re-sends its commit with the echoed token.
@@ -760,7 +760,7 @@ async fn wifi_client_sae_anti_clogging() {
     client.shutdown().await;
 }
 
-/// G2b: hunting-and-pecking fallback. `sae_pwe=0` makes hostapd both
+/// hunting-and-pecking fallback. `sae_pwe=0` makes hostapd both
 /// omit SAE H2E support from its RSNXE and accept only HnP commits
 /// (`sae_status_success()` rejects the H2E status 126 with
 /// UNSPECIFIED_FAILURE). With the default `SaePwe::Auto` the client
@@ -816,7 +816,7 @@ async fn wifi_client_sae_hnp_fallback() {
     client.shutdown().await;
 }
 
-/// Stage 3 M7: with `sae_password_id` configured, the client mixes the
+/// with `sae_password_id` configured, the client mixes the
 /// identifier into the H2E PWE and the commit's Password Identifier
 /// element, so hostapd (which only knows `12345678|id=corp-id`)
 /// accepts the connection.
@@ -847,7 +847,7 @@ async fn wifi_client_sae_password_identifier() {
     client.shutdown().await;
 }
 
-/// Stage 3 M8: BIP-GMAC-256 negotiation.  The client picks the AP's
+/// BIP-GMAC-256 negotiation.  The client picks the AP's
 /// group management cipher, installs the IGTK with it, and survives an
 /// SA Query (protected action frames must reach the kernel).
 #[tokio::test]
@@ -919,7 +919,7 @@ async fn wifi_client_sae_bip_gmac256() {
     client.shutdown().await;
 }
 
-/// Stage 3 M9: a hostapd AP that sends the Transition Disable KDE must
+/// a hostapd AP that sends the Transition Disable KDE must
 /// still connect (the KDE is parsed and logged; the bits are a policy
 /// hint for future profile changes).
 #[tokio::test]
@@ -948,7 +948,7 @@ async fn wifi_client_sae_transition_disable() {
     client.shutdown().await;
 }
 
-/// Stage 3 M11: Extended Key ID SAE connection - the AP selects a
+/// Extended Key ID SAE connection - the AP selects a
 /// pairwise key id and the client installs the PTK RX-then-TX.
 #[tokio::test]
 async fn wifi_client_sae_ext_key_id() {
@@ -1033,7 +1033,7 @@ async fn wifi_client_multi_network_connect() {
     client.shutdown().await;
 }
 
-/// G1a end-to-end: with PMF (ieee80211w=2) the AP sends an SA Query
+/// end-to-end: with PMF (ieee80211w=2) the AP sends an SA Query
 /// request - a protected action frame - to the STA. mac80211 only lets
 /// it through when shuli installed the IGTK from 4-way Message 3 (the
 /// kernel's SA Query responder answers it), and hostapd disassociates a
@@ -1105,7 +1105,7 @@ async fn wifi_client_sae_pmf_sa_query() {
     client.shutdown().await;
 }
 
-/// G1d: WPA2-PSK with optional PMF (MFPC). The AP has ieee80211w=1, so
+/// WPA2-PSK with optional PMF (MFPC). The AP has ieee80211w=1, so
 /// the MFPC-bit RSNE negotiates PMF and the 4-way Message 3 carries an
 /// IGTK KDE; the connection must complete through PORT_AUTHORIZED.
 #[tokio::test]
@@ -1134,7 +1134,7 @@ async fn wifi_client_wpa2_psk_pmf_connect() {
     client.shutdown().await;
 }
 
-/// M2/G3: WPA2-PSK (AKM 00-0F-AC:2) full 4-way handshake against hostapd
+/// WPA2-PSK (AKM 00-0F-AC:2) full 4-way handshake against hostapd
 /// without PMF - the classic WPA2 setup. Mirrors the SAE connect test and
 /// additionally pushes traffic over the encrypted data path: with the STA
 /// and AP on the same 192.0.2.0/24, an ICMP echo must round-trip through
@@ -1197,7 +1197,7 @@ async fn wifi_client_wpa2_psk_connect() {
     client.shutdown().await;
 }
 
-/// Stage 3 M1: WPA2-PSK-SHA256 (AKM 00-0F-AC:6) full 4-way handshake
+/// WPA2-PSK-SHA256 (AKM 00-0F-AC:6) full 4-way handshake
 /// against hostapd, with the encrypted data path exercised end-to-end
 /// (KDV 3 + AES-CMAC MIC + KDF-Hash-Length PTK must be correct for
 /// traffic to flow).
@@ -1260,7 +1260,7 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
     client.shutdown().await;
 }
 
-/// Stage 3 M4: WPA2-Enterprise (802.1X / EAP-TLS, AKM 1) full flow:
+/// WPA2-Enterprise (802.1X / EAP-TLS, AKM 1) full flow:
 /// open-system auth, association, EAP identity + TLS over the control
 /// port, MSK -> PMK, 4-way handshake, and the encrypted data path.
 #[tokio::test]
@@ -1339,7 +1339,7 @@ async fn wifi_client_wpa2_eap_connect() {
     client.shutdown().await;
 }
 
-/// Stage 3 M5: WPA3-Enterprise baseline (802.1X-SHA256, AKM 5) with
+/// WPA3-Enterprise baseline (802.1X-SHA256, AKM 5) with
 /// mandatory PMF.  EAP-TLS + 4-way must complete, the IGTK must be
 /// installed (an SA Query is answered by the kernel and the
 /// connection survives), and traffic must flow.
@@ -1422,7 +1422,7 @@ async fn wifi_client_wpa3_eap_connect() {
     client.shutdown().await;
 }
 
-/// Stage 3 M6: wired 802.1X (EAP-TLS) against hostapd's wired
+/// wired 802.1X (EAP-TLS) against hostapd's wired
 /// authenticator driver over a veth pair.  EAP-Success authorizes the
 /// port; there is no 4-way handshake or key install on wired links.
 #[tokio::test]
@@ -1478,7 +1478,7 @@ async fn wired_8021x_eap_tls_connect() {
     auth.join().expect("wired authenticator thread");
 }
 
-/// G4: after the first SAE connection the PMKSA is cached. When the AP
+/// after the first SAE connection the PMKSA is cached. When the AP
 /// disconnects the STA, the client must reconnect without a new SAE
 /// exchange: the association carries the cached PMKID and the AP runs
 /// the 4-way handshake directly with the cached PMK.
@@ -1548,7 +1548,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
     client.shutdown().await;
 }
 
-/// G4 exit criterion 3: after the first WPA2-PSK connection the PMKSA
+/// exit criterion 3: after the first WPA2-PSK connection the PMKSA
 /// is cached. When the AP disconnects the STA, the client must
 /// reconnect through the cached PMK: `psk_pmk` stays `None` on the
 /// cache-hit path (PBKDF2 is skipped), unlike the first connection
@@ -1708,7 +1708,7 @@ r1kh=02:00:00:00:01:00 02:00:00:00:01:00 000102030405060708090a0b0c0d0e0f0001020
 ctrl_interface=/var/run/hostapd
 ";
 
-/// G8: connect to a two-BSS FT-SAE ESS, then let a BSS Transition
+/// connect to a two-BSS FT-SAE ESS, then let a BSS Transition
 /// Management Request steer the client to the other BSS - an
 /// over-the-air Fast BSS Transition, no new SAE exchange.
 #[tokio::test]
@@ -1908,7 +1908,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
     client.shutdown().await;
 }
 
-/// G8: with a roam threshold configured, a weak signal triggers a scan
+/// with a roam threshold configured, a weak signal triggers a scan
 /// and the client FT-roams to the stronger/other BSS of the ESS on its
 /// own (no BTM Request involved). The threshold is set high so hwsim's
 /// fixed signal always qualifies.
@@ -2012,7 +2012,7 @@ async fn wifi_client_ft_psk_signal_roam() {
     client.shutdown().await;
 }
 
-/// G8 regression: a signal-triggered roam scan that finds no better BSS
+/// regression: a signal-triggered roam scan that finds no better BSS
 /// must keep the client connected on the current BSS. Previously the
 /// "staying" path left the state machine in `Scanning`, so the next
 /// `run()` iteration fell through into a fresh authentication to the AP
@@ -2293,7 +2293,7 @@ bss_transition=1
 ctrl_interface=/var/run/hostapd
 ";
 
-/// G8: a roam scan that finds the connected BSS below the critical
+/// a roam scan that finds the connected BSS below the critical
 /// threshold must switch to a well-signalled BSS of a *different*
 /// configured SSID, even though that terminates the current session.
 /// The client starts on AP1 (Test-WIFI-A); AP1's signal is then dropped

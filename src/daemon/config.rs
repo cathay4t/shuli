@@ -21,7 +21,7 @@ pub(crate) struct ShuliConfig {
     pub version: u32,
     #[serde(default)]
     pub wifis: Vec<WifiEntry>,
-    /// Wired 802.1X ports (Stage 3 M6): each entry authenticates one
+    /// Wired 802.1X ports: each entry authenticates one
     /// Ethernet interface with EAP and then applies its IP config.
     #[serde(default)]
     pub ethernets: Vec<EthernetEntry>,
@@ -194,7 +194,7 @@ impl ShuliConfig {
     }
 
     /// Convert `entries` - the configured networks bound to
-    /// `iface_name` (M7: one interface can carry several SSIDs) - into
+    /// `iface_name` (one interface can carry several SSIDs) - into
     /// the lib's `WifiConfig`. Each entry keeps its own roaming policy.
     pub(crate) fn wifi_config_for_entries(
         iface_name: &str,
