@@ -13,8 +13,9 @@ modern WiFi networks written entirely in Rust.
 * **WPA3-OWE** - WPA3 open networks.
 * **WPA2-Enterprise and WPA3-Enterprise** - 802.1X / EAP-TLS (rustls,
   TLS 1.3, RFC 9190 MSK), mandatory PMF for WPA3.
-* **Roaming** - 802.11r fast BSS transition (FT-PSK / FT-SAE),
-  802.11v BTM, and signal-triggered roam scans; PMKSA caching and OKC.
+* **Roaming** - 802.11r fast BSS transition (FT-PSK / FT-SAE), 802.11v
+  BTM, 802.11k Neighbor Reports before quick roam scans, and
+  signal-triggered roam scans; PMKSA caching and OKC.
 * **Wired 802.1X** - EAP-TLS over Ethernet (raw AF_PACKET EAPOL).
 * **Hardening** - WoWLAN (opt-in), OCV, Extended Key ID, Transition
   Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
