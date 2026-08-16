@@ -267,7 +267,7 @@ impl WifiClient {
         if signal >= threshold {
             return;
         }
-        log::info!(
+        log::trace!(
             "signal {signal} dBm below roam threshold {threshold} dBm; \
              scanning for roam candidates"
         );
@@ -297,7 +297,7 @@ impl WifiClient {
             return;
         }
         self.roam_scan_background = true;
-        log::info!("background roam scan: looking for a better BSS");
+        log::trace!("background roam scan: looking for a better BSS");
         self.trigger_roam_scan().await;
     }
 
@@ -348,7 +348,7 @@ impl WifiClient {
                 {
                     return;
                 }
-                log::info!(
+                log::trace!(
                     "kernel CQM: signal {rssi} dBm below the roam threshold; \
                      scanning for roam candidates"
                 );

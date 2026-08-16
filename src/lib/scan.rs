@@ -240,7 +240,11 @@ impl WifiClient {
             .iter()
             .map(|network| network.ssid.clone())
             .collect();
-        log::info!("scanning for SSIDs [{}]", ssids.join(", "));
+        if self.roam_scan {
+            log::trace!("scanning for SSIDs [{}]", ssids.join(", "));
+        } else {
+            log::info!("scanning for SSIDs [{}]", ssids.join(", "));
+        }
         trigger_scan(&self.handle, self.if_index, Some(&ssids)).await
     }
 
@@ -272,7 +276,11 @@ impl WifiClient {
                     {
                         match event {
                             Nl80211Event::NewScanResults => {
-                                log::debug!("scan finished");
+                                if self.roam_scan {
+                                    log::trace!("scan finished");
+                                } else {
+                                    log::debug!("scan finished");
+                                }
                                 return;
                             }
                             other => {
@@ -349,6 +357,7 @@ impl WifiClient {
             log::warn!("roam scan failed: {e}");
             return;
         }
+        self.roam_scan_count += 1;
         let current_base = self.bss_info.security.base();
         let current_ssid = self.network.ssid.clone();
         // Freshly measured signal of the current BSS from this same scan
@@ -417,7 +426,7 @@ impl WifiClient {
             }
         }
         let Some(target) = target else {
-            log::info!("roam scan found no better BSS; staying");
+            log::trace!("roam scan found no better BSS; staying");
             return;
         };
         log::info!(

@@ -202,6 +202,10 @@ pub struct WifiClient {
     /// equal-signal one would ping-pong on every scan interval), whereas
     /// a signal-degraded roam (CQM / poll) accepts an equal-signal peer.
     pub(crate) roam_scan_background: bool,
+    /// Number of roam scans whose candidate dump was collected. Used by
+    /// the integration tests to observe scans that `run()` now keeps
+    /// internal (no `Scanning` state is surfaced when the scan stays).
+    pub(crate) roam_scan_count: u64,
     /// G2c: SAE commit retransmission state. `sae_commit_sent` is true
     /// while we await the AP's commit; on a timeout the same commit is
     /// re-sent (the 802.11 SAE Sync counter, max 3) instead of paying a
@@ -351,6 +355,7 @@ impl WifiClient {
             last_roam: None,
             cqm_armed: false,
             roam_scan_background: false,
+            roam_scan_count: 0,
             sae_commit_sent: false,
             sae_sync: 0,
             sae_commit_auth_data: Vec::new(),
@@ -363,10 +368,25 @@ impl WifiClient {
         Ok(client)
     }
 
-    /// Drive the connection flow until the state changes and return it.
-    /// On transient errors the client falls back to a retry state instead
-    /// of failing hard.
+    /// Drive the connection flow until a state change worth reporting
+    /// happens and return it.  On transient errors the client falls back
+    /// to a retry state instead of failing hard.
+    ///
+    /// Roam scans started from the connected state (CQM event or
+    /// proactive background scan) are internal housekeeping: when they
+    /// find no better BSS the client stays connected, so [`WifiClient::run`]
+    /// keeps driving without surfacing the `Connected -> Scanning ->
+    /// Connected` round trip to the caller.
     pub async fn run(&mut self) -> Result<WifiState, WifiError> {
+        // The state to which an in-flight roam scan will return. A scan
+        // that decides to stay is invisible to callers, so remember the
+        // connected state (or the pre-scan state when this call starts
+        // mid-scan) and suppress every transition back to it.
+        let baseline = if self.state == WifiState::Scanning {
+            self.pre_roam_state.unwrap_or(self.state)
+        } else {
+            self.state
+        };
         loop {
             let prev_state = self.state;
             if let Err(e) = self._run().await {
@@ -378,7 +398,12 @@ impl WifiClient {
                 };
                 return Err(e);
             }
-            if self.state != prev_state {
+            let roaming_scan = self.state == WifiState::Scanning
+                && self.pre_roam_state.is_some();
+            if self.state != prev_state
+                && self.state != baseline
+                && !roaming_scan
+            {
                 return Ok(self.state);
             }
         }
@@ -1246,7 +1271,11 @@ impl WifiClient {
             }
 
             Nl80211Event::ScanStart | Nl80211Event::NewScanResults => {
-                log::debug!("scan event: {event:?}");
+                if self.roam_scan {
+                    log::trace!("scan event: {event:?}");
+                } else {
+                    log::debug!("scan event: {event:?}");
+                }
             }
             Nl80211Event::ExternalAuth => {
                 log::debug!("EXTERNAL_AUTH event (unsupported in this mode)");

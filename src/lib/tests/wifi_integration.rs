@@ -593,20 +593,6 @@ async fn run_until_connected(
     client: &mut WifiClient,
     max_iters: u32,
 ) -> Result<WifiState, crate::WifiError> {
-    let mut roam_scans = 0u32;
-    run_until_connected_counting(client, max_iters, &mut roam_scans).await
-}
-
-/// Like [`run_until_connected`], but additionally counts every
-/// `WifiState::Scanning` return (roam scans) into `roam_scans`. With the
-/// kernel CQM armed, the weak-signal roam scan fires as soon as the
-/// threshold is crossed - i.e. during this connect loop - so tests that
-/// must observe it count here.
-async fn run_until_connected_counting(
-    client: &mut WifiClient,
-    max_iters: u32,
-    roam_scans: &mut u32,
-) -> Result<WifiState, crate::WifiError> {
     for _ in 0..max_iters {
         let step = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -614,7 +600,6 @@ async fn run_until_connected_counting(
         )
         .await;
         match step {
-            Ok(Ok(WifiState::Scanning)) => *roam_scans += 1,
             Ok(Ok(state)) => match state {
                 WifiState::ConnectedWithoutOffloadRekey
                 | WifiState::ConnectedWithOffloadRekey => return Ok(state),
@@ -2025,7 +2010,9 @@ async fn wifi_client_ft_psk_signal_roam() {
 /// `run()` iteration fell through into a fresh authentication to the AP
 /// the client was already connected to - which the kernel rejects with
 /// -EALREADY ("Operation already in progress"), and the client spun in a
-/// scan -> select -> SAE -> EALREADY retry loop forever.
+/// scan -> select -> SAE -> EALREADY retry loop forever. `run()` must not
+/// surface the transient `Scanning` state (nor a repeated `Connected`) for
+/// these scans at all.
 #[tokio::test]
 async fn wifi_client_roam_scan_stays_connected() {
     init_logger();
@@ -2048,13 +2035,7 @@ async fn wifi_client_roam_scan_stays_connected() {
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
     let mut client = WifiClient::init(config).await.expect("init");
-    // The kernel CQM reports the weak signal as soon as the roam
-    // threshold is armed, so the first roam scan usually fires during the
-    // connect loop itself; count it here.
-    let mut roam_scans = 0u32;
-    let state = run_until_connected_counting(&mut client, 20, &mut roam_scans)
-        .await
-        .expect("connect");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
@@ -2063,22 +2044,7 @@ async fn wifi_client_roam_scan_stays_connected() {
     let start_bssid = client.bss_info.bssid;
     let start_ssid = client.current_ssid().to_string();
 
-    // Drain trailing events. A roam scan may also fire here; count it so
-    // the "must have run at least one scan" assertion below sees it.
-    let mut idle = 0;
-    while idle < 2 {
-        let step = tokio::time::timeout(
-            std::time::Duration::from_millis(400),
-            client.run(),
-        )
-        .await;
-        match step {
-            Ok(Ok(WifiState::Scanning)) => roam_scans += 1,
-            Ok(Ok(_)) => idle = 0,
-            Ok(Err(e)) => panic!("client error while draining events: {e}"),
-            Err(_) => idle += 1, // 400 ms without an event
-        }
-    }
+    drain_pending_events(&mut client).await;
 
     // Let the roam engine run several signal-check rounds. With no better
     // BSS on air the roam scan must "stay" and the client must return to
@@ -2094,9 +2060,19 @@ async fn wifi_client_roam_scan_stays_connected() {
         .await;
         match step {
             Ok(Ok(WifiState::Scanning)) => {
-                // A roam scan is running; it must resolve back to
-                // Connected, not into a fresh authentication.
-                roam_scans += 1;
+                panic!("roam scans must not surface Scanning to run() callers")
+            }
+            Ok(Ok(state))
+                if matches!(
+                    state,
+                    WifiState::ConnectedWithoutOffloadRekey
+                        | WifiState::ConnectedWithOffloadRekey
+                ) =>
+            {
+                panic!(
+                    "a roam scan that stays must not re-emit Connected (got \
+                     {state:?})"
+                );
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
@@ -2136,7 +2112,7 @@ async fn wifi_client_roam_scan_stays_connected() {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     }
     assert!(
-        roam_scans > 0,
+        client.roam_scan_count > 0,
         "the weak-signal roam engine must have run at least one scan"
     );
     client.shutdown().await;
