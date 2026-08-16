@@ -378,14 +378,11 @@ impl WifiClient {
             .unwrap_or(self.bss_info.signal_dbm);
         let current_signal = match self.current_signal_dbm().await {
             Ok(Some(live)) => {
+                // The current link is healthy again - stay instead of
+                // roaming to a possibly weaker BSS.
                 if let Some(threshold) = self.roam_threshold()
                     && live >= threshold
                 {
-                    log::info!(
-                        "roam scan: current BSS live signal {live} dBm \
-                         recovered above the roam threshold {threshold} dBm; \
-                         staying"
-                    );
                     return;
                 }
                 // Scan-dump measurement of the current BSS is taken while
