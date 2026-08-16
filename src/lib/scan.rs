@@ -360,17 +360,42 @@ impl WifiClient {
         self.roam_scan_count += 1;
         let current_base = self.bss_info.security.base();
         let current_ssid = self.network.ssid.clone();
-        // Freshly measured signal of the current BSS from this same scan
-        // dump (identical measurement source as the candidates), so the
-        // "not weaker" comparison is apples-to-apples. When the current
-        // BSS is absent from the dump (it went off-channel / hidden),
-        // fall back to the signal recorded when it was selected.
-        let current_signal = self
+        // The scan was started because the signal measured below the roam
+        // threshold (CQM LOW / poll), but the live signal of the current
+        // BSS may have recovered while the scan ran - the scan dump of the
+        // *associated* BSS is measured while the radio is off-channel and
+        // can report a much weaker value than the actual live signal (e.g.
+        // a scan dump of -73 dBm while CQM measured the same BSS at
+        // -57 dBm). Use the live signal for the "not weaker" baseline;
+        // when it is back above the roam threshold, the current link is
+        // healthy again, so stay instead of roaming to a possibly weaker
+        // BSS.
+        let scan_dump_current = self
             .last_scan_candidates
             .iter()
             .find(|(bss, _)| bss.bssid == self.bss_info.bssid)
             .map(|(bss, _)| bss.signal_dbm)
             .unwrap_or(self.bss_info.signal_dbm);
+        let current_signal = match self.current_signal_dbm().await {
+            Ok(Some(live)) => {
+                if let Some(threshold) = self.roam_threshold()
+                    && live >= threshold
+                {
+                    log::info!(
+                        "roam scan: current BSS live signal {live} dBm \
+                         recovered above the roam threshold {threshold} dBm; \
+                         staying"
+                    );
+                    return;
+                }
+                // Scan-dump measurement of the current BSS is taken while
+                // the radio is off-channel and can be much weaker than the
+                // live signal; the stronger of the two is the safe baseline
+                // so the client never trades down to a weaker BSS.
+                live.max(scan_dump_current)
+            }
+            _ => scan_dump_current,
+        };
         let strict = self.background_scan;
         // Same-network candidates: any BSS of the *connected* SSID (its
         // security family, FT or not) that is not weaker than the current

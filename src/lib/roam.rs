@@ -307,14 +307,19 @@ impl WifiClient {
     /// crossing (the connected AP's signal dropped below the armed roam
     /// threshold) start a roam scan, honoring the same gates as the
     /// polling path: only on a managed-roaming AP, and never while
-    /// another roam / scan is already in flight. A HIGH crossing just
-    /// means the signal recovered.
+    /// another roam / scan is already in flight. A HIGH crossing means
+    /// the signal recovered; when a roam scan triggered by the earlier
+    /// LOW is still in flight, that recovery cancels the pending roam so
+    /// the client stays on its (now healthy) current BSS instead of
+    /// switching to a possibly weaker one.
     pub(crate) async fn handle_cqm_rssi(&mut self, cqm: Nl80211CqmRssiEvent) {
+        let in_roam_scan = self.roam_scan;
         if !matches!(
             self.state,
             WifiState::ConnectedWithoutOffloadRekey
                 | WifiState::ConnectedWithOffloadRekey
-        ) {
+        ) && !in_roam_scan
+        {
             return;
         }
         let mut threshold_event = None;
@@ -359,6 +364,22 @@ impl WifiClient {
             }
             Nl80211CqmRssiThresholdEvent::High => {
                 log::debug!("kernel CQM: signal {rssi} dBm recovered");
+                // The signal recovered above the roam threshold while a
+                // roam scan started by the earlier LOW crossing is still
+                // in flight: the current BSS is healthy again, so cancel
+                // the pending roam scan and stay on it (iwd does the same
+                // in `station_ok_rssi`).
+                if self.roam_scan {
+                    log::info!(
+                        "kernel CQM: signal {rssi} dBm recovered during roam \
+                         scan; cancelling roam"
+                    );
+                    self.roam_scan = false;
+                    self.background_scan = false;
+                    if let Some(prev) = self.pre_roam_state.take() {
+                        self.state = prev;
+                    }
+                }
             }
             Nl80211CqmRssiThresholdEvent::Other(_) => {}
         }
@@ -421,7 +442,9 @@ impl WifiClient {
 
     /// Signal level (dBm) of the station entry for the current BSSID via
     /// `NL80211_CMD_GET_STATION`.
-    async fn current_signal_dbm(&mut self) -> Result<Option<i32>, WifiError> {
+    pub(crate) async fn current_signal_dbm(
+        &mut self,
+    ) -> Result<Option<i32>, WifiError> {
         use futures::TryStreamExt;
         use wl_nl80211::{
             Nl80211Attr, Nl80211StationHandle, Nl80211StationInfo,
