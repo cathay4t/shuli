@@ -17,11 +17,13 @@
 
 use aws_lc_rs::rand::SecureRandom;
 use wl_nl80211::{
-    Nl80211Associate, Nl80211AuthType, Nl80211Authenticate, Nl80211UseMfp,
+    Nl80211Associate, Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm,
+    Nl80211CqmAttr, Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent,
+    Nl80211UseMfp,
 };
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiClient, WifiError, WifiState,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError, WifiState,
     client::drain_request,
     config::SaePwe,
     crypto::ft::{
@@ -44,6 +46,20 @@ const FRAME_TYPE_ACTION: u16 = 0x00d0;
 
 /// Pause signal-triggered roaming for this long after a completed roam.
 const ROAM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hysteresis (dBm) for the kernel connection quality monitor (CQM):
+/// after a LOW RSSI event the kernel only re-arms the HIGH event once
+/// the signal moved this far above the roam threshold, and vice versa.
+/// Matches iwd's `CQM_RSSI_HYST`.
+const CQM_RSSI_HYST_DBM: u32 = 5;
+
+/// Interval (seconds) between proactive background roam scans in the
+/// connected state: the scan evaluates whether a better BSS (same
+/// network with a stronger signal, or - on a critical link - a
+/// well-signalled BSS of another configured SSID) warrants a roam.
+/// Only created for APs that advertise a managed-roaming capability
+/// (802.11v BSS Transition / 802.11k Neighbor Report).
+pub(crate) const BACKGROUND_SCAN_SECS: u64 = 30;
 
 /// FT key material of the current connection (802.11-2020 §12.8.2).
 #[derive(Debug)]
@@ -220,11 +236,16 @@ impl WifiClient {
     }
 
     /// Connected-state tick: poll the current AP's signal level and
-    /// start a roam scan when it drops below the threshold.
+    /// start a roam scan when it drops below the threshold. This is the
+    /// fallback used when the driver has no kernel connection quality
+    /// monitor (see [`Self::arm_cqm`]).
     pub(crate) async fn check_roam_conditions(&mut self) {
         let Some(threshold) = self.roam_threshold() else {
             return;
         };
+        if !self.bss_info.ap_supports_signal_roam() {
+            return;
+        }
         if self.ft_roam.is_some() || self.roam_scan {
             return;
         }
@@ -250,6 +271,137 @@ impl WifiClient {
             "signal {signal} dBm below roam threshold {threshold} dBm; \
              scanning for roam candidates"
         );
+        self.roam_scan_background = false;
+        self.trigger_roam_scan().await;
+    }
+
+    /// Proactive background roam check (Connected state): start a roam
+    /// scan to look for a better BSS - the same network with a stronger
+    /// signal, or (when the current link is critical) a well-signalled
+    /// BSS of another configured SSID. The caller only invokes this on a
+    /// managed-roaming AP, so no additional capability gate is needed;
+    /// the same in-flight / cooldown gates as the CQM path apply.
+    pub(crate) async fn check_background_roam(&mut self) {
+        if self.roam_threshold().is_none() {
+            return;
+        }
+        if !self.bss_info.ap_supports_signal_roam() {
+            return;
+        }
+        if self.ft_roam.is_some() || self.roam_scan {
+            return;
+        }
+        if let Some(last) = self.last_roam
+            && last.elapsed() < ROAM_COOLDOWN
+        {
+            return;
+        }
+        self.roam_scan_background = true;
+        log::info!("background roam scan: looking for a better BSS");
+        self.trigger_roam_scan().await;
+    }
+
+    /// A `NL80211_CMD_NOTIFY_CQM` event from the kernel. On a LOW
+    /// crossing (the connected AP's signal dropped below the armed roam
+    /// threshold) start a roam scan, honoring the same gates as the
+    /// polling path: only on a managed-roaming AP, and never while
+    /// another roam / scan is already in flight. A HIGH crossing just
+    /// means the signal recovered.
+    pub(crate) async fn handle_cqm_rssi(&mut self, cqm: Nl80211CqmRssiEvent) {
+        if !matches!(
+            self.state,
+            WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        ) {
+            return;
+        }
+        let mut threshold_event = None;
+        let mut rssi = 0;
+        for attr in &cqm.events {
+            match attr {
+                Nl80211CqmAttr::RssiThresholdEvent(ev) => {
+                    threshold_event = Some(*ev);
+                }
+                Nl80211CqmAttr::RssiLevel(level) => rssi = *level,
+                _ => {}
+            }
+        }
+        match threshold_event.unwrap_or(Nl80211CqmRssiThresholdEvent::Other(0))
+        {
+            Nl80211CqmRssiThresholdEvent::Low => {
+                if self.roam_threshold().is_none() {
+                    return;
+                }
+                if !self.bss_info.ap_supports_signal_roam() {
+                    log::debug!(
+                        "CQM LOW but AP {:02x?} advertises no BSS Transition \
+                         / Neighbor Report capability; staying",
+                        self.bss_info.bssid
+                    );
+                    return;
+                }
+                if self.ft_roam.is_some() || self.roam_scan {
+                    return;
+                }
+                if let Some(last) = self.last_roam
+                    && last.elapsed() < ROAM_COOLDOWN
+                {
+                    return;
+                }
+                log::info!(
+                    "kernel CQM: signal {rssi} dBm below the roam threshold; \
+                     scanning for roam candidates"
+                );
+                self.roam_scan_background = false;
+                self.trigger_roam_scan().await;
+            }
+            Nl80211CqmRssiThresholdEvent::High => {
+                log::debug!("kernel CQM: signal {rssi} dBm recovered");
+            }
+            Nl80211CqmRssiThresholdEvent::Other(_) => {}
+        }
+    }
+
+    /// Arm the kernel connection quality monitor (`NL80211_CMD_SET_CQM`)
+    /// with the connected network's roam threshold, so the kernel
+    /// reports a `NL80211_CMD_NOTIFY_CQM` event when the AP's signal
+    /// drops. Returns true when armed; false when the driver has no CQM
+    /// support (mac80211 with beacon filtering and no hardware CQM), in
+    /// which case the caller keeps polling the signal instead.
+    pub(crate) async fn arm_cqm(&mut self) -> bool {
+        let Some(threshold) = self.roam_threshold() else {
+            return false;
+        };
+        let attrs = Nl80211Cqm::new(self.if_index)
+            .rssi_thold(threshold)
+            .rssi_hyst(CQM_RSSI_HYST_DBM)
+            .build();
+        match drain_request(self.conn_handle.set_cqm(attrs).execute().await)
+            .await
+        {
+            Ok(()) => {
+                log::info!(
+                    "kernel CQM armed: roam below {threshold} dBm (hysteresis \
+                     {CQM_RSSI_HYST_DBM} dBm)"
+                );
+                true
+            }
+            Err(e) => {
+                log::debug!(
+                    "kernel CQM not supported ({e}); polling the signal every \
+                     {}s instead",
+                    crate::client::ROAM_SIGNAL_CHECK_SECS
+                );
+                false
+            }
+        }
+    }
+
+    /// Start a roam scan (active scan for the configured SSIDs) from the
+    /// connected state. The caller has already decided the signal is
+    /// below the roam threshold; this records the pre-scan state so a
+    /// scan that decides to stay put can restore the connection.
+    async fn trigger_roam_scan(&mut self) {
         self.roam_scan = true;
         // Remember the connected state so a roam scan that decides to
         // stay can restore it instead of leaving the state machine in
@@ -340,7 +492,7 @@ impl WifiClient {
                     target.bssid,
                 )
                 .await;
-                self.start_roam(target).await;
+                self.start_roam(target, self.network.clone()).await;
             }
             None => {
                 log::info!("no usable BTM candidate; rejecting");
@@ -422,9 +574,20 @@ impl WifiClient {
     /// Start roaming to `target`: FT within the mobility domain when
     /// possible, otherwise disconnect and reconnect through the normal
     /// flow (PMKSA cache first, full authentication otherwise), steered
-    /// to the target BSSID.
-    pub(crate) async fn start_roam(&mut self, target: BssInfo) {
-        if self.ft.is_some()
+    /// to the target BSSID. `target_network` is the configuration of the
+    /// target's SSID; when it differs from the connected network the
+    /// client switches SSID, terminating the current session.
+    pub(crate) async fn start_roam(
+        &mut self,
+        target: BssInfo,
+        target_network: NetworkConfig,
+    ) {
+        // An FT roam only applies within the connected network (the FT
+        // context is bound to the current SSID); a different configured
+        // SSID always goes through a full reconnection.
+        let switching_network = target_network.ssid != self.network.ssid;
+        if !switching_network
+            && self.ft.is_some()
             && target.security.is_ft()
             && target.mdie.map(|m| m.mdid) == self.ft.as_ref().map(|ft| ft.mdid)
         {
@@ -434,16 +597,28 @@ impl WifiClient {
             return;
         }
 
+        if switching_network {
+            log::info!(
+                "switching to configured SSID {} (bssid {:02x?}) - the \
+                 current session is terminated",
+                target_network.ssid,
+                target.bssid
+            );
+            self.network = target_network;
+        }
         // No FT path: leave the current BSS and let the retry loop
         // reconnect to the target. An exact PMKSA cache hit skips the
         // full authentication; without one, OKC clones the current PMK's
         // PMKID onto the target BSSID and tries that first (the
         // association is rejected when the AP has no matching PMKSA, and
-        // the existing fallback then runs the full authentication).
-        if self
-            .pmksa_cache
-            .lookup(&self.network.ssid, target.bssid)
-            .is_none()
+        // the existing fallback then runs the full authentication). OKC
+        // is meaningless across an SSID switch (different PMK), so it is
+        // skipped there.
+        if !switching_network
+            && self
+                .pmksa_cache
+                .lookup(&self.network.ssid, target.bssid)
+                .is_none()
         {
             self.synthesize_okc_entry(&target);
         }

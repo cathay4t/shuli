@@ -61,10 +61,13 @@ pub fn init_logger() {
 
 const HWSIM0_PERM_MAC: &str = "02:00:00:00:00:00";
 const HWSIM1_PERM_MAC: &str = "02:00:00:00:01:00";
+const HWSIM2_PERM_MAC: &str = "02:00:00:00:02:00";
 const TEST_NIC: &str = "test-wlan0";
 const AP_NIC: &str = "wifi_ap";
+const AP_NIC2: &str = "wifi_ap2";
 const TEST_NS: &str = "shuli_test";
 const AP_IP: &str = "192.0.2.1";
+const AP_IP2: &str = "192.0.2.2";
 
 struct WifiTestEnv {
     hostapd_pid: Option<String>,
@@ -313,6 +316,7 @@ wpa=2
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 wpa_passphrase=12345678
+bss_transition=1
 ctrl_interface=/var/run/hostapd
 ";
 
@@ -589,6 +593,20 @@ async fn run_until_connected(
     client: &mut WifiClient,
     max_iters: u32,
 ) -> Result<WifiState, crate::WifiError> {
+    let mut roam_scans = 0u32;
+    run_until_connected_counting(client, max_iters, &mut roam_scans).await
+}
+
+/// Like [`run_until_connected`], but additionally counts every
+/// `WifiState::Scanning` return (roam scans) into `roam_scans`. With the
+/// kernel CQM armed, the weak-signal roam scan fires as soon as the
+/// threshold is crossed - i.e. during this connect loop - so tests that
+/// must observe it count here.
+async fn run_until_connected_counting(
+    client: &mut WifiClient,
+    max_iters: u32,
+    roam_scans: &mut u32,
+) -> Result<WifiState, crate::WifiError> {
     for _ in 0..max_iters {
         let step = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -596,6 +614,7 @@ async fn run_until_connected(
         )
         .await;
         match step {
+            Ok(Ok(WifiState::Scanning)) => *roam_scans += 1,
             Ok(Ok(state)) => match state {
                 WifiState::ConnectedWithoutOffloadRekey
                 | WifiState::ConnectedWithOffloadRekey => return Ok(state),
@@ -1674,6 +1693,7 @@ wpa_key_mgmt=FT-PSK
 rsn_pairwise=CCMP
 ieee80211w=1
 wpa_passphrase=12345678
+bss_transition=1
 nas_identifier=ap1
 mobility_domain=a1b2
 r0_key_lifetime=10000
@@ -1690,6 +1710,7 @@ wpa_key_mgmt=FT-PSK
 rsn_pairwise=CCMP
 ieee80211w=1
 wpa_passphrase=12345678
+bss_transition=1
 nas_identifier=ap2
 mobility_domain=a1b2
 r0_key_lifetime=10000
@@ -2027,7 +2048,13 @@ async fn wifi_client_roam_scan_stays_connected() {
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
     let mut client = WifiClient::init(config).await.expect("init");
-    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    // The kernel CQM reports the weak signal as soon as the roam
+    // threshold is armed, so the first roam scan usually fires during the
+    // connect loop itself; count it here.
+    let mut roam_scans = 0u32;
+    let state = run_until_connected_counting(&mut client, 20, &mut roam_scans)
+        .await
+        .expect("connect");
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
@@ -2036,7 +2063,22 @@ async fn wifi_client_roam_scan_stays_connected() {
     let start_bssid = client.bss_info.bssid;
     let start_ssid = client.current_ssid().to_string();
 
-    drain_pending_events(&mut client).await;
+    // Drain trailing events. A roam scan may also fire here; count it so
+    // the "must have run at least one scan" assertion below sees it.
+    let mut idle = 0;
+    while idle < 2 {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(WifiState::Scanning)) => roam_scans += 1,
+            Ok(Ok(_)) => idle = 0,
+            Ok(Err(e)) => panic!("client error while draining events: {e}"),
+            Err(_) => idle += 1, // 400 ms without an event
+        }
+    }
 
     // Let the roam engine run several signal-check rounds. With no better
     // BSS on air the roam scan must "stay" and the client must return to
@@ -2044,7 +2086,6 @@ async fn wifi_client_roam_scan_stays_connected() {
     // authentication to the AP it is already on.
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut roam_scans = 0;
     loop {
         let step = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -2097,6 +2138,249 @@ async fn wifi_client_roam_scan_stays_connected() {
     assert!(
         roam_scans > 0,
         "the weak-signal roam engine must have run at least one scan"
+    );
+    client.shutdown().await;
+}
+
+/// Custom 3-radio environment for the cross-SSID roam test: one STA radio
+/// plus two AP radios on separate phys (so each AP can report a different
+/// signal via the hwsim `rx_rssi` debugfs knob), both APs hostapd in the
+/// test netns. [`Drop`] tears everything down.
+struct TwoApEnv {
+    hostapd1_pid: Option<String>,
+    hostapd2_pid: Option<String>,
+}
+
+impl TwoApEnv {
+    /// Provision: 3 hwsim radios, move the two AP phys into the netns,
+    /// start one hostapd per AP. Returns the hwsim phys of the two APs
+    /// (needed to steer their reported signal via debugfs later).
+    fn provision() -> (Self, String, String) {
+        sh_allow_fail("modprobe -r mac80211_hwsim");
+        sh_allow_fail(&format!("ip netns del {TEST_NS}"));
+        sh_ok(&format!("ip netns add {TEST_NS}"));
+        sh_ok("modprobe mac80211_hwsim radios=3");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let nic0 = find_nic_by_mac(HWSIM0_PERM_MAC).expect("hwsim NIC 0 (STA)");
+        let nic1 =
+            find_nic_by_mac(HWSIM1_PERM_MAC).expect("hwsim NIC 1 (AP 1)");
+        let nic2 =
+            find_nic_by_mac(HWSIM2_PERM_MAC).expect("hwsim NIC 2 (AP 2)");
+        if nic0 != TEST_NIC {
+            sh_ok(&format!("ip link set {nic0} name {TEST_NIC}"));
+        }
+        if nic1 != AP_NIC {
+            sh_ok(&format!("ip link set {nic1} name {AP_NIC}"));
+        }
+        if nic2 != AP_NIC2 {
+            sh_ok(&format!("ip link set {nic2} name {AP_NIC2}"));
+        }
+
+        // The hwsim rx_rssi debugfs knob is per-phy and indexed by phy;
+        // record the ids before the phys leave this netns.
+        let ap1_phy = get_phy_id(AP_NIC);
+        let ap2_phy = get_phy_id(AP_NIC2);
+        let phy1 = iw_phy_netns_move(&ap1_phy);
+        let phy2 = iw_phy_netns_move(&ap2_phy);
+
+        sh_ok(&format!("ip link set {TEST_NIC} up"));
+        sh_ok(&format!("ip netns exec {TEST_NS} ip link set {AP_NIC} up"));
+        sh_ok(&format!(
+            "ip netns exec {TEST_NS} ip addr add {AP_IP}/24 dev {AP_NIC}"
+        ));
+        sh_ok(&format!("ip netns exec {TEST_NS} ip link set {AP_NIC2} up"));
+        sh_ok(&format!(
+            "ip netns exec {TEST_NS} ip addr add {AP_IP2}/24 dev {AP_NIC2}"
+        ));
+
+        let bin = hostapd_bin("hostapd");
+        let conf1 = "/tmp/shuli_rs_test_ap1_hostapd.conf";
+        let conf2 = "/tmp/shuli_rs_test_ap2_hostapd.conf";
+        std::fs::write(conf1, AP1_HOSTAPD_CONF).expect("write AP1 conf");
+        std::fs::write(conf2, AP2_HOSTAPD_CONF).expect("write AP2 conf");
+        let pid1 = "/tmp/shuli_rs_test_ap1_hostapd.pid";
+        let pid2 = "/tmp/shuli_rs_test_ap2_hostapd.pid";
+        sh_ok(&format!(
+            "ip netns exec {TEST_NS} {bin} -B -dd -t -f \
+             /tmp/shuli_rs_test_ap1_hostapd.log -P {pid1} {conf1}"
+        ));
+        sh_ok(&format!(
+            "ip netns exec {TEST_NS} {bin} -B -dd -t -f \
+             /tmp/shuli_rs_test_ap2_hostapd.log -P {pid2} {conf2}"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let env = TwoApEnv {
+            hostapd1_pid: std::fs::read_to_string(pid1)
+                .ok()
+                .map(|s| s.trim().to_string()),
+            hostapd2_pid: std::fs::read_to_string(pid2)
+                .ok()
+                .map(|s| s.trim().to_string()),
+        };
+        (env, phy1, phy2)
+    }
+
+    /// Set the transmit power (mBm) of a given AP radio. The hwsim
+    /// measured signal is the fixed `rx_rssi` (-50 dBm) plus this tx
+    /// power, so it slides between -50 dBm (0 mBm) and -30 dBm (20 dBm).
+    fn set_ap_txpower(phy: &str, mbm: i32) {
+        sh_ok(&format!(
+            "ip netns exec {TEST_NS} iw phy phy{phy} set txpower fixed {mbm}"
+        ));
+    }
+}
+
+impl Drop for TwoApEnv {
+    fn drop(&mut self) {
+        if let Some(ref pid) = self.hostapd1_pid {
+            sh_allow_fail(&format!("kill {pid}"));
+        }
+        if let Some(ref pid) = self.hostapd2_pid {
+            sh_allow_fail(&format!("kill {pid}"));
+        }
+        sh_allow_fail(&format!("ip netns del {TEST_NS}"));
+        sh_allow_fail(&format!("ip link del {TEST_NIC}"));
+        sh_allow_fail("modprobe -r mac80211_hwsim");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_ap1_hostapd.conf");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_ap2_hostapd.conf");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_ap1_hostapd.pid");
+        let _ = std::fs::remove_file("/tmp/shuli_rs_test_ap2_hostapd.pid");
+    }
+}
+
+fn iw_phy_netns_move(phy: &str) -> String {
+    sh_ok(&format!("iw phy#{phy} set netns name {TEST_NS}"));
+    phy.to_string()
+}
+
+/// Two WPA2-PSK APs with different SSIDs, both advertising BSS
+/// Transition (802.11v) so signal-triggered roaming applies. AP1
+/// ("Test-WIFI-A") starts with the default signal; AP2 ("Test-WIFI-B")
+/// is set weaker so the client connects to AP1 first.
+const AP1_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-A
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+bss_transition=1
+ctrl_interface=/var/run/hostapd
+";
+
+const AP2_HOSTAPD_CONF: &str = r"
+interface=wifi_ap2
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-B
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+bss_transition=1
+ctrl_interface=/var/run/hostapd
+";
+
+/// G8: a roam scan that finds the connected BSS below the critical
+/// threshold must switch to a well-signalled BSS of a *different*
+/// configured SSID, even though that terminates the current session.
+/// The client starts on AP1 (Test-WIFI-A); AP1's signal is then dropped
+/// below the critical threshold and AP2 (Test-WIFI-B) is strengthened, so
+/// the next roam engine run must move the client across SSIDs.
+#[tokio::test]
+async fn wifi_client_cross_ssid_critical_switch() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_cross_ssid_critical_switch: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let (_env, ap1_phy, ap2_phy) = TwoApEnv::provision();
+    // AP2 weaker than AP1 (default -30 dBm) so the initial connection
+    // lands on AP1.
+    TwoApEnv::set_ap_txpower(&ap2_phy, 0);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-A", Some("12345678"));
+    config.add_network("Test-WIFI-B", Some("12345678"));
+    for network in &mut config.networks {
+        // hwsim signals slide between -50 dBm (0 mBm) and -30 dBm
+        // (20 dBm) as the tx power changes: tune the roam thresholds so
+        // AP1 (initially -30) is healthy, AP2 (-50) is not yet good, and
+        // a critical AP1 (-50) triggers the SSID switch to a good AP2
+        // (-30).
+        network.roaming_threshold = -40;
+        network.switch_ssid_lower_than_dbm = -45;
+    }
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        "Test-WIFI-A",
+        client.current_ssid(),
+        "the client must connect to the stronger AP1 first"
+    );
+
+    drain_pending_events(&mut client).await;
+
+    // Drop AP1 below the critical threshold and strengthen AP2; the
+    // roam engine (CQM event) must then switch SSIDs to AP2.
+    TwoApEnv::set_ap_txpower(&ap1_phy, 0);
+    TwoApEnv::set_ap_txpower(&ap2_phy, 20000);
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("client error during cross-SSID roam: {e}"),
+            Err(_) => {}
+        }
+        if client.current_ssid() == "Test-WIFI-B"
+            && matches!(
+                client.state,
+                WifiState::ConnectedWithoutOffloadRekey
+                    | WifiState::ConnectedWithOffloadRekey
+            )
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cross-SSID switch did not happen in time (still on {} at bssid \
+             {:02x?})",
+            client.current_ssid(),
+            client.bss_info.bssid
+        );
+    }
+    assert!(matches!(
+        client.state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        "Test-WIFI-B",
+        client.current_ssid(),
+        "the client must land on the other configured SSID"
     );
     client.shutdown().await;
 }

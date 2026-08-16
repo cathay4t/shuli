@@ -20,6 +20,43 @@ pub const IE_ID_FTIE: u8 = 55;
 pub const IE_ID_RSNE: u8 = 48;
 /// Element ID of the RSNXE (802.11-2020 §9.4.2.25a).
 pub const IE_ID_RSNXE: u8 = 244;
+/// Element ID of the Extended Capabilities element (802.11-2020
+/// §9.4.2.26).
+pub const IE_ID_EXT_CAPAB: u8 = 127;
+/// Element ID of the RM Enabled Capabilities element (802.11-2020
+/// §9.4.2.43).
+pub const IE_ID_RM_ENABLED_CAPAB: u8 = 70;
+
+/// Extended Capabilities bit 19: the BSS Transition capability
+/// (802.11v, §11.21.7, Table 9-192). Set by an AP that participates in
+/// BSS Transition Management.
+const EXT_CAP_BSS_TRANSITION: usize = 19;
+/// RM Enabled Capabilities octet 0 bit 1: the Neighbor Report capability
+/// (802.11k, §11.10.10). Set by an AP that answers neighbor report
+/// requests.
+const RM_CAP_NEIGHBOR_REPORT: u8 = 1 << 1;
+
+/// Whether the AP's IEs advertise the BSS Transition (802.11v)
+/// capability: bit 19 of the Extended Capabilities element
+/// (§9.4.2.26). A missing or too-short element is not a BTM AP.
+pub fn ap_supports_btm(ies: &[u8]) -> bool {
+    find_ie(ies, IE_ID_EXT_CAPAB).is_some_and(|body| {
+        body.get(EXT_CAP_BSS_TRANSITION / 8).is_some_and(|octet| {
+            octet & (1 << (EXT_CAP_BSS_TRANSITION % 8)) != 0
+        })
+    })
+}
+
+/// Whether the AP's IEs advertise the Neighbor Report (802.11k)
+/// capability: bit 1 of octet 0 of the RM Enabled Capabilities element
+/// (§9.4.2.43). A missing or malformed element is not a neighbor-report
+/// AP.
+pub fn ap_supports_rm_neighbor_report(ies: &[u8]) -> bool {
+    find_ie(ies, IE_ID_RM_ENABLED_CAPAB).is_some_and(|body| {
+        body.first()
+            .is_some_and(|octet| octet & RM_CAP_NEIGHBOR_REPORT != 0)
+    })
+}
 
 /// Find an element in an IE buffer and return the offset of its ID
 /// octet.
@@ -834,4 +871,55 @@ pub fn unwrap_ft_key(
             format!("FT key unwrap failed: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an IE buffer from (id, body) pairs.
+    fn ies(parts: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (id, body) in parts {
+            out.push(*id);
+            out.push(body.len() as u8);
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    #[test]
+    fn test_ap_supports_btm() {
+        // Bit 19 of the Extended Capabilities element: octet 2, bit 3.
+        let btm = ies(&[(IE_ID_EXT_CAPAB, &[0x00, 0x00, 0x08])]);
+        assert!(ap_supports_btm(&btm));
+
+        // Other bits of the same octet do not advertise BTM.
+        let no_btm = ies(&[(IE_ID_EXT_CAPAB, &[0x00, 0x00, 0x10])]);
+        assert!(!ap_supports_btm(&no_btm));
+
+        // Element too short for bit 19.
+        let short = ies(&[(IE_ID_EXT_CAPAB, &[0x00, 0x00])]);
+        assert!(!ap_supports_btm(&short));
+
+        // No Extended Capabilities element at all.
+        assert!(!ap_supports_btm(&[]));
+        assert!(!ap_supports_btm(&ies(&[(IE_ID_RSNE, &[0x01])])));
+    }
+
+    #[test]
+    fn test_ap_supports_rm_neighbor_report() {
+        // Bit 1 of octet 0 of the RM Enabled Capabilities element.
+        let nr =
+            ies(&[(IE_ID_RM_ENABLED_CAPAB, &[0x02, 0x00, 0x00, 0x00, 0x00])]);
+        assert!(ap_supports_rm_neighbor_report(&nr));
+
+        // Only the link measurement bit set.
+        let lm =
+            ies(&[(IE_ID_RM_ENABLED_CAPAB, &[0x01, 0x00, 0x00, 0x00, 0x00])]);
+        assert!(!ap_supports_rm_neighbor_report(&lm));
+
+        // Missing element.
+        assert!(!ap_supports_rm_neighbor_report(&[]));
+    }
 }

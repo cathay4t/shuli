@@ -68,6 +68,12 @@ pub(crate) struct WifiEntry {
     /// `RoamThreshold`).
     #[serde(default = "default_roam_threshold")]
     pub roaming_threshold: i32,
+    /// Signal level (dBm) below which the current link is critical and
+    /// may be abandoned for a well-signalled BSS of another configured
+    /// SSID (terminating the current session). Defaults to -80 (iwd's
+    /// `CriticalRoamThreshold`).
+    #[serde(default = "default_roam_critical_threshold")]
+    pub switch_ssid_lower_than_dbm: i32,
     /// Wake-on-WLAN (WoWLAN): arm the wiphy's Disconnect / GTK-rekey
     /// failure triggers while connected, so the device can wake the
     /// host on suspend. Defaults to `false` (opt-in, like
@@ -202,6 +208,8 @@ impl ShuliConfig {
             }
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
+            network.switch_ssid_lower_than_dbm =
+                entry.switch_ssid_lower_than_dbm;
             network.wowlan = entry.wowlan;
             network.sae_password_id = entry.sae_password_id.clone();
             network.ocv = entry.ocv;
@@ -222,6 +230,10 @@ fn default_roaming() -> bool {
 
 fn default_roam_threshold() -> i32 {
     shuli::DEFAULT_ROAM_THRESHOLD_DBM
+}
+
+fn default_roam_critical_threshold() -> i32 {
+    shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
 }
 
 #[cfg(test)]
@@ -283,6 +295,26 @@ wifis:
         let network = &wifi.networks[0];
         assert!(network.roaming);
         assert_eq!(network.roaming_threshold, -80);
+        // The critical threshold keeps its -80 default unless set.
+        assert_eq!(
+            network.switch_ssid_lower_than_dbm,
+            shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
+        );
+    }
+
+    #[test]
+    fn switch_ssid_lower_than_dbm_override() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    switch_ssid_lower_than_dbm: -85
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert_eq!(wifi.networks[0].switch_ssid_lower_than_dbm, -85);
     }
 
     #[test]

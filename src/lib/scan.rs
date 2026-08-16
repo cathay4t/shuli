@@ -114,6 +114,12 @@ pub struct BssInfo {
     /// Whether the AP hides its SSID in beacons while still answering
     /// directed probe requests with the SSID.
     pub hidden: bool,
+    /// Whether the AP advertises the BSS Transition (802.11v)
+    /// capability (Extended Capabilities bit 19).
+    pub btm_support: bool,
+    /// Whether the AP advertises the Neighbor Report (802.11k)
+    /// capability (RM Enabled Capabilities octet 0 bit 1).
+    pub rm_neighbor_report: bool,
 }
 
 impl Default for BssInfo {
@@ -128,6 +134,8 @@ impl Default for BssInfo {
             group_mgmt_cipher: Ieee80211CipherSuite::BipCmac128,
             mdie: None,
             hidden: false,
+            btm_support: false,
+            rm_neighbor_report: false,
         }
     }
 }
@@ -168,6 +176,16 @@ impl BssInfo {
     /// than on local network config alone.
     pub(crate) fn ap_ext_key_id_capable(&self) -> bool {
         crate::ieee80211::elements::ap_rsne_supports_ext_key_id(&self.ap_rsne)
+    }
+
+    /// Whether the AP advertises a capability that makes a client
+    /// signal-triggered roam meaningful: 802.11v BSS Transition or
+    /// 802.11k Neighbor Report. APs advertising neither do not
+    /// participate in managed roaming, so scanning for a roam target
+    /// against them is skipped (the connected link is only ever
+    /// abandoned on an actual failure).
+    pub(crate) fn ap_supports_signal_roam(&self) -> bool {
+        self.btm_support || self.rm_neighbor_report
     }
 }
 
@@ -317,16 +335,22 @@ impl WifiClient {
         Ok(())
     }
 
-    /// Roam scan results: pick the best roam candidate (a different BSS
-    /// of the same security family that is not weaker than the current
-    /// one) and start roaming to it; stay put when no candidate
-    /// qualifies.
+    /// Roam scan results: pick the best roam candidate and start roaming
+    /// to it; stay put when no candidate qualifies. Same-network
+    /// candidates are BSSes of the same security family that are not
+    /// weaker than the current one (a background scan requires a strictly
+    /// stronger one, so equal-signal BSSes do not ping-pong on every scan
+    /// interval). When the current link is critical (signal below
+    /// `switch_ssid_lower_than_dbm`), a well-signalled BSS of a
+    /// *different* configured SSID also qualifies - switching SSIDs
+    /// terminates the current session.
     pub(crate) async fn process_roam_scan_results(&mut self) {
         if let Err(e) = self.collect_scan_candidates().await {
             log::warn!("roam scan failed: {e}");
             return;
         }
         let current_base = self.bss_info.security.base();
+        let current_ssid = self.network.ssid.clone();
         // Freshly measured signal of the current BSS from this same scan
         // dump (identical measurement source as the candidates), so the
         // "not weaker" comparison is apples-to-apples. When the current
@@ -338,17 +362,61 @@ impl WifiClient {
             .find(|(bss, _)| bss.bssid == self.bss_info.bssid)
             .map(|(bss, _)| bss.signal_dbm)
             .unwrap_or(self.bss_info.signal_dbm);
+        let strict = self.roam_scan_background;
+        // Same-network candidates: any BSS of the *connected* SSID (its
+        // security family, FT or not) that is not weaker than the current
+        // one. A different configured SSID only qualifies through the
+        // critical-link branch below.
         let best = self
             .last_scan_candidates
             .iter()
-            .map(|(bss, _)| bss)
-            .filter(|bss| {
+            .filter(|(bss, network)| {
                 bss.bssid != self.bss_info.bssid
+                    && network.ssid == current_ssid
                     && bss.security.base() == current_base
-                    && bss.signal_dbm >= current_signal
+                    && if strict {
+                        bss.signal_dbm > current_signal
+                    } else {
+                        bss.signal_dbm >= current_signal
+                    }
             })
-            .max();
-        let Some(target) = best.cloned() else {
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(bss, _)| bss.clone());
+        let mut target = best;
+        let mut target_network = self.network.clone();
+        if target.is_none()
+            && current_signal < self.network.switch_ssid_lower_than_dbm
+        {
+            // The current link is critical: abandon it for a
+            // well-signalled BSS of a different configured SSID, even
+            // though switching terminates the current session.
+            let good_signal = self
+                .roam_threshold()
+                .unwrap_or(self.network.switch_ssid_lower_than_dbm);
+            if let Some((bss, network)) = self
+                .last_scan_candidates
+                .iter()
+                .filter(|(bss, network)| {
+                    bss.bssid != self.bss_info.bssid
+                        && network.ssid != current_ssid
+                        && bss.signal_dbm >= good_signal
+                })
+                .max_by(|(a, _), (b, _)| a.signal_dbm.cmp(&b.signal_dbm))
+            {
+                log::info!(
+                    "current signal {current_signal} dBm is below the \
+                     critical {} dBm; switching to configured SSID {} (bssid \
+                     {:02x?}, signal {} dBm)",
+                    self.network.switch_ssid_lower_than_dbm,
+                    network.ssid,
+                    bss.bssid,
+                    bss.signal_dbm
+                );
+                target = Some(bss.clone());
+                target_network = network.clone();
+            }
+        }
+        let Some(target) = target else {
             log::info!("roam scan found no better BSS; staying");
             return;
         };
@@ -358,7 +426,7 @@ impl WifiClient {
             target.freq_mhz,
             target.signal_dbm
         );
-        self.start_roam(target).await;
+        self.start_roam(target, target_network).await;
     }
 
     /// Dump the scan results and record every BSS whose SSID matches a
@@ -419,6 +487,12 @@ impl WifiClient {
                     group_mgmt_cipher: bss_security.group_mgmt_cipher,
                     mdie: bss_security.mdie,
                     hidden: false,
+                    btm_support:
+                        crate::ieee80211::elements::ap_supports_btm(ies),
+                    rm_neighbor_report:
+                        crate::ieee80211::elements::ap_supports_rm_neighbor_report(
+                            ies,
+                        ),
                 },
                 network,
             ));
@@ -672,6 +746,9 @@ pub async fn scan_wifi_with_ies(
             group_mgmt_cipher: bss_security.group_mgmt_cipher,
             mdie: bss_security.mdie,
             hidden: beacon_has_ssid.get(&bssid) == Some(&false),
+            btm_support: crate::ieee80211::elements::ap_supports_btm(ies),
+            rm_neighbor_report:
+                crate::ieee80211::elements::ap_supports_rm_neighbor_report(ies),
         };
         results.push((info, ies.to_vec()));
     }

@@ -70,6 +70,12 @@ requests are always honoured.
 Signal level (dBm) below which the client scans for roam
 candidates (default \fB-70\fR).
 .TP
+.B switch_ssid_lower_than_dbm
+Signal level (dBm) below which the current link is considered
+critical: a roam scan then also considers a well-signalled BSS of
+a different configured SSID and switches to it, terminating the
+current session (default \fB-80\fR).
+.TP
 .B sae_pwe
 SAE PWE derivation: \fBauto\fR (default), \fBh2e\fR, or
 \fBhnp\fR.

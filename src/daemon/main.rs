@@ -427,6 +427,8 @@ mod tests {
             password: None,
             roaming: true,
             roaming_threshold: shuli::DEFAULT_ROAM_THRESHOLD_DBM,
+            switch_ssid_lower_than_dbm:
+                shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
             wowlan: false,
             eap: None,
             sae_pwe: config::SaePweConfig::Auto,

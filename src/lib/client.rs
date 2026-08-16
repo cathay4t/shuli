@@ -69,6 +69,10 @@ const RETRY_AUTH_SEC: u64 = 120;
 /// Max time to wait for the next authentication event (SAE frame, association
 /// result, 4-way handshake message) before giving up and retrying.
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
+/// Interval (seconds) at which the connected state polls the AP's signal
+/// when the driver has no kernel connection quality monitor (CQM) support:
+/// the fallback to the CQM event-driven roam trigger.
+pub(crate) const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
 /// SAE retransmission period (seconds): 802.11-2020 §12.4.8.6.2 sets
 /// the t0 (retransmission) timer to `dot11RSNASAERetransPeriod`, whose
 /// MIB default is 2000 ms (iwd uses the same 2 s). While the SAE
@@ -189,6 +193,15 @@ pub struct WifiClient {
     /// `ROAM_COOLDOWN_SECS` afterwards so equal-signal BSSes do not
     /// ping-pong the client.
     pub(crate) last_roam: Option<std::time::Instant>,
+    /// Whether the kernel connection quality monitor (CQM) is armed with
+    /// the roam threshold; when true the connected state waits for
+    /// `NL80211_CMD_NOTIFY_CQM` events instead of polling the signal.
+    pub(crate) cqm_armed: bool,
+    /// Whether the roam scan in flight was started by a proactive
+    /// background scan: only a strictly stronger BSS qualifies (an
+    /// equal-signal one would ping-pong on every scan interval), whereas
+    /// a signal-degraded roam (CQM / poll) accepts an equal-signal peer.
+    pub(crate) roam_scan_background: bool,
     /// G2c: SAE commit retransmission state. `sae_commit_sent` is true
     /// while we await the AP's commit; on a timeout the same commit is
     /// re-sent (the 802.11 SAE Sync counter, max 3) instead of paying a
@@ -336,6 +349,8 @@ impl WifiClient {
             last_scan_candidates: Vec::new(),
             pending_ft_msg1: None,
             last_roam: None,
+            cqm_armed: false,
+            roam_scan_background: false,
             sae_commit_sent: false,
             sae_sync: 0,
             sae_commit_auth_data: Vec::new(),
@@ -579,13 +594,34 @@ impl WifiClient {
             | WifiState::ConnectedWithOffloadRekey => {
                 // Keep draining events so group rekeys, disconnects and
                 // BTM Requests are handled while the connection stays up.
-                // With signal-triggered roaming enabled for the connected
-                // network, bound the wait so the signal level gets
-                // checked periodically.
-                const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
-                let next = if self.network.roaming {
+                // Signal-triggered roaming runs only against an AP that
+                // advertises a managed-roaming capability (802.11v BSS
+                // Transition / 802.11k Neighbor Report): for such APs the
+                // kernel CQM reports `NL80211_CMD_NOTIFY_CQM` events when
+                // the beacon signal drops below the roam threshold (a
+                // stable, beacon-only measurement - not the last-frame
+                // station signal that dips under power save), and a
+                // periodic background scan looks for a better BSS. Drivers
+                // without CQM support fall back to polling the signal.
+                // Neither runs for an AP that does not advertise a
+                // managed-roaming capability (the wait is unbounded).
+                let ap_roams = self.network.roaming
+                    && self.bss_info.ap_supports_signal_roam();
+                if !self.cqm_armed && ap_roams {
+                    self.cqm_armed = self.arm_cqm().await;
+                }
+                let wait_secs = if ap_roams {
+                    if self.cqm_armed {
+                        crate::roam::BACKGROUND_SCAN_SECS
+                    } else {
+                        ROAM_SIGNAL_CHECK_SECS
+                    }
+                } else {
+                    0
+                };
+                let next = if wait_secs > 0 {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(ROAM_SIGNAL_CHECK_SECS),
+                        std::time::Duration::from_secs(wait_secs),
                         self.event_receiver.next(),
                     )
                     .await
@@ -606,9 +642,15 @@ impl WifiClient {
                             "event channel closed",
                         ));
                     }
-                    // No event within the interval: check whether the
-                    // signal dropped below the roam threshold.
-                    Err(_) => self.check_roam_conditions().await,
+                    // Roam engine tick: the background scan (CQM armed)
+                    // or, without CQM support, the signal poll.
+                    Err(_) => {
+                        if self.cqm_armed {
+                            self.check_background_roam().await;
+                        } else {
+                            self.check_roam_conditions().await;
+                        }
+                    }
                 }
             }
             WifiState::Failed | WifiState::FailedAuthentication => {
@@ -1152,6 +1194,10 @@ impl WifiClient {
 
             Nl80211Event::WowlanWakeup { reasons } => {
                 self.handle_wowlan_wakeup(reasons).await;
+            }
+
+            Nl80211Event::CqmRssi(cqm) => {
+                self.handle_cqm_rssi(cqm).await;
             }
 
             Nl80211Event::Disconnect { reason } => {

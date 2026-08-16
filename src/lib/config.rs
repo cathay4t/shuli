@@ -3,6 +3,11 @@
 /// Default roam threshold: matches iwd's `RoamThreshold` (-70 dBm).
 pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
 
+/// Default signal level (dBm) below which the current link is treated
+/// as critical and may be abandoned for a well-signalled BSS of a
+/// *different* configured SSID. Matches iwd's `CriticalRoamThreshold`.
+pub const DEFAULT_SWITCH_SSID_LOWER_THAN_DBM: i32 = -80;
+
 /// SAE PWE derivation mode for a WPA3-Personal network (Stage 2 G2b).
 ///
 /// WPA3 APs derive the SAE password element either with hash-to-element
@@ -65,7 +70,13 @@ pub struct WifiConfig {
 /// transition management, 802.11v §11.21.7) leaves client-side roaming
 /// policy to the implementation. The threshold is deliberately
 /// band-agnostic: per-band thresholds are added only if users ask for
-/// them. BTM (802.11v) Requests are honoured regardless of `roaming`.
+/// them. The signal is tracked by the kernel's connection quality
+/// monitor (`NL80211_CMD_SET_CQM`, beacon-based and power-save stable),
+/// polling every few seconds only on drivers without CQM support, and
+/// a roam scan is only started against an AP that advertises a
+/// managed-roaming capability (802.11v BSS Transition or 802.11k
+/// Neighbor Report). BTM (802.11v) Requests are honoured regardless of
+/// `roaming`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkConfig {
     pub ssid: String,
@@ -77,6 +88,12 @@ pub struct NetworkConfig {
     /// candidates while connected to this SSID. Defaults to
     /// [`DEFAULT_ROAM_THRESHOLD_DBM`].
     pub roaming_threshold: i32,
+    /// Signal level (dBm) below which the current link is considered
+    /// critical: a roam scan then also considers a well-signalled BSS of
+    /// a *different* configured SSID and switches to it, even though
+    /// that terminates the current session. Defaults to
+    /// [`DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`].
+    pub switch_ssid_lower_than_dbm: i32,
     /// Wake-on-WLAN (WoWLAN): when `true`, the client arms the
     /// `Disconnect` and `GtkRekeyFailure` triggers (as supported by the
     /// wiphy) while connected, so the device can wake the host on
@@ -113,6 +130,7 @@ impl NetworkConfig {
             password: None,
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
+            switch_ssid_lower_than_dbm: DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
             wowlan: false,
             eap: None,
             sae_pwe: SaePwe::Auto,
