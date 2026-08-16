@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::scan::SecurityType;
+
 /// Default roam threshold: matches iwd's `RoamThreshold` (-70 dBm).
 pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
 
@@ -175,6 +177,16 @@ impl NetworkConfig {
     pub fn set_ext_key_id(&mut self, enabled: bool) -> &mut Self {
         self.ext_key_id = enabled;
         self
+    }
+
+    /// Whether a cross-SSID roam may land on a BSS advertising
+    /// `security`.
+    pub(crate) fn can_roam_to_security(&self, security: SecurityType) -> bool {
+        match security {
+            SecurityType::Unsupported => false,
+            SecurityType::Open => self.password.is_none() && self.eap.is_none(),
+            _ => true,
+        }
     }
 }
 

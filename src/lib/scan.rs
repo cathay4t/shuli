@@ -409,6 +409,7 @@ impl WifiClient {
                     bss.bssid != self.bss_info.bssid
                         && network.ssid != current_ssid
                         && bss.signal_dbm >= good_signal
+                        && network.can_roam_to_security(bss.security)
                 })
                 .max_by(|(a, _), (b, _)| a.signal_dbm.cmp(&b.signal_dbm))
             {

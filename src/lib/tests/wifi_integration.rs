@@ -2132,6 +2132,13 @@ impl TwoApEnv {
     /// start one hostapd per AP. Returns the hwsim phys of the two APs
     /// (needed to steer their reported signal via debugfs later).
     fn provision() -> (Self, String, String) {
+        Self::provision_with_configs(AP1_HOSTAPD_CONF, AP2_HOSTAPD_CONF)
+    }
+
+    fn provision_with_configs(
+        ap1_conf: &str,
+        ap2_conf: &str,
+    ) -> (Self, String, String) {
         sh_allow_fail("modprobe -r mac80211_hwsim");
         sh_allow_fail(&format!("ip netns del {TEST_NS}"));
         sh_ok(&format!("ip netns add {TEST_NS}"));
@@ -2173,8 +2180,8 @@ impl TwoApEnv {
         let bin = hostapd_bin("hostapd");
         let conf1 = "/tmp/shuli_rs_test_ap1_hostapd.conf";
         let conf2 = "/tmp/shuli_rs_test_ap2_hostapd.conf";
-        std::fs::write(conf1, AP1_HOSTAPD_CONF).expect("write AP1 conf");
-        std::fs::write(conf2, AP2_HOSTAPD_CONF).expect("write AP2 conf");
+        std::fs::write(conf1, ap1_conf).expect("write AP1 conf");
+        std::fs::write(conf2, ap2_conf).expect("write AP2 conf");
         let pid1 = "/tmp/shuli_rs_test_ap1_hostapd.pid";
         let pid2 = "/tmp/shuli_rs_test_ap2_hostapd.pid";
         sh_ok(&format!(
@@ -2259,6 +2266,16 @@ wpa=2
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 wpa_passphrase=12345678
+bss_transition=1
+ctrl_interface=/var/run/hostapd
+";
+
+const AP2_OPEN_HOSTAPD_CONF: &str = r"
+interface=wifi_ap2
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-B
 bss_transition=1
 ctrl_interface=/var/run/hostapd
 ";
@@ -2358,6 +2375,85 @@ async fn wifi_client_cross_ssid_critical_switch() {
         client.current_ssid(),
         "the client must land on the other configured SSID"
     );
+    client.shutdown().await;
+}
+
+/// Regression for the cross-SSID critical roam downgrade: a saved SSID
+/// with credentials must not switch to an open BSS just because it has
+/// the right SSID and stronger signal.
+#[tokio::test]
+async fn wifi_client_cross_ssid_critical_switch_rejects_open_downgrade() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_cross_ssid_critical_switch_rejects_open_downgrade: test binary not \
+             running as root (`.cargo/config.toml` runs tests via `sudo`, so \
+             plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let (_env, ap1_phy, ap2_phy) = TwoApEnv::provision_with_configs(
+        AP1_HOSTAPD_CONF,
+        AP2_OPEN_HOSTAPD_CONF,
+    );
+    TwoApEnv::set_ap_txpower(&ap2_phy, 0);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-A", Some("12345678"));
+    config.add_network("Test-WIFI-B", Some("12345678"));
+    for network in &mut config.networks {
+        network.roaming_threshold = -40;
+        network.switch_ssid_lower_than_dbm = -45;
+    }
+    let mut client = WifiClient::init(config).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        "Test-WIFI-A",
+        client.current_ssid(),
+        "the client must connect to AP1 first"
+    );
+
+    drain_pending_events(&mut client).await;
+    TwoApEnv::set_ap_txpower(&ap1_phy, 0);
+    TwoApEnv::set_ap_txpower(&ap2_phy, 20000);
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                panic!("client error during open-downgrade regression: {e}")
+            }
+            Err(_) => {}
+        }
+        assert_ne!(
+            "Test-WIFI-B",
+            client.current_ssid(),
+            "the client must not roam to an open impostor SSID"
+        );
+    }
+    assert_eq!(
+        "Test-WIFI-A",
+        client.current_ssid(),
+        "the client must stay on the protected SSID"
+    );
+    assert!(matches!(
+        client.state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
     client.shutdown().await;
 }
 

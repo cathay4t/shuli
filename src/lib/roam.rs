@@ -588,6 +588,18 @@ impl WifiClient {
         // context is bound to the current SSID); a different configured
         // SSID always goes through a full reconnection.
         let switching_network = target_network.ssid != self.network.ssid;
+        if switching_network
+            && !target_network.can_roam_to_security(target.security)
+        {
+            log::warn!(
+                "refusing cross-SSID roam to {} via BSSID {:02x?}: \
+                 incompatible security {:?}",
+                target_network.ssid,
+                target.bssid,
+                target.security
+            );
+            return;
+        }
         if !switching_network
             && self.ft.is_some()
             && target.security.is_ft()
