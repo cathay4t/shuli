@@ -1,4 +1,66 @@
 # Changelog
+## [0.2.0] - 2026-08-16
+### Breaking changes
+ - `WifiConfig` now holds a network list; use `add_network()` instead
+   of the removed `ssid`/`password` fields. (05b4466)
+ - Signal-triggered roaming is enabled per network by default; the
+   global `roam_threshold_dbm` config is replaced by per-network
+   `roaming` and `roaming_threshold`. (40fba35)
+
+### New features
+ - Support multiple WiFi networks in one scan schedule. (05b4466)
+ - Add hardware scheduled scan (PNO) with host scan backoff fallback.
+   (6d423c8)
+ - Add userspace PMKSA cache for fast reconnection. (60e7404)
+ - Add IEEE 802.11r/802.11v roaming support. (afb4278)
+ - Add per-SSID signal-triggered roaming, enabled by default. (40fba35)
+ - Add CQM-triggered roam scans, background scan and cross-SSID
+   critical switch. (d7f5ea7)
+ - Quick-scan known ESS frequencies before a full-scan fallback.
+   (a4c4242)
+ - Request 802.11k Neighbor Reports before quick roam scans. (a955907)
+ - Add SAE anti-clogging token handling, HnP fallback and commit
+   retransmission. (5aae947)
+ - Add WoWLAN suspend support with opt-in `wowlan` config. (f63bb6e)
+ - Run one `WifiClient` per configured interface. (504ba1a)
+ - Skip unsupported-AKM BSSes and classify disconnect reasons for
+   retry backoff. (504ba1a)
+ - Add systemd unit, /etc/shuli layout and man page. (7ad6e3a)
+ - Add WPA2-PSK-SHA256 (AKM 6) support. (72d0b46)
+ - Add EAP transport (RFC 3748) and peer state machine. (545edd2)
+ - Add EAP-TLS via rustls (RFC 5216 / RFC 9190). (630b375)
+ - Add WPA2-Enterprise (802.1X/EAP-TLS) support. (144d813)
+ - Add WPA3-Enterprise baseline (AKM 5, mandatory PMF). (9acb48f)
+ - Add wired 802.1X (EAPOL over Ethernet). (16bc427)
+ - Add SAE password identifiers. (8bf6f70)
+ - Negotiate the BIP group management cipher in the RSNE. (ec6e8cf)
+ - Parse and log the Transition Disable KDE. (f6a4622)
+ - Add Operating Channel Validation (OCV) support. (044ab39)
+ - Add Extended Key ID support. (76a239c)
+ - Add SAE-EXT-KEY (AKM 24/25) support. (b2c3aea)
+ - Fail cleanly when the AP requires SAE-PK (status 127). (da9df6d)
+ - Support connection to hidden SSIDs. (eaaa41b)
+ - Expose `WifiClient::current_bssid()`. (4d6e7c4)
+
+### Bug fixes
+ - Install IGTK/BIGTK and validate Message 3 IEs for PMF. (959ce70)
+ - Wait for the scan-completion event instead of a fixed sleep.
+   (eea56d1)
+ - Restore the connected state when a roam scan stays. (b4a4db7)
+ - Do not switch to a weaker BSS in a roam scan. (ca04d6d)
+ - Cancel a pending roam scan when the signal recovers. (473ae27)
+ - Reject security downgrades in cross-SSID critical switch. (ed1011b)
+ - Fix FT-SAE roam on HnP APs and rejected reassociation handling.
+   (64e729a)
+ - Clear stale FT context on a new auth attempt. (28ac610)
+ - Retry SAE auth on transient 802.11 rejection statuses. (29b8820)
+ - Report scan signal in dBm instead of mBm. (75f654f)
+ - Check AP scan capabilities before SAE H2E, OCV and Extended Key ID.
+   (2cd79a6)
+ - Make background scan a low-frequency fallback. (604b67f)
+ - Only return from `run()` when the state changes. (d801098)
+ - Suppress transient roam scan states from `run()`. (2f12ff9)
+
 ## [0.1.0] - 2026-08-05
 ### Breaking changes
  - N/A

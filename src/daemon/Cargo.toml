@@ -14,7 +14,7 @@ name = "shulid"
 path = "main.rs"
 
 [dependencies]
-shuli = { version = "0.1", path = "../lib" }
+shuli = { version = "0.2", path = "../lib" }
 tokio.workspace = true
 log.workspace = true
 env_logger.workspace = true
