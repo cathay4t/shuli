@@ -317,6 +317,7 @@ wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 wpa_passphrase=12345678
 bss_transition=1
+rrm_neighbor_report=1
 ctrl_interface=/var/run/hostapd
 ";
 
@@ -1679,6 +1680,7 @@ rsn_pairwise=CCMP
 ieee80211w=1
 wpa_passphrase=12345678
 bss_transition=1
+rrm_neighbor_report=1
 nas_identifier=ap1
 mobility_domain=a1b2
 r0_key_lifetime=10000
@@ -1696,6 +1698,7 @@ rsn_pairwise=CCMP
 ieee80211w=1
 wpa_passphrase=12345678
 bss_transition=1
+rrm_neighbor_report=1
 nas_identifier=ap2
 mobility_domain=a1b2
 r0_key_lifetime=10000
@@ -1982,6 +1985,11 @@ async fn wifi_client_ft_psk_signal_roam() {
         client.auth.is_none(),
         "an FT roam must not run a new PSK/4-way full authentication"
     );
+    assert!(
+        client.neighbor_report_responses > 0,
+        "the signal roam must actively request and receive an 802.11k \
+         neighbor report before the quick scan"
+    );
 
     // Stability: the signal is still "weak", but the roam cooldown must
     // keep the client on the target BSS instead of roaming right back.
@@ -2114,6 +2122,11 @@ async fn wifi_client_roam_scan_stays_connected() {
     assert!(
         client.roam_scan_count > 0,
         "the weak-signal roam engine must have run at least one scan"
+    );
+    assert!(
+        client.neighbor_report_responses > 0,
+        "the roam engine must actively request and receive an 802.11k \
+         neighbor report before the quick scan"
     );
     client.shutdown().await;
 }

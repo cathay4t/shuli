@@ -195,6 +195,13 @@ pub struct WifiClient {
     /// all-channel scan (quick-scan-first is the normal path; the full
     /// scan runs once per episode as the fallback).
     pub(crate) roam_scan_full: bool,
+    /// Dialog token of the 802.11k Neighbor Report Request in flight,
+    /// if any. Cleared when the matching response arrives or the wait
+    /// times out.
+    pub(crate) pending_nr_dialog: Option<u8>,
+    /// Number of 802.11k Neighbor Report Responses received and parsed.
+    /// Test-observable proof that the active neighbor-report path ran.
+    pub(crate) neighbor_report_responses: u64,
     /// A 4-way Message 1 that arrived before the FT context could be
     /// built from the association response event (the two can race).
     pub(crate) pending_ft_msg1: Option<Vec<u8>>,
@@ -364,6 +371,8 @@ impl WifiClient {
             last_scan_candidates: Vec::new(),
             roam_freqs: Vec::new(),
             roam_scan_full: false,
+            pending_nr_dialog: None,
+            neighbor_report_responses: 0,
             pending_ft_msg1: None,
             last_roam: None,
             cqm_armed: false,
@@ -908,6 +917,10 @@ impl WifiClient {
                     && frame[24] == crate::ieee80211::wnm::WNM_ACTION_CATEGORY
                 {
                     self.handle_wnm_frame(&frame).await;
+                } else if frame.len() > 24
+                    && frame[24] == crate::ieee80211::rrm::RRM_ACTION_CATEGORY
+                {
+                    self.handle_rrm_frame(&frame).await;
                 } else {
                     self.handle_auth_frame(&frame).await;
                 }
@@ -2457,6 +2470,8 @@ impl WifiClient {
         self.last_scan_candidates.clear();
         self.roam_freqs.clear();
         self.roam_scan_full = false;
+        self.pending_nr_dialog = None;
+        self.neighbor_report_responses = 0;
         self.pending_ft_msg1 = None;
         self.last_roam = None;
         self.sae_commit_sent = false;

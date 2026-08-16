@@ -16,6 +16,7 @@
 //!     FTIE subelements - no 4-way handshake follows.
 
 use aws_lc_rs::rand::SecureRandom;
+use futures::StreamExt;
 use wl_nl80211::{
     Nl80211Associate, Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm,
     Nl80211CqmAttr, Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent,
@@ -31,6 +32,10 @@ use crate::{
     },
     ieee80211::{
         elements,
+        rrm::{
+            NEIGHBOR_REPORT_RESPONSE_ACTION, RRM_ACTION_CATEGORY,
+            build_neighbor_report_request, parse_neighbor_report_response,
+        },
         wnm::{
             BTM_REQUEST_ACTION, BTM_STATUS_ACCEPT,
             BTM_STATUS_REJECT_UNSPECIFIED, BtmRequest, WNM_ACTION_CATEGORY,
@@ -66,6 +71,11 @@ pub(crate) const BACKGROUND_SCAN_SECS: u64 = 300;
 /// ESS channels are enough; bounding the list keeps the quick scan fast
 /// even with many configured networks.
 pub(crate) const ROAM_QUICK_SCAN_MAX_FREQS: usize = 16;
+
+/// How long to wait for the 802.11k Neighbor Report Response before
+/// falling back to the frequencies already known. Matches iwd's 3-second
+/// neighbor report timeout (`netdev_neighbor_report_timeout`).
+const NEIGHBOR_REPORT_TIMEOUT_SECS: u64 = 3;
 
 /// FT key material of the current connection (802.11-2020 §12.8.2).
 #[derive(Debug)]
@@ -110,8 +120,10 @@ fn ft_reassoc_uses_rsnxe(
 }
 
 impl WifiClient {
-    /// Register for WNM action frames so BTM Requests reach us
-    /// (802.11-2020 §11.11.9; requires PMF for protected delivery).
+    /// Register for the action frames roaming needs: WNM (category 10)
+    /// so BTM Requests reach us (802.11-2020 §11.11.9), and the 802.11k
+    /// Radio Measurement Neighbor Report Response (category 5, action 5)
+    /// so the active neighbor-report path sees the AP's answer.
     pub(crate) async fn register_roam_frames(&mut self) {
         let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.if_index)
             .frame_type(FRAME_TYPE_ACTION)
@@ -123,6 +135,20 @@ impl WifiClient {
         .await
         {
             log::debug!("register WNM action frames failed: {e}");
+        }
+        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.if_index)
+            .frame_type(FRAME_TYPE_ACTION)
+            .frame_match(vec![
+                RRM_ACTION_CATEGORY,
+                NEIGHBOR_REPORT_RESPONSE_ACTION,
+            ])
+            .build();
+        if let Err(e) = drain_request(
+            self.conn_handle.register_frame(attrs).execute().await,
+        )
+        .await
+        {
+            log::debug!("register RRM neighbor report frames failed: {e}");
         }
     }
 
@@ -443,6 +469,13 @@ impl WifiClient {
     /// records the pre-scan state so a scan that decides to stay put can
     /// restore the connection.
     pub(crate) async fn trigger_roam_scan(&mut self, full: bool) {
+        // Before the quick scan, ask the connected AP for its neighbor
+        // list (802.11k) so the scan covers the channels the AP itself
+        // considers part of the ESS. Bounded by a 3-second timeout; the
+        // quick scan then runs on the known + reported frequencies.
+        if !full {
+            self.request_neighbor_report_freqs().await;
+        }
         self.roam_scan = true;
         self.roam_scan_full = full;
         // Remember the connected state so a roam scan that decides to
@@ -592,6 +625,159 @@ impl WifiClient {
         }
     }
 
+    /// Handle a received Radio Measurement action frame (registered via
+    /// [`register_roam_frames`]): the 802.11k Neighbor Report Response
+    /// answers our outstanding request. Its entries widen the quick-scan
+    /// frequency set with the channels the AP reports as ESS neighbors.
+    pub(crate) async fn handle_rrm_frame(&mut self, frame: &[u8]) {
+        // 24-byte 802.11 header, then category / action / body.
+        if frame.len() < 27 || frame[24] != RRM_ACTION_CATEGORY {
+            return;
+        }
+        if frame[25] != NEIGHBOR_REPORT_RESPONSE_ACTION {
+            log::debug!("RRM action {} ignored", frame[25]);
+            return;
+        }
+        let Some(dialog) = self.pending_nr_dialog else {
+            log::trace!(
+                "802.11k Neighbor Report Response without pending request"
+            );
+            return;
+        };
+        let Some(response) = parse_neighbor_report_response(&frame[26..])
+        else {
+            log::warn!("malformed 802.11k Neighbor Report Response; ignored");
+            self.pending_nr_dialog = None;
+            return;
+        };
+        if response.dialog_token != dialog {
+            log::debug!(
+                "802.11k response dialog {} != pending {}; ignored",
+                response.dialog_token,
+                dialog
+            );
+            return;
+        }
+        self.pending_nr_dialog = None;
+        self.neighbor_report_responses += 1;
+
+        let mut added = 0;
+        for entry in &response.entries {
+            if self.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
+                break;
+            }
+            let Some(freq) =
+                crate::ieee80211::band::operating_class_channel_to_freq(
+                    entry.operating_class,
+                    entry.channel,
+                )
+            else {
+                continue;
+            };
+            if !self.roam_freqs.contains(&freq) {
+                log::trace!(
+                    "802.11k neighbor {:02x?} adds freq {freq} MHz to roam \
+                     quick-scan set",
+                    entry.bssid
+                );
+                self.roam_freqs.push(freq);
+                added += 1;
+            }
+        }
+        log::info!(
+            "802.11k neighbor report: {} entries (dialog {}), {} new \
+             quick-scan frequency(ies)",
+            response.entries.len(),
+            dialog,
+            added
+        );
+    }
+
+    /// Actively request the connected AP's 802.11k Neighbor Report and
+    /// wait (bounded) for the response, merging the reported channels
+    /// into [`Self::roam_freqs`]. Runs before every quick roam scan when
+    /// the AP advertises the capability; on failure or timeout the quick
+    /// scan proceeds with the frequencies already known. Non-response
+    /// events are left queued for the regular state machine.
+    async fn request_neighbor_report_freqs(&mut self) {
+        if !self.bss_info.rm_neighbor_report {
+            return;
+        }
+        if self.pending_nr_dialog.is_some() {
+            return;
+        }
+        // iwd uses a constant non-zero dialog token: at most one request
+        // is outstanding and we match the response by token.
+        let dialog = 1;
+        let frame = self.action_frame(build_neighbor_report_request(dialog));
+        let attrs = wl_nl80211::Nl80211Frame::new(self.if_index)
+            .frame(frame)
+            .frequency(self.bss_info.freq_mhz)
+            .build();
+        if let Err(e) =
+            drain_request(self.conn_handle.frame(attrs).execute().await).await
+        {
+            log::debug!("802.11k neighbor report request failed: {e}");
+            return;
+        }
+        self.pending_nr_dialog = Some(dialog);
+        log::debug!("802.11k neighbor report request sent (dialog {dialog})");
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(NEIGHBOR_REPORT_TIMEOUT_SECS);
+        loop {
+            let remaining =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.event_receiver.next())
+                .await
+            {
+                Ok(Some((raw_msg, _addr))) => {
+                    if let Some(wl_nl80211::Nl80211Event::Frame { frame }) =
+                        wl_nl80211::Nl80211Event::parse(raw_msg)
+                        && frame.len() > 25
+                        && frame[24] == RRM_ACTION_CATEGORY
+                        && frame[25] == NEIGHBOR_REPORT_RESPONSE_ACTION
+                    {
+                        self.handle_rrm_frame(&frame).await;
+                        if self.pending_nr_dialog.is_none() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "event channel closed while waiting for the 802.11k \
+                         neighbor report"
+                    );
+                    break;
+                }
+                Err(_) => break, // timeout
+            }
+        }
+        self.pending_nr_dialog = None;
+        log::debug!(
+            "802.11k neighbor report request timed out; using known \
+             frequencies"
+        );
+    }
+
+    /// Build a complete Action frame (24-byte 802.11 header addressed to
+    /// the current AP, then the category/action/body payload).
+    fn action_frame(&self, body: Vec<u8>) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(24 + body.len());
+        frame.extend_from_slice(&FRAME_TYPE_ACTION.to_le_bytes());
+        frame.extend_from_slice(&[0, 0]); // duration
+        frame.extend_from_slice(&self.bss_info.bssid); // DA = AP
+        frame.extend_from_slice(&self.mac); // SA
+        frame.extend_from_slice(&self.bss_info.bssid); // BSSID
+        frame.extend_from_slice(&[0, 0]); // sequence control
+        frame.extend_from_slice(&body);
+        frame
+    }
+
     /// Choose a roam target from a BTM candidate list: candidates are in
     /// preference order; each must match the last scan results and the
     /// network's security family, and differ from the current BSS.
@@ -633,14 +819,7 @@ impl WifiClient {
         status: u8,
         target_bssid: [u8; ETH_ALEN],
     ) {
-        let mut frame = Vec::with_capacity(24 + 11);
-        frame.extend_from_slice(&FRAME_TYPE_ACTION.to_le_bytes());
-        frame.extend_from_slice(&[0, 0]); // duration
-        frame.extend_from_slice(&self.bss_info.bssid); // DA = AP
-        frame.extend_from_slice(&self.mac); // SA
-        frame.extend_from_slice(&self.bss_info.bssid); // BSSID
-        frame.extend_from_slice(&[0, 0]); // sequence control
-        frame.extend_from_slice(&build_btm_response(
+        let frame = self.action_frame(build_btm_response(
             dialog_token,
             status,
             target_bssid,

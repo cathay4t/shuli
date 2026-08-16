@@ -245,7 +245,12 @@ impl WifiClient {
         // neighbor-report entries); only the full-scan fallback sweeps
         // every channel. Non-roam scans always sweep everything.
         let freqs = if self.roam_scan && !self.roam_scan_full {
-            let freqs = self.roam_freqs.clone();
+            let freqs: Vec<u32> = self
+                .roam_freqs
+                .iter()
+                .copied()
+                .filter(|freq| *freq != 0)
+                .collect();
             if freqs.is_empty() { None } else { Some(freqs) }
         } else {
             None
@@ -589,7 +594,13 @@ impl WifiClient {
             .iter()
             .map(|(bss, _)| bss.freq_mhz)
             .collect();
-        freqs.push(self.bss_info.freq_mhz);
+        // The default BSS (before the first scan selects one) carries
+        // freq 0; never let a zero frequency into the kernel's
+        // NL80211_ATTR_SCAN_FREQUENCIES (it rejects the scan with
+        // EINVAL, silently downgrading every quick scan to a full one).
+        if self.bss_info.freq_mhz != 0 {
+            freqs.push(self.bss_info.freq_mhz);
+        }
         freqs.sort_unstable();
         freqs.dedup();
         self.roam_freqs = freqs

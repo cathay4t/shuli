@@ -13,6 +13,7 @@ mod elements;
 mod ieee80211_auth;
 mod ieee80211_eapol;
 mod pmksa;
+mod rrm;
 mod scan;
 mod wifi_integration;
 mod wnm;
