@@ -53,13 +53,14 @@ const ROAM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Matches iwd's `CQM_RSSI_HYST`.
 const CQM_RSSI_HYST_DBM: u32 = 5;
 
-/// Interval (seconds) between proactive background roam scans in the
-/// connected state: the scan evaluates whether a better BSS (same
-/// network with a stronger signal, or - on a critical link - a
-/// well-signalled BSS of another configured SSID) warrants a roam.
-/// Only created for APs that advertise a managed-roaming capability
-/// (802.11v BSS Transition / 802.11k Neighbor Report).
-pub(crate) const BACKGROUND_SCAN_SECS: u64 = 30;
+/// Interval (seconds) between low-frequency proactive background roam
+/// scans in the connected state. These are a fallback safety net: the
+/// kernel CQM handles signal-degraded roaming, and BTM handles AP-directed
+/// roaming, so this periodic scan only needs to catch cases both missed
+/// (e.g. a better BSS appearing while the current signal is still healthy).
+/// Matches wpa_supplicant's long bgscan interval rather than its 30-second
+/// short interval.
+pub(crate) const BACKGROUND_SCAN_SECS: u64 = 300;
 
 /// FT key material of the current connection (802.11-2020 §12.8.2).
 #[derive(Debug)]
@@ -271,16 +272,17 @@ impl WifiClient {
             "signal {signal} dBm below roam threshold {threshold} dBm; \
              scanning for roam candidates"
         );
-        self.roam_scan_background = false;
+        self.background_scan = false;
         self.trigger_roam_scan().await;
     }
 
-    /// Proactive background roam check (Connected state): start a roam
-    /// scan to look for a better BSS - the same network with a stronger
-    /// signal, or (when the current link is critical) a well-signalled
-    /// BSS of another configured SSID. The caller only invokes this on a
-    /// managed-roaming AP, so no additional capability gate is needed;
-    /// the same in-flight / cooldown gates as the CQM path apply.
+    /// Low-frequency proactive background roam check (Connected state):
+    /// fallback safety net that looks for a better BSS - the same network
+    /// with a strictly stronger signal, or (when the current link is
+    /// critical) a well-signalled BSS of another configured SSID. The
+    /// caller only invokes this on a managed-roaming AP, so no additional
+    /// capability gate is needed; the same in-flight / cooldown gates as
+    /// the CQM path apply.
     pub(crate) async fn check_background_roam(&mut self) {
         if self.roam_threshold().is_none() {
             return;
@@ -296,7 +298,7 @@ impl WifiClient {
         {
             return;
         }
-        self.roam_scan_background = true;
+        self.background_scan = true;
         log::trace!("background roam scan: looking for a better BSS");
         self.trigger_roam_scan().await;
     }
@@ -352,7 +354,7 @@ impl WifiClient {
                     "kernel CQM: signal {rssi} dBm below the roam threshold; \
                      scanning for roam candidates"
                 );
-                self.roam_scan_background = false;
+                self.background_scan = false;
                 self.trigger_roam_scan().await;
             }
             Nl80211CqmRssiThresholdEvent::High => {

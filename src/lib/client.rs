@@ -197,11 +197,13 @@ pub struct WifiClient {
     /// the roam threshold; when true the connected state waits for
     /// `NL80211_CMD_NOTIFY_CQM` events instead of polling the signal.
     pub(crate) cqm_armed: bool,
-    /// Whether the roam scan in flight was started by a proactive
-    /// background scan: only a strictly stronger BSS qualifies (an
-    /// equal-signal one would ping-pong on every scan interval), whereas
-    /// a signal-degraded roam (CQM / poll) accepts an equal-signal peer.
-    pub(crate) roam_scan_background: bool,
+    /// Whether the scan in flight was started by the low-frequency
+    /// proactive background scan: only a strictly stronger BSS qualifies
+    /// for a same-ESS roam (an equal-signal one would ping-pong on every
+    /// scan interval), whereas a signal-degraded roam (CQM / poll)
+    /// accepts an equal-signal peer. The background scan may also switch
+    /// to a different configured SSID when the current link is critical.
+    pub(crate) background_scan: bool,
     /// Number of roam scans whose candidate dump was collected. Used by
     /// the integration tests to observe scans that `run()` now keeps
     /// internal (no `Scanning` state is surfaced when the scan stays).
@@ -354,7 +356,7 @@ impl WifiClient {
             pending_ft_msg1: None,
             last_roam: None,
             cqm_armed: false,
-            roam_scan_background: false,
+            background_scan: false,
             roam_scan_count: 0,
             sae_commit_sent: false,
             sae_sync: 0,
@@ -372,11 +374,11 @@ impl WifiClient {
     /// happens and return it.  On transient errors the client falls back
     /// to a retry state instead of failing hard.
     ///
-    /// Roam scans started from the connected state (CQM event or
-    /// proactive background scan) are internal housekeeping: when they
-    /// find no better BSS the client stays connected, so [`WifiClient::run`]
-    /// keeps driving without surfacing the `Connected -> Scanning ->
-    /// Connected` round trip to the caller.
+    /// Roam scans started from the connected state (CQM event or the
+    /// low-frequency background safety net) are internal housekeeping:
+    /// when they find no better BSS the client stays connected, so
+    /// [`WifiClient::run`] keeps driving without surfacing the
+    /// `Connected -> Scanning -> Connected` round trip to the caller.
     pub async fn run(&mut self) -> Result<WifiState, WifiError> {
         // The state to which an in-flight roam scan will return. A scan
         // that decides to stay is invisible to callers, so remember the
@@ -625,11 +627,12 @@ impl WifiClient {
                 // kernel CQM reports `NL80211_CMD_NOTIFY_CQM` events when
                 // the beacon signal drops below the roam threshold (a
                 // stable, beacon-only measurement - not the last-frame
-                // station signal that dips under power save), and a
-                // periodic background scan looks for a better BSS. Drivers
-                // without CQM support fall back to polling the signal.
-                // Neither runs for an AP that does not advertise a
-                // managed-roaming capability (the wait is unbounded).
+                // station signal that dips under power save). A
+                // low-frequency background scan is kept as a fallback
+                // safety net for cases CQM cannot catch. Drivers without
+                // CQM support fall back to polling the signal. Neither
+                // runs for an AP that does not advertise a managed-roaming
+                // capability (the wait is unbounded).
                 let ap_roams = self.network.roaming
                     && self.bss_info.ap_supports_signal_roam();
                 if !self.cqm_armed && ap_roams {
@@ -667,8 +670,8 @@ impl WifiClient {
                             "event channel closed",
                         ));
                     }
-                    // Roam engine tick: the background scan (CQM armed)
-                    // or, without CQM support, the signal poll.
+                    // Roam engine tick: the low-frequency background scan
+                    // (CQM armed) or, without CQM support, the signal poll.
                     Err(_) => {
                         if self.cqm_armed {
                             self.check_background_roam().await;

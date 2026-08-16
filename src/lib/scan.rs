@@ -346,12 +346,12 @@ impl WifiClient {
     /// Roam scan results: pick the best roam candidate and start roaming
     /// to it; stay put when no candidate qualifies. Same-network
     /// candidates are BSSes of the same security family that are not
-    /// weaker than the current one (a background scan requires a strictly
-    /// stronger one, so equal-signal BSSes do not ping-pong on every scan
-    /// interval). When the current link is critical (signal below
-    /// `switch_ssid_lower_than_dbm`), a well-signalled BSS of a
-    /// *different* configured SSID also qualifies - switching SSIDs
-    /// terminates the current session.
+    /// weaker than the current one (the low-frequency background scan
+    /// requires a strictly stronger one, so equal-signal BSSes do not
+    /// ping-pong on every scan interval). When the current link is
+    /// critical (signal below `switch_ssid_lower_than_dbm`), a
+    /// well-signalled BSS of a *different* configured SSID also qualifies
+    /// - switching SSIDs terminates the current session.
     pub(crate) async fn process_roam_scan_results(&mut self) {
         if let Err(e) = self.collect_scan_candidates().await {
             log::warn!("roam scan failed: {e}");
@@ -371,7 +371,7 @@ impl WifiClient {
             .find(|(bss, _)| bss.bssid == self.bss_info.bssid)
             .map(|(bss, _)| bss.signal_dbm)
             .unwrap_or(self.bss_info.signal_dbm);
-        let strict = self.roam_scan_background;
+        let strict = self.background_scan;
         // Same-network candidates: any BSS of the *connected* SSID (its
         // security family, FT or not) that is not weaker than the current
         // one. A different configured SSID only qualifies through the
