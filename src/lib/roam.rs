@@ -62,6 +62,11 @@ const CQM_RSSI_HYST_DBM: u32 = 5;
 /// short interval.
 pub(crate) const BACKGROUND_SCAN_SECS: u64 = 300;
 
+/// Upper bound on the known-frequency set of a quick roam scan. A few
+/// ESS channels are enough; bounding the list keeps the quick scan fast
+/// even with many configured networks.
+pub(crate) const ROAM_QUICK_SCAN_MAX_FREQS: usize = 16;
+
 /// FT key material of the current connection (802.11-2020 §12.8.2).
 #[derive(Debug)]
 pub(crate) struct FtContext {
@@ -273,7 +278,7 @@ impl WifiClient {
              scanning for roam candidates"
         );
         self.background_scan = false;
-        self.trigger_roam_scan().await;
+        self.trigger_roam_scan(false).await;
     }
 
     /// Low-frequency proactive background roam check (Connected state):
@@ -300,7 +305,11 @@ impl WifiClient {
         }
         self.background_scan = true;
         log::trace!("background roam scan: looking for a better BSS");
-        self.trigger_roam_scan().await;
+        // The background safety net is low-frequency (every
+        // `BACKGROUND_SCAN_SECS`), so it keeps the full scan: a quick
+        // scan would never discover a new BSS on a channel not seen
+        // before, which is exactly what the safety net is for.
+        self.trigger_roam_scan(true).await;
     }
 
     /// A `NL80211_CMD_NOTIFY_CQM` event from the kernel. On a LOW
@@ -360,10 +369,13 @@ impl WifiClient {
                      scanning for roam candidates"
                 );
                 self.background_scan = false;
-                self.trigger_roam_scan().await;
+                self.trigger_roam_scan(false).await;
             }
             Nl80211CqmRssiThresholdEvent::High => {
                 log::debug!("kernel CQM: signal {rssi} dBm recovered");
+                // The low-signal episode is over: the next LOW starts a
+                // fresh quick scan again.
+                self.roam_scan_full = false;
                 // The signal recovered above the roam threshold while a
                 // roam scan started by the earlier LOW crossing is still
                 // in flight: the current BSS is healthy again, so cancel
@@ -420,21 +432,45 @@ impl WifiClient {
         }
     }
 
-    /// Start a roam scan (active scan for the configured SSIDs) from the
-    /// connected state. The caller has already decided the signal is
-    /// below the roam threshold; this records the pre-scan state so a
-    /// scan that decides to stay put can restore the connection.
-    async fn trigger_roam_scan(&mut self) {
+    /// Start a roam scan from the connected state. With `full == false`
+    /// this is the *quick* path: an active scan restricted to
+    /// frequencies where the ESS has been seen (last scan results + BTM
+    /// neighbor-report entries), which completes in a fraction of the
+    /// time a full sweep takes. With `full == true` it is the
+    /// all-channel scan - the one-shot fallback when the quick scan
+    /// finds no candidate while the signal is still low. The caller has
+    /// already decided the signal is below the roam threshold; this
+    /// records the pre-scan state so a scan that decides to stay put can
+    /// restore the connection.
+    pub(crate) async fn trigger_roam_scan(&mut self, full: bool) {
         self.roam_scan = true;
+        self.roam_scan_full = full;
         // Remember the connected state so a roam scan that decides to
         // stay can restore it instead of leaving the state machine in
         // Scanning (which would re-authenticate the already-connected
         // AP and fail with -EALREADY).
-        self.pre_roam_state = Some(self.state);
+        // The fallback scan is triggered while the quick scan's results
+        // are being processed (state is still Scanning): keep the
+        // originally recorded pre-roam state instead of overwriting it.
+        if self.pre_roam_state.is_none() {
+            self.pre_roam_state = Some(self.state);
+        }
         if let Err(e) = self.send_out_scan_request().await {
-            log::warn!("roam scan trigger failed: {e}");
+            if !full {
+                log::warn!(
+                    "roam quick scan trigger failed: {e}; trying full scan"
+                );
+            } else {
+                log::warn!("roam scan trigger failed: {e}");
+            }
+            let prev = self.pre_roam_state.take();
             self.roam_scan = false;
-            self.pre_roam_state = None;
+            if let Some(prev) = prev {
+                self.state = prev;
+            }
+            if !full {
+                Box::pin(self.trigger_roam_scan(true)).await;
+            }
             return;
         }
         self.state = WifiState::Scanning;
@@ -507,6 +543,31 @@ impl WifiClient {
             btm.candidates.len(),
             btm.preferred_candidates
         );
+
+        // Cache the neighbor-report channels for future quick roam
+        // scans: the frequencies the AP itself considers part of the
+        // ESS are the best starting point for a signal-triggered roam.
+        for candidate in &btm.candidates {
+            if self.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
+                break;
+            }
+            let Some(freq) =
+                crate::ieee80211::band::operating_class_channel_to_freq(
+                    candidate.operating_class,
+                    candidate.channel,
+                )
+            else {
+                continue;
+            };
+            if !self.roam_freqs.contains(&freq) {
+                log::trace!(
+                    "BTM candidate {:02x?} adds freq {freq} MHz to roam \
+                     quick-scan set",
+                    candidate.bssid
+                );
+                self.roam_freqs.push(freq);
+            }
+        }
 
         let target = self.pick_btm_target(&btm);
         match target {
@@ -664,6 +725,7 @@ impl WifiClient {
         // Cooldown from the roam decision so equal-signal BSSes do not
         // ping-pong through repeated full reconnections.
         self.last_roam = Some(std::time::Instant::now());
+        self.roam_scan_full = false;
         if let Err(e) = crate::nl80211::connect::disconnect(
             &mut self.conn_handle,
             self.if_index,
@@ -1254,6 +1316,7 @@ impl WifiClient {
         self.bss_info = target.clone();
         self.ft_roam = None;
         self.last_roam = Some(std::time::Instant::now());
+        self.roam_scan_full = false;
         self.fourway = None;
         self.auth = None;
         self.scan_retry_interval = crate::client::RETRY_BACKOFF_INIT_SEC;

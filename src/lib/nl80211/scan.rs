@@ -11,10 +11,14 @@ use crate::WifiError;
 
 /// Trigger an active scan probing for `ssids` (all of them in one
 /// scan); `None` or an empty list performs a passive scan instead.
+/// `freqs` restricts the scan to the given channels - the fast path
+/// used by roaming, which only needs to re-check the frequencies where
+/// the ESS has already been seen instead of sweeping the whole band.
 pub async fn trigger_scan(
     handle: &Nl80211Handle,
     if_index: u32,
     ssids: Option<&[String]>,
+    freqs: Option<&[u32]>,
 ) -> Result<(), WifiError> {
     let mut builder = wl_nl80211::Nl80211Scan::new(if_index);
     match ssids {
@@ -22,6 +26,9 @@ pub async fn trigger_scan(
             builder = builder.ssids(ssids.to_vec());
         }
         _ => builder = builder.passive(true),
+    }
+    if let Some(freqs) = freqs {
+        builder = builder.scan_frequencies(freqs.to_vec());
     }
     let attrs = builder.build();
     let mut stream = handle.scan().trigger(attrs).execute().await;

@@ -186,6 +186,15 @@ pub struct WifiClient {
     /// Every BSS matching a configured network from the last scan (with
     /// the matched network) - the roam decision picks among these.
     pub(crate) last_scan_candidates: Vec<(BssInfo, NetworkConfig)>,
+    /// Frequencies where the connected ESS (or its BTM neighbor-report
+    /// entries) has been seen. The first roam scan of a signal-triggered
+    /// episode is restricted to these; only the fallback sweeps all
+    /// channels.
+    pub(crate) roam_freqs: Vec<u32>,
+    /// Whether the current roam episode has already started a full
+    /// all-channel scan (quick-scan-first is the normal path; the full
+    /// scan runs once per episode as the fallback).
+    pub(crate) roam_scan_full: bool,
     /// A 4-way Message 1 that arrived before the FT context could be
     /// built from the association response event (the two can race).
     pub(crate) pending_ft_msg1: Option<Vec<u8>>,
@@ -353,6 +362,8 @@ impl WifiClient {
             pre_roam_state: None,
             roam_target: None,
             last_scan_candidates: Vec::new(),
+            roam_freqs: Vec::new(),
+            roam_scan_full: false,
             pending_ft_msg1: None,
             last_roam: None,
             cqm_armed: false,
@@ -439,6 +450,12 @@ impl WifiClient {
                     // current BSS.
                     self.roam_scan = false;
                     self.process_roam_scan_results().await;
+                    // The roam scan fell back to a full scan and it is
+                    // already in flight: keep Scanning (and the recorded
+                    // pre-roam state) for the next iteration.
+                    if self.roam_scan {
+                        return Ok(());
+                    }
                     // When the roam scan stays on the current BSS (or
                     // failed to gather candidates), restore the connected
                     // state recorded before the scan. Otherwise the next
@@ -2438,6 +2455,8 @@ impl WifiClient {
         self.pre_roam_state = None;
         self.roam_target = None;
         self.last_scan_candidates.clear();
+        self.roam_freqs.clear();
+        self.roam_scan_full = false;
         self.pending_ft_msg1 = None;
         self.last_roam = None;
         self.sae_commit_sent = false;

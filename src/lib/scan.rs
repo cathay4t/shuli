@@ -240,12 +240,42 @@ impl WifiClient {
             .iter()
             .map(|network| network.ssid.clone())
             .collect();
-        if self.roam_scan {
-            log::trace!("scanning for SSIDs [{}]", ssids.join(", "));
+        // Roam scans start as *quick* scans restricted to frequencies
+        // where the ESS has already been seen (last scan results + BTM
+        // neighbor-report entries); only the full-scan fallback sweeps
+        // every channel. Non-roam scans always sweep everything.
+        let freqs = if self.roam_scan && !self.roam_scan_full {
+            let freqs = self.roam_freqs.clone();
+            if freqs.is_empty() { None } else { Some(freqs) }
         } else {
-            log::info!("scanning for SSIDs [{}]", ssids.join(", "));
+            None
+        };
+        match (&freqs, self.roam_scan) {
+            (Some(freqs), true) => log::trace!(
+                "roam quick scan for SSIDs [{}] on {} known frequencies [{}]",
+                ssids.join(", "),
+                freqs.len(),
+                freqs
+                    .iter()
+                    .map(|freq| freq.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            (None, true) => {
+                log::trace!("roam full scan for SSIDs [{}]", ssids.join(", "))
+            }
+            (None, false) => {
+                log::info!("scanning for SSIDs [{}]", ssids.join(", "))
+            }
+            (Some(_), false) => unreachable!("non-roam scans never restrict"),
         }
-        trigger_scan(&self.handle, self.if_index, Some(&ssids)).await
+        trigger_scan(
+            &self.handle,
+            self.if_index,
+            Some(&ssids),
+            freqs.as_deref(),
+        )
+        .await
     }
 
     // Wait for the kernel's `NL80211_CMD_NEW_SCAN_RESULTS` multicast event
@@ -449,6 +479,24 @@ impl WifiClient {
             }
         }
         let Some(target) = target else {
+            // Quick scan first, full scan only when the limited scan
+            // found nothing and the signal is still below the roam
+            // threshold (iwd escalates the same way in
+            // `station_roam_failed`). The full scan runs at most once
+            // per episode.
+            if !self.roam_scan_full
+                && self
+                    .roam_threshold()
+                    .is_some_and(|threshold| current_signal < threshold)
+            {
+                log::info!(
+                    "roam quick scan found no better BSS on {} known \
+                     frequencies; falling back to a full scan",
+                    self.roam_freqs.len()
+                );
+                self.trigger_roam_scan(true).await;
+                return;
+            }
             log::trace!("roam scan found no better BSS; staying");
             return;
         };
@@ -531,6 +579,23 @@ impl WifiClient {
         }
 
         self.last_scan_candidates = candidates;
+        // Keep the channels where the ESS has been seen so the next
+        // signal-triggered roam starts with a quick scan instead of a
+        // full multi-band sweep (iwd / wpa_supplicant bgscan=learn do
+        // the same). The current BSS frequency is included so a
+        // same-channel peer is probed too.
+        let mut freqs: Vec<u32> = self
+            .last_scan_candidates
+            .iter()
+            .map(|(bss, _)| bss.freq_mhz)
+            .collect();
+        freqs.push(self.bss_info.freq_mhz);
+        freqs.sort_unstable();
+        freqs.dedup();
+        self.roam_freqs = freqs
+            .into_iter()
+            .take(crate::roam::ROAM_QUICK_SCAN_MAX_FREQS)
+            .collect();
         Ok(())
     }
 }
@@ -732,7 +797,7 @@ pub async fn scan_wifi_with_ies(
 
     let if_index = resolve_if_index(&handle, iface_name).await?;
 
-    trigger_scan(&handle, if_index, None).await?;
+    trigger_scan(&handle, if_index, None, None).await?;
     tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS)).await;
 
     let bss_list = get_scan_results(&handle, if_index).await?;
