@@ -2383,6 +2383,13 @@ impl WifiClient {
         &self.network.ssid
     }
 
+    /// BSSID of the BSS the client is currently working toward.
+    /// Before the first scan selects a BSS this is all-zero; after a
+    /// successful scan it is the selected BSS's BSSID.
+    pub fn current_bssid(&self) -> [u8; ETH_ALEN] {
+        self.bss_info.bssid
+    }
+
     /// Replace the configured network list at runtime, reusing the same
     /// client (nl80211 socket, wiphy capability probes and PMKSA cache).
     ///
