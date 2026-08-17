@@ -58,6 +58,11 @@ pub(crate) struct WifiEntry {
     pub ssid: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Hidden SSID: probe for this network with an SSID-specific probe
+    /// request (wpa_supplicant's `scan_ssid=1`). Visible networks
+    /// (default) are found by the wildcard probe every scan carries.
+    #[serde(default)]
+    pub hidden: bool,
     /// Signal-triggered roaming while connected to this SSID: `false`
     /// disables it (BTM / 802.11v Requests are still honoured).
     /// Defaults to `true`.
@@ -206,6 +211,7 @@ impl ShuliConfig {
             if let Some(password) = entry.password.as_deref() {
                 network.set_password(password);
             }
+            network.hidden = entry.hidden;
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
             network.switch_ssid_lower_than_dbm =
@@ -336,6 +342,27 @@ wifis:
         );
         let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(wifi.networks[0].wowlan);
+    }
+
+    #[test]
+    fn hidden_defaults_to_false_and_maps_true() {
+        let config = parse(MINIMAL_YAML);
+        assert!(!config.wifis[0].hidden);
+
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(!wifi.networks[0].hidden);
+
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    hidden: true
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(wifi.networks[0].hidden);
     }
 
     #[test]

@@ -106,6 +106,12 @@ pub struct NetworkConfig {
     /// suspend. Defaults to `false` - opt in per network (matches
     /// wpa_supplicant, where `wowlan_triggers` is unset by default).
     pub wowlan: bool,
+    /// Hidden network: the AP does not include its SSID in beacons and
+    /// only answers directed probe requests that carry its name. Mark
+    /// this `true` to probe for the SSID with a specific probe request
+    /// (wpa_supplicant's `scan_ssid=1`). Visible networks (the default)
+    /// are found by the wildcard SSID entry that every scan carries.
+    pub hidden: bool,
     /// EAP credentials for 802.1X networks (WPA-Enterprise / wired
     /// 802.1X). `None` for PSK/SAE/open networks.
     pub eap: Option<EapConfig>,
@@ -138,6 +144,7 @@ impl NetworkConfig {
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
             switch_ssid_lower_than_dbm: DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
             wowlan: false,
+            hidden: false,
             eap: None,
             sae_pwe: SaePwe::Auto,
             sae_password_id: None,
@@ -156,6 +163,13 @@ impl NetworkConfig {
     /// `Disconnect` / `GtkRekeyFailure` triggers while connected.
     pub fn set_wowlan(&mut self, enabled: bool) -> &mut Self {
         self.wowlan = enabled;
+        self
+    }
+
+    /// Mark this network hidden so shuli probes for it with an
+    /// SSID-specific probe request (like wpa_supplicant's `scan_ssid=1`).
+    pub fn set_hidden(&mut self, hidden: bool) -> &mut Self {
+        self.hidden = hidden;
         self
     }
 
@@ -240,9 +254,19 @@ impl WifiConfig {
         self
     }
 
-    /// All configured SSIDs (for probe requests, PNO match sets, and
-    /// logging).
+    /// All configured SSIDs (for PNO match sets and logging; probe
+    /// requests use [`Self::hidden_ssids`] plus a wildcard entry).
     pub fn ssids(&self) -> impl Iterator<Item = &str> {
         self.networks.iter().map(|network| network.ssid.as_str())
+    }
+
+    /// SSIDs of hidden networks, probed with directed probe requests.
+    /// Visible networks are discovered by the wildcard scan entry that
+    /// every scan carries (wpa_supplicant behaviour).
+    pub fn hidden_ssids(&self) -> impl Iterator<Item = &str> {
+        self.networks
+            .iter()
+            .filter(|network| network.hidden)
+            .map(|network| network.ssid.as_str())
     }
 }

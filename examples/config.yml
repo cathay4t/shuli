@@ -53,6 +53,7 @@ wifis:
       gateway: 2001:db8:1::254
   - ssid: Test-WIFI-OPEN
     interface: any
+    # hidden: true  # AP does not broadcast its SSID; probe by name
     ipv4:
       auto: true
     ipv6:

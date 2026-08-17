@@ -43,7 +43,7 @@ use crate::{
         PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
         PmksaEntry, entry_with_fresh_lifetime,
     },
-    scan::{BssInfo, SecurityType},
+    scan::{BssInfo, SecurityType, format_ssids},
 };
 
 type Nl80211EventMsg = NetlinkMessage<genetlink::message::RawGenlMessage>;
@@ -64,6 +64,9 @@ const RETRY_BACKOFF_MAX_SEC: u64 = 300;
 /// while the host sleeps; shuli only wakes on
 /// `NL80211_CMD_SCHED_SCAN_RESULTS`.
 const SCHED_SCAN_INTERVAL_SEC: u32 = 10;
+/// Cap on specific-SSID probes in one scheduled-scan request, matching
+/// wpa_supplicant's `WPAS_MAX_SCAN_SSIDS` (16).
+const MAX_SCHED_SCAN_SSIDS: usize = 16;
 /// Watchdog (seconds) for [`WifiState::SchedScanWait`]: with an SSID
 /// match set the firmware only reports on a match, so an absent AP
 /// produces no results events at all. If none arrives this long, the
@@ -71,6 +74,9 @@ const SCHED_SCAN_INTERVAL_SEC: u32 = 10;
 /// silently stopped). Longer than the firmware's scan interval, so a
 /// match (present AP) always wakes us first.
 const SCHED_SCAN_WATCHDOG_SECS: u64 = 60;
+/// How long to wait for our own `SCHED_SCAN_STOPPED` echo while
+/// rotating a PNO chunk before force-starting the next chunk.
+const SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS: u64 = 5;
 /// Backoff (seconds) after a fatal authentication failure (wrong
 /// password, unknown SAE password identifier, SAE-PK required, ...):
 /// retrying is futile, but the wait must stay short enough that the
@@ -149,6 +155,42 @@ pub(crate) struct WifiIface {
     /// [`WifiState::SchedScanWait`] tell our own echo from a genuine
     /// firmware abort.
     pub(crate) sched_scan_stop_pending: bool,
+    /// Maximum number of SSIDs the wiphy accepts in one scheduled-scan
+    /// request (`NL80211_ATTR_MAX_NUM_SCHED_SCAN_SSIDS`).
+    pub(crate) max_sched_scan_ssids: usize,
+    /// Maximum number of match sets the wiphy accepts in one scheduled
+    /// scan (`NL80211_ATTR_MAX_MATCH_SETS`); 0 means no filtering.
+    pub(crate) max_match_sets: usize,
+    /// Index of the next hidden SSID for the next PNO chunk
+    /// (wpa_supplicant's `prev_sched_ssid`).
+    pub(crate) sched_scan_cursor: usize,
+    /// Whether the current PNO chunk did not cover every hidden SSID,
+    /// so it must be rotated to the next chunk after
+    /// `sched_scan_timeout_secs`.
+    pub(crate) sched_scan_more: bool,
+    /// A stop in flight was requested to rotate to the next PNO chunk.
+    pub(crate) sched_scan_rotate: bool,
+    /// Current PNO plan interval; doubles as chunks rotate and resets
+    /// with the timeout (wpa_supplicant behaviour).
+    pub(crate) sched_scan_interval_sec: u32,
+    /// How long (seconds) the current PNO chunk runs before rotating.
+    pub(crate) sched_scan_timeout_secs: u64,
+    /// Whether the next PNO start begins a fresh rotation cycle (and
+    /// resets interval/timeout).
+    pub(crate) sched_scan_first: bool,
+    /// Maximum number of SSIDs the wiphy accepts in one scan request
+    /// (`NL80211_ATTR_MAX_NUM_SCAN_SSIDS`). Hidden SSIDs are rotated
+    /// through this cap with a wildcard entry reserved, exactly like
+    /// wpa_supplicant.
+    pub(crate) max_scan_ssids: usize,
+    /// Index of the next hidden SSID to probe (wpa_supplicant-style
+    /// rotation across scans).
+    pub(crate) scan_ssid_cursor: usize,
+    /// Drivers accepting only one SSID per scan get wildcard and
+    /// specific-SSID scans interleaved (wpa_supplicant's
+    /// `prev_scan_wildcard`); true when the next round should be the
+    /// wildcard probe.
+    pub(crate) scan_wildcard_next: bool,
     pub(crate) if_index: u32,
     pub(crate) mac: [u8; ETH_ALEN],
     pub(crate) config: WifiConfig,
@@ -614,26 +656,55 @@ impl WifiIface {
             if_index
         );
 
-        // Detect hardware scheduled scan (PNO) support once: when
-        // available, the firmware keeps scanning while the host sleeps.
-        let sched_scan_supported =
-            match wiphy_supports_sched_scan(&handle, wiphy_idx).await {
-                Ok(true) => {
-                    log::info!(
-                        "wiphy {wiphy_idx} supports scheduled scan (PNO)"
-                    );
-                    true
-                }
-                Ok(false) => {
-                    log::info!(
-                        "wiphy {wiphy_idx} has no scheduled scan support; \
-                         using host-side scan backoff"
-                    );
-                    false
+        // Detect hardware scheduled scan (PNO) support and its caps
+        // once: when available, the firmware keeps scanning while the
+        // host sleeps. The caps bound each PNO chunk, which shuli
+        // rotates through like wpa_supplicant.
+        let (sched_scan_supported, max_sched_scan_ssids, max_match_sets) =
+            match wiphy_sched_scan_caps(&handle, wiphy_idx).await {
+                Ok(caps) => {
+                    if caps.supported {
+                        log::info!(
+                            "wiphy {wiphy_idx} supports scheduled scan (PNO): \
+                             max_ssids={}, max_match_sets={}",
+                            caps.max_ssids,
+                            caps.max_match_sets
+                        );
+                    } else {
+                        log::info!(
+                            "wiphy {wiphy_idx} has no scheduled scan support; \
+                             using host-side scan backoff"
+                        );
+                    }
+                    (caps.supported, caps.max_ssids, caps.max_match_sets)
                 }
                 Err(e) => {
                     log::debug!("could not query sched scan support: {e}");
-                    false
+                    (false, 0, 0)
+                }
+            };
+
+        // Query the per-scan SSID cap once. Hidden networks are rotated
+        // through it (wpa_supplicant reserves one slot for the wildcard
+        // entry); when the kernel advertises no cap, fall back to
+        // wildcard-only scans so a request can never be rejected for
+        // asking the driver to probe too many SSIDs.
+        let max_scan_ssids =
+            match wiphy_max_scan_ssids(&handle, wiphy_idx).await {
+                Ok(n) if n > 0 => n as usize,
+                Ok(_) => {
+                    log::debug!(
+                        "wiphy {wiphy_idx} advertises no per-scan SSID cap; \
+                         using wildcard-only scans"
+                    );
+                    1
+                }
+                Err(e) => {
+                    log::debug!(
+                        "could not query max scan SSIDs: {e}; using \
+                         wildcard-only scans"
+                    );
+                    1
                 }
             };
 
@@ -696,6 +767,17 @@ impl WifiIface {
             sched_scan_supported,
             sched_scan_active: false,
             sched_scan_stop_pending: false,
+            max_sched_scan_ssids,
+            max_match_sets,
+            sched_scan_cursor: 0,
+            sched_scan_more: false,
+            sched_scan_rotate: false,
+            sched_scan_interval_sec: SCHED_SCAN_INTERVAL_SEC,
+            sched_scan_timeout_secs: SCHED_SCAN_WATCHDOG_SECS,
+            sched_scan_first: true,
+            max_scan_ssids,
+            scan_ssid_cursor: 0,
+            scan_wildcard_next: true,
             wowlan_supported_triggers,
             wowlan_armed: false,
             if_index,
@@ -833,16 +915,26 @@ impl WifiIface {
                     // SSID not found: hand the periodic scanning over to
                     // the firmware (PNO) when supported, otherwise fall
                     // back to host-side scans with exponential backoff.
-                    if e.kind == ErrorKind::SsidNotFound
-                        && self.start_sched_scan().await?
-                    {
-                        log::info!(
-                            "no configured SSID ([{}]) found; entering \
-                             scheduled scan mode",
-                            self.config.ssids().collect::<Vec<_>>().join(", ")
-                        );
-                        self.state = WifiState::SchedScanWait;
-                        return Ok(());
+                    if e.kind == ErrorKind::SsidNotFound {
+                        // A fresh PNO session starts from the first
+                        // hidden SSID with reset rotation timing
+                        // (wpa_supplicant resets `prev_sched_ssid`).
+                        self.sched_scan_cursor = 0;
+                        self.sched_scan_more = false;
+                        self.sched_scan_rotate = false;
+                        self.sched_scan_first = true;
+                        if self.start_sched_scan().await? {
+                            log::info!(
+                                "no configured SSID ([{}]) found; entering \
+                                 scheduled scan mode",
+                                self.config
+                                    .ssids()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            self.state = WifiState::SchedScanWait;
+                            return Ok(());
+                        }
                     }
                     return Err(e);
                 }
@@ -854,9 +946,19 @@ impl WifiIface {
             WifiState::SchedScanWait => {
                 // The firmware scans on the configured interval while the
                 // host sleeps here; only sched-scan events wake us. The
-                // watchdog catches a firmware that silently stopped.
+                // watchdog catches a firmware that silently stopped, and
+                // a shorter chunk timeout rotates to the next SSID chunk
+                // when more hidden SSIDs are configured than fit in one
+                // PNO request (wpa_supplicant behaviour).
+                let wait_secs = if self.sched_scan_stop_pending {
+                    SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS
+                } else if self.sched_scan_more {
+                    self.sched_scan_timeout_secs
+                } else {
+                    SCHED_SCAN_WATCHDOG_SECS
+                };
                 let timed = tokio::time::timeout(
-                    std::time::Duration::from_secs(SCHED_SCAN_WATCHDOG_SECS),
+                    std::time::Duration::from_secs(wait_secs),
                     self.event_receiver.next(),
                 )
                 .await;
@@ -876,11 +978,19 @@ impl WifiIface {
                                 } => {
                                     if self.sched_scan_stop_pending {
                                         // Echo of our own stop request
-                                        // (e.g. the watchdog fallback
-                                        // stopped the scan); the firmware
-                                        // scan is already gone, so just
-                                        // keep waiting for a match.
+                                        // (rotation or watchdog fallback);
+                                        // the firmware scan is gone.
                                         self.sched_scan_stop_pending = false;
+                                        if self.sched_scan_rotate {
+                                            self.sched_scan_rotate = false;
+                                            log::info!(
+                                                "rotating scheduled scan to \
+                                                 the next SSID chunk"
+                                            );
+                                            if !self.start_sched_scan().await? {
+                                                self.state = WifiState::Failed;
+                                            }
+                                        }
                                     } else {
                                         // The kernel/firmware aborted the
                                         // scan on its own (e.g. regulatory
@@ -907,12 +1017,38 @@ impl WifiIface {
                         ));
                     }
                     Err(_) => {
-                        log::warn!(
-                            "no scheduled scan results for {}s; falling back \
-                             to host scans",
-                            SCHED_SCAN_WATCHDOG_SECS
-                        );
-                        self.state = WifiState::Failed;
+                        if self.sched_scan_stop_pending {
+                            // The stop echo was lost; force the rotation
+                            // (or restart) that was in flight.
+                            self.sched_scan_stop_pending = false;
+                            if self.sched_scan_rotate {
+                                self.sched_scan_rotate = false;
+                                log::info!(
+                                    "scheduled scan stop echo lost; rotating \
+                                     to the next SSID chunk"
+                                );
+                                if !self.start_sched_scan().await? {
+                                    self.state = WifiState::Failed;
+                                }
+                            }
+                        } else if self.sched_scan_more {
+                            // This chunk ran long enough: stop it and let
+                            // the STOPPED echo start the next chunk.
+                            log::info!(
+                                "scheduled scan chunk timed out after {}s; \
+                                 rotating to the next SSID chunk",
+                                self.sched_scan_timeout_secs
+                            );
+                            self.sched_scan_rotate = true;
+                            self.stop_sched_scan().await?;
+                        } else {
+                            log::warn!(
+                                "no scheduled scan results for {}s; falling \
+                                 back to host scans",
+                                SCHED_SCAN_WATCHDOG_SECS
+                            );
+                            self.state = WifiState::Failed;
+                        }
                     }
                 }
             }
@@ -1127,24 +1263,59 @@ impl WifiIface {
     }
 
     /// Hand the periodic scanning over to the firmware (PNO): ask it to
-    /// scan for the configured SSID on a fixed interval while the host
-    /// sleeps. Returns true when a scheduled scan is now running.
+    /// scan for a chunk of the configured SSIDs on a fixed interval
+    /// while the host sleeps. Like wpa_supplicant, the chunk reserves
+    /// one slot for the wildcard probe when visible networks exist and
+    /// rotates through hidden SSIDs within the driver's
+    /// `max_sched_scan_ssids` cap. Returns true when a scheduled scan
+    /// is now running.
     async fn start_sched_scan(&mut self) -> Result<bool, WifiError> {
         if !self.sched_scan_supported {
             return Ok(false);
         }
-        let ssids: Vec<String> = self
-            .config
-            .networks
-            .iter()
-            .map(|network| network.ssid.clone())
-            .collect();
-        let attrs = vec![
-            Nl80211Attr::IfIndex(self.if_index),
-            // Active probe for the configured SSIDs...
-            Nl80211Attr::ScanSsids(ssids.clone()),
-            // ...and only wake us when one of them shows up.
-            Nl80211Attr::SchedScanMatch(
+        let cap = self.max_sched_scan_ssids.min(MAX_SCHED_SCAN_SSIDS);
+        if cap == 0 {
+            return Ok(false);
+        }
+
+        let hidden_ssids: Vec<String> =
+            self.config.hidden_ssids().map(str::to_string).collect();
+        let wildcard = self.config.networks.iter().any(|n| !n.hidden);
+        let specific_cap = cap - if wildcard { 1 } else { 0 };
+        if !hidden_ssids.is_empty() && specific_cap == 0 {
+            // A one-SSID PNO driver cannot probe hidden networks while
+            // reserving the wildcard slot; fall back to host scans.
+            log::debug!(
+                "sched scan cap {cap} leaves no slot for hidden SSIDs; using \
+                 host scan backoff"
+            );
+            return Ok(false);
+        }
+
+        // Fresh rotation cycle: reset interval and chunk timeout
+        // (wpa_supplicant starts with `max_sched_scan_ssids * 2`).
+        if self.sched_scan_first {
+            self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
+            self.sched_scan_timeout_secs = (cap as u64) * 2;
+            self.sched_scan_first = false;
+        }
+
+        let (ssids, more) = next_sched_scan_ssids(
+            &hidden_ssids,
+            wildcard,
+            &mut self.sched_scan_cursor,
+            cap,
+        );
+        self.sched_scan_more = more;
+
+        // Match sets wake the host only for configured SSIDs; when more
+        // are configured than the driver can filter, drop the filter
+        // entirely (wpa_supplicant does the same) so every scan result
+        // is reported instead of silently missing networks.
+        let match_sets = if self.max_match_sets > 0
+            && self.config.networks.len() <= self.max_match_sets
+        {
+            Some(
                 self.config
                     .networks
                     .iter()
@@ -1156,14 +1327,29 @@ impl WifiIface {
                         ])
                     })
                     .collect(),
-            ),
+            )
+        } else {
+            None
+        };
+
+        let mut attrs = vec![
+            Nl80211Attr::IfIndex(self.if_index),
+            // Active probe for this chunk's hidden SSIDs plus the
+            // wildcard entry for visible networks...
+            Nl80211Attr::ScanSsids(ssids.clone()),
             Nl80211Attr::SchedScanPlans(vec![Nl80211SchedScanPlan(vec![
-                Nl80211SchedScanPlanAttr::Interval(SCHED_SCAN_INTERVAL_SEC),
+                Nl80211SchedScanPlanAttr::Interval(
+                    self.sched_scan_interval_sec,
+                ),
             ])]),
             // Tie the scan to this socket so the kernel stops it if shuli
             // dies without a chance to clean up.
             Nl80211Attr::SocketOwner,
         ];
+        if let Some(match_sets) = match_sets {
+            attrs.insert(2, Nl80211Attr::SchedScanMatch(match_sets));
+        }
+
         // Drive the request manually so a permanent "not supported"
         // (-EOPNOTSUPP) can be told apart from transient failures; the
         // errno is lost once the error is converted into `WifiError`.
@@ -1180,10 +1366,34 @@ impl WifiIface {
             Ok(()) => {
                 self.sched_scan_active = true;
                 log::info!(
-                    "scheduled scan started: ssids=[{}], interval={}s",
-                    ssids.join(", "),
-                    SCHED_SCAN_INTERVAL_SEC
+                    "scheduled scan started: ssids=[{}], interval={}s, \
+                     chunk_timeout={}s{}",
+                    format_ssids(&ssids),
+                    self.sched_scan_interval_sec,
+                    self.sched_scan_timeout_secs,
+                    if more { ", more SSIDs pending" } else { "" }
                 );
+                if more {
+                    // Throttle the rotation like wpa_supplicant: each
+                    // subsequent chunk runs for a shorter timeout with a
+                    // longer scan interval, resetting when the interval
+                    // grows too large.
+                    self.sched_scan_timeout_secs =
+                        (self.sched_scan_timeout_secs / 2).max(2);
+                    self.sched_scan_interval_sec =
+                        (self.sched_scan_interval_sec * 2)
+                            .min(RETRY_BACKOFF_MAX_SEC as u32);
+                    if self.sched_scan_timeout_secs
+                        < self.sched_scan_interval_sec as u64
+                    {
+                        self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
+                        self.sched_scan_timeout_secs = (cap as u64) * 2;
+                    }
+                } else {
+                    // Full coverage in one chunk: the next start begins a
+                    // fresh cycle with reset timing.
+                    self.sched_scan_first = true;
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -1240,6 +1450,7 @@ impl WifiIface {
         match self.process_scan_results().await {
             Ok(()) => {
                 // SSID found - stop the firmware scan and connect.
+                self.sched_scan_rotate = false;
                 self.stop_sched_scan().await?;
                 self.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.send_out_auth_request().await?;
@@ -2772,6 +2983,14 @@ impl WifiIface {
 
         if connected && connected_network_kept {
             self.config.networks = networks;
+            self.scan_ssid_cursor = 0;
+            self.scan_wildcard_next = true;
+            self.sched_scan_cursor = 0;
+            self.sched_scan_more = false;
+            self.sched_scan_rotate = false;
+            self.sched_scan_first = true;
+            self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
+            self.sched_scan_timeout_secs = SCHED_SCAN_WATCHDOG_SECS;
             log::info!(
                 "network list updated, keeping connection to {old_ssid}: [{}]",
                 self.config.ssids().collect::<Vec<_>>().join(", ")
@@ -2780,6 +2999,14 @@ impl WifiIface {
         }
 
         self.config.networks = networks;
+        self.scan_ssid_cursor = 0;
+        self.scan_wildcard_next = true;
+        self.sched_scan_cursor = 0;
+        self.sched_scan_more = false;
+        self.sched_scan_rotate = false;
+        self.sched_scan_first = true;
+        self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
+        self.sched_scan_timeout_secs = SCHED_SCAN_WATCHDOG_SECS;
 
         if connected {
             log::info!(
@@ -3391,7 +3618,7 @@ where
     Ok(())
 }
 
-async fn get_if_index_and_mac(
+pub(crate) async fn get_if_index_and_mac(
     handle: &Nl80211Handle,
     ifname: &str,
 ) -> Result<(u32, [u8; ETH_ALEN], u32), WifiError> {
@@ -3450,14 +3677,85 @@ fn is_eopnotsupp(e: &wl_nl80211::Nl80211Error) -> bool {
     )
 }
 
-/// Whether the wiphy owning `wiphy_idx` advertises hardware scheduled
-/// scan (PNO) support. The kernel omits
+/// Build one PNO chunk the way wpa_supplicant does: reserve one slot
+/// for the wildcard probe when visible networks are configured, then
+/// take a contiguous slice of the rotating hidden SSID list within
+/// `cap`. Returns `(ssids, more)` where `more` is true when hidden
+/// SSIDs remain for a later chunk.
+fn next_sched_scan_ssids(
+    hidden_ssids: &[String],
+    wildcard: bool,
+    cursor: &mut usize,
+    cap: usize,
+) -> (Vec<String>, bool) {
+    let cap = cap.clamp(1, MAX_SCHED_SCAN_SSIDS);
+    let specific_cap = cap - if wildcard { 1 } else { 0 };
+    let mut ssids = Vec::new();
+    if wildcard {
+        ssids.push(String::new());
+    }
+    let mut idx = (*cursor).min(hidden_ssids.len());
+    let mut added = 0usize;
+    while idx < hidden_ssids.len() && added < specific_cap {
+        ssids.push(hidden_ssids[idx].clone());
+        idx += 1;
+        added += 1;
+    }
+    let more = idx < hidden_ssids.len();
+    *cursor = if more { idx } else { 0 };
+    (ssids, more)
+}
+
+/// Hardware scheduled scan (PNO) capabilities of the wiphy owning
+/// `wiphy_idx`. The kernel omits
 /// `NL80211_ATTR_MAX_NUM_SCHED_SCAN_SSIDS` for drivers without a
-/// `sched_scan_start` op, so its presence means the feature is available.
-async fn wiphy_supports_sched_scan(
+/// `sched_scan_start` op, so its presence means the feature is
+/// available.
+pub(crate) struct WiphySchedScanCaps {
+    pub(crate) supported: bool,
+    pub(crate) max_ssids: usize,
+    pub(crate) max_match_sets: usize,
+}
+
+pub(crate) async fn wiphy_sched_scan_caps(
     handle: &Nl80211Handle,
     wiphy_idx: u32,
-) -> Result<bool, WifiError> {
+) -> Result<WiphySchedScanCaps, WifiError> {
+    let mut dump = handle.wireless_physic().get().execute().await;
+    while let Some(msg) = dump.try_next().await? {
+        let mut idx = None;
+        let mut max_ssids = 0u8;
+        let mut max_match_sets = 0u8;
+        for attr in &msg.payload.attributes {
+            match attr {
+                Nl80211Attr::Wiphy(i) => idx = Some(*i),
+                Nl80211Attr::MaxNumSchedScanSsids(n) => max_ssids = *n,
+                Nl80211Attr::MaxMatchSets(n) => max_match_sets = *n,
+                _ => {}
+            }
+        }
+        if idx == Some(wiphy_idx) {
+            return Ok(WiphySchedScanCaps {
+                supported: max_ssids > 0,
+                max_ssids: max_ssids as usize,
+                max_match_sets: max_match_sets as usize,
+            });
+        }
+    }
+    Ok(WiphySchedScanCaps {
+        supported: false,
+        max_ssids: 0,
+        max_match_sets: 0,
+    })
+}
+
+/// The maximum number of SSIDs the wiphy accepts in one scan request
+/// (`NL80211_ATTR_MAX_NUM_SCAN_SSIDS`). Returns 0 when the kernel did
+/// not advertise the attribute.
+pub(crate) async fn wiphy_max_scan_ssids(
+    handle: &Nl80211Handle,
+    wiphy_idx: u32,
+) -> Result<u8, WifiError> {
     let mut dump = handle.wireless_physic().get().execute().await;
     while let Some(msg) = dump.try_next().await? {
         let mut idx = None;
@@ -3465,15 +3763,15 @@ async fn wiphy_supports_sched_scan(
         for attr in &msg.payload.attributes {
             match attr {
                 Nl80211Attr::Wiphy(i) => idx = Some(*i),
-                Nl80211Attr::MaxNumSchedScanSsids(n) => max_ssids = *n,
+                Nl80211Attr::MaxNumScanSsids(n) => max_ssids = *n,
                 _ => {}
             }
         }
         if idx == Some(wiphy_idx) {
-            return Ok(max_ssids > 0);
+            return Ok(max_ssids);
         }
     }
-    Ok(false)
+    Ok(0)
 }
 
 /// the WoWLAN triggers the wiphy owning `wiphy_idx` advertises via
@@ -3510,8 +3808,9 @@ mod tests {
     };
 
     use super::{
-        desired_wowlan_triggers, fmt_transition_disable,
-        is_fatal_disconnect_reason, wowlan_wakeup_requires_reconnect,
+        MAX_SCHED_SCAN_SSIDS, desired_wowlan_triggers, fmt_transition_disable,
+        is_fatal_disconnect_reason, next_sched_scan_ssids,
+        wowlan_wakeup_requires_reconnect,
     };
 
     /// reasons 2 (PREV_AUTH_NOT_VALID) and 23
@@ -3600,5 +3899,55 @@ mod tests {
         let s = fmt_transition_disable(0x0F);
         assert_eq!(s, "WPA3-Personal, SAE-PK, WPA3-Enterprise, Enhanced Open");
         assert_eq!(fmt_transition_disable(0), "none");
+    }
+
+    #[test]
+    fn sched_scan_chunk_reserves_wildcard_and_rotates() {
+        let hidden: Vec<String> =
+            ["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect();
+        let mut cursor = 0;
+        let (round, more) =
+            next_sched_scan_ssids(&hidden, true, &mut cursor, 4);
+        assert_eq!(round, vec!["", "A", "B", "C"]);
+        assert!(more);
+        assert_eq!(cursor, 3);
+
+        let (round, more) =
+            next_sched_scan_ssids(&hidden, true, &mut cursor, 4);
+        assert_eq!(round, vec!["", "D"]);
+        assert!(!more);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn sched_scan_chunk_fits_all_hidden_ssids() {
+        let hidden: Vec<String> =
+            ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let mut cursor = 0;
+        let (round, more) =
+            next_sched_scan_ssids(&hidden, false, &mut cursor, 4);
+        assert_eq!(round, vec!["A", "B"]);
+        assert!(!more);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn sched_scan_chunk_caps_at_wpa_supplicant_max() {
+        let hidden: Vec<String> = (0..20).map(|i| format!("S{i:02}")).collect();
+        let mut cursor = 0;
+        let (round, more) =
+            next_sched_scan_ssids(&hidden, true, &mut cursor, 255);
+        assert_eq!(round.len(), MAX_SCHED_SCAN_SSIDS);
+        assert_eq!(round[0], "");
+        assert_eq!(round[1], "S00");
+        assert_eq!(round[15], "S14");
+        assert!(more);
+        assert_eq!(cursor, 15);
+
+        let (round, more) =
+            next_sched_scan_ssids(&hidden, true, &mut cursor, 255);
+        assert_eq!(round, vec!["", "S15", "S16", "S17", "S18", "S19"]);
+        assert!(!more);
+        assert_eq!(cursor, 0);
     }
 }

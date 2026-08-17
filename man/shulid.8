@@ -57,6 +57,11 @@ Network name to scan for and connect to (required).
 Passphrase for WPA2-Personal / WPA3-Personal networks.
 Omit for open networks.
 .TP
+.B hidden
+\fBtrue\fR when the AP does not broadcast its SSID and only answers
+probe requests that carry the network name; shuli then probes for this
+SSID by name (default \fBfalse\fR).
+.TP
 .B interface
 Interface to bind to; \fBany\fR (or omitted) picks the first
 WiFi NIC.  Entries sharing an interface share one connection

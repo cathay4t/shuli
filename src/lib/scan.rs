@@ -3,13 +3,14 @@
 //! Scan flow: trigger a scan, wait for results, then pick the strongest BSS
 //! matching the configured SSID.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface,
+    client::{get_if_index_and_mac, wiphy_max_scan_ssids},
     nl80211::scan::{
         extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
         extract_ssid_from_ies, get_scan_results, trigger_scan,
@@ -17,6 +18,10 @@ use crate::{
 };
 
 const SCAN_SLEEP_SECS: u64 = 3;
+/// Cap on specific-SSID probes in one scan request, matching
+/// wpa_supplicant's `WPAS_MAX_SCAN_SSIDS` (16): shuli never asks a
+/// driver for more hidden SSIDs than the reference implementation would.
+const MAX_SCAN_SSIDS: usize = 16;
 /// Bounds how long [`WifiIface::wait_scan_finish`] waits for the
 /// `NL80211_CMD_NEW_SCAN_RESULTS` completion event before giving up and
 /// dumping the scan results anyway.  Generous on purpose: the event is the
@@ -234,12 +239,18 @@ impl WifiIface {
     pub(crate) async fn send_out_scan_request(
         &mut self,
     ) -> Result<(), WifiError> {
-        let ssids: Vec<String> = self
-            .config
-            .networks
-            .iter()
-            .map(|network| network.ssid.clone())
-            .collect();
+        // Like wpa_supplicant: probe hidden SSIDs within the driver's
+        // per-scan cap and always keep one wildcard entry, so every scan
+        // also finds all visible networks. The hidden list rotates across
+        // scans when it does not fit in one request.
+        let hidden_ssids: Vec<String> =
+            self.config.hidden_ssids().map(str::to_string).collect();
+        let ssids = next_scan_ssids(
+            &hidden_ssids,
+            &mut self.scan_ssid_cursor,
+            &mut self.scan_wildcard_next,
+            self.max_scan_ssids,
+        );
         // Roam scans start as *quick* scans restricted to frequencies
         // where the ESS has already been seen (last scan results + BTM
         // neighbor-report entries); only the full-scan fallback sweeps
@@ -258,7 +269,7 @@ impl WifiIface {
         match (&freqs, self.roam_scan) {
             (Some(freqs), true) => log::trace!(
                 "roam quick scan for SSIDs [{}] on {} known frequencies [{}]",
-                ssids.join(", "),
+                format_ssids(&ssids),
                 freqs.len(),
                 freqs
                     .iter()
@@ -267,10 +278,13 @@ impl WifiIface {
                     .join(" ")
             ),
             (None, true) => {
-                log::trace!("roam full scan for SSIDs [{}]", ssids.join(", "))
+                log::trace!(
+                    "roam full scan for SSIDs [{}]",
+                    format_ssids(&ssids)
+                )
             }
             (None, false) => {
-                log::info!("scanning for SSIDs [{}]", ssids.join(", "))
+                log::info!("scanning for SSIDs [{}]", format_ssids(&ssids))
             }
             (Some(_), false) => unreachable!("non-roam scans never restrict"),
         }
@@ -798,18 +812,65 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
 
 /// Standalone scan: create a nl80211 handle, trigger a scan on the
 /// given interface, wait, and return all discovered BSSes with their
-/// raw IE buffers (for generation detection by the caller).
+/// raw IE buffers (for generation detection by the caller). Hidden
+/// SSIDs are probed by name (wpa_supplicant's `scan_ssid=1`); every
+/// scan also carries a wildcard entry so visible networks are found
+/// too, and the hidden list is chunked when the driver's per-scan SSID
+/// cap is smaller than the list.
 pub async fn scan_wifi_with_ies(
     iface_name: &str,
+    hidden_ssids: Vec<String>,
 ) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
     let (conn, handle, _) = wl_nl80211::new_connection()
         .map_err(|e| WifiError::new(ErrorKind::Nl80211, e.to_string()))?;
     tokio::spawn(conn);
 
-    let if_index = resolve_if_index(&handle, iface_name).await?;
+    let (if_index, _, wiphy_idx) =
+        get_if_index_and_mac(&handle, iface_name).await?;
+    let max_ssids = wiphy_max_scan_ssids(&handle, wiphy_idx).await? as usize;
 
-    trigger_scan(&handle, if_index, None, None).await?;
-    tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS)).await;
+    if max_ssids.clamp(1, MAX_SCAN_SSIDS) == 1 {
+        // One-SSID drivers cannot carry wildcard and specific SSIDs in
+        // the same request: probe the wildcard once for visible networks,
+        // then each hidden SSID by itself.
+        trigger_scan(&handle, if_index, Some(&[String::new()]), None).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
+            .await;
+        for hidden in &hidden_ssids {
+            trigger_scan(
+                &handle,
+                if_index,
+                Some(std::slice::from_ref(hidden)),
+                None,
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
+                .await;
+        }
+    } else {
+        // Rotate through the hidden list in chunks of max_ssids - 1,
+        // keeping a wildcard entry in every request, until all hidden
+        // SSIDs have been probed.
+        let mut cursor = 0usize;
+        let mut wildcard_next = true;
+        let max_rounds = hidden_ssids.len().saturating_add(1);
+        let mut rounds = 0usize;
+        loop {
+            let ssids = next_scan_ssids(
+                &hidden_ssids,
+                &mut cursor,
+                &mut wildcard_next,
+                max_ssids,
+            );
+            trigger_scan(&handle, if_index, Some(&ssids), None).await?;
+            tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
+                .await;
+            rounds += 1;
+            if hidden_ssids.is_empty() || cursor == 0 || rounds >= max_rounds {
+                break;
+            }
+        }
+    }
 
     let bss_list = get_scan_results(&handle, if_index).await?;
     let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
@@ -826,6 +887,7 @@ pub async fn scan_wifi_with_ies(
         }
     }
     let mut results = Vec::new();
+    let mut seen_bssids = HashSet::new();
     for bss in &bss_list {
         let Some(ies) = extract_ies(bss) else {
             continue;
@@ -858,29 +920,165 @@ pub async fn scan_wifi_with_ies(
             rm_neighbor_report:
                 crate::ieee80211::elements::ap_supports_rm_neighbor_report(ies),
         };
-        results.push((info, ies.to_vec()));
+        if seen_bssids.insert(bssid) {
+            results.push((info, ies.to_vec()));
+        }
     }
     Ok(results)
 }
 
-async fn resolve_if_index(
-    handle: &wl_nl80211::Nl80211Handle,
-    iface_name: &str,
-) -> Result<u32, WifiError> {
-    let mut dump = handle.interface().get(vec![]).execute().await;
-    while let Some(msg) = dump.try_next().await? {
-        if msg.payload.attributes.iter().any(|attr| {
-            matches!(attr, wl_nl80211::Nl80211Attr::IfName(n) if n == iface_name)
-        }) {
-            for attr in &msg.payload.attributes {
-                if let wl_nl80211::Nl80211Attr::IfIndex(idx) = attr {
-                    return Ok(*idx);
-                }
+/// Build the SSID list for the next scan the way wpa_supplicant does:
+/// keep one wildcard entry (empty SSID) so every scan finds all visible
+/// networks, and rotate through `hidden_ssids` within the driver's
+/// per-scan cap (`max_ssids`, itself capped at `MAX_SCAN_SSIDS`).
+/// Drivers that accept only one SSID per scan interleave wildcard and
+/// specific-SSID scans via `wildcard_next`.
+fn next_scan_ssids(
+    hidden_ssids: &[String],
+    cursor: &mut usize,
+    wildcard_next: &mut bool,
+    max_ssids: usize,
+) -> Vec<String> {
+    let max_ssids = max_ssids.clamp(1, MAX_SCAN_SSIDS);
+
+    if max_ssids == 1 {
+        if hidden_ssids.is_empty() || *wildcard_next {
+            *wildcard_next = false;
+            return vec![String::new()];
+        }
+        let idx = *cursor % hidden_ssids.len();
+        *cursor = (idx + 1) % hidden_ssids.len();
+        *wildcard_next = true;
+        return vec![hidden_ssids[idx].clone()];
+    }
+
+    // Reserve the last slot for the wildcard entry.
+    let capacity = max_ssids - 1;
+    let start = *cursor;
+    let mut ssids = Vec::with_capacity(max_ssids);
+    let mut used = 0usize;
+    if !hidden_ssids.is_empty() {
+        let mut idx = start % hidden_ssids.len();
+        while used < capacity {
+            ssids.push(hidden_ssids[idx].clone());
+            used += 1;
+            idx = (idx + 1) % hidden_ssids.len();
+            if idx == start {
+                break;
             }
         }
     }
-    Err(WifiError::new(
-        ErrorKind::InterfaceNotFound,
-        format!("interface {iface_name} not found"),
-    ))
+    // When every hidden SSID fits in one round, start over each scan;
+    // otherwise continue from the first SSID not yet probed.
+    if used < capacity || hidden_ssids.is_empty() {
+        *cursor = 0;
+    } else {
+        *cursor = (start + used) % hidden_ssids.len();
+    }
+    ssids.push(String::new());
+    ssids
+}
+
+/// Format an SSID list for logging, showing the wildcard entry as `*`.
+pub(crate) fn format_ssids(ssids: &[String]) -> String {
+    ssids
+        .iter()
+        .map(|ssid| {
+            if ssid.is_empty() {
+                "*".to_string()
+            } else {
+                ssid.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SCAN_SSIDS, next_scan_ssids};
+
+    fn ssids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn wildcard_only_when_no_hidden_networks() {
+        let hidden = Vec::new();
+        let mut cursor = 0;
+        let mut wildcard_next = true;
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 4),
+            ssids(&[""])
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn rotates_hidden_ssids_with_wildcard_reserved() {
+        let hidden = ssids(&["A", "B", "C", "D"]);
+        let mut cursor = 0;
+        let mut wildcard_next = true;
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 4),
+            ssids(&["A", "B", "C", ""])
+        );
+        assert_eq!(cursor, 3);
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 4),
+            ssids(&["D", "A", "B", ""])
+        );
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn all_hidden_ssids_fit_in_one_scan() {
+        let hidden = ssids(&["A", "B"]);
+        let mut cursor = 0;
+        let mut wildcard_next = true;
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 4),
+            ssids(&["A", "B", ""])
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn one_ssid_driver_interleaves_wildcard() {
+        let hidden = ssids(&["A", "B"]);
+        let mut cursor = 0;
+        let mut wildcard_next = true;
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 1),
+            ssids(&[""])
+        );
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 1),
+            ssids(&["A"])
+        );
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 1),
+            ssids(&[""])
+        );
+        assert_eq!(
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 1),
+            ssids(&["B"])
+        );
+        assert_eq!(cursor, 0);
+        assert!(wildcard_next);
+    }
+
+    #[test]
+    fn caps_at_wpa_supplicant_max() {
+        let hidden = (0..20).map(|i| format!("S{i:02}")).collect::<Vec<_>>();
+        let mut cursor = 0;
+        let mut wildcard_next = true;
+        let round =
+            next_scan_ssids(&hidden, &mut cursor, &mut wildcard_next, 255);
+        assert_eq!(round.len(), MAX_SCAN_SSIDS);
+        assert_eq!(round.last().map(String::as_str), Some(""));
+        assert_eq!(round[0], "S00");
+        assert_eq!(round[14], "S14");
+        assert_eq!(cursor, 15);
+    }
 }

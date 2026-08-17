@@ -138,6 +138,7 @@ version: 1
 wifis:
   - ssid: {HIDDEN_SSID}
     password: "{HIDDEN_PSK}"
+    hidden: true
     interface: {TEST_NIC}
 """)
 
@@ -202,7 +203,7 @@ def _add_sta_ip():
 class TestHiddenSsid:
     def test_shulid_probes_hidden_ssid(self, shulid_hidden_connection):
         """The scan must probe the hidden SSID by name (directed probe)."""
-        assert f"scanning for SSIDs [{HIDDEN_SSID}]" in _read_log(), (
+        assert f"scanning for SSIDs [{HIDDEN_SSID}, *]" in _read_log(), (
             "shulid did not probe the hidden SSID; log:\n" + _read_log()
         )
 

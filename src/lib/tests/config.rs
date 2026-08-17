@@ -67,6 +67,19 @@ fn wowlan_is_opt_in_and_can_be_enabled() {
 }
 
 #[test]
+fn hidden_defaults_to_false_and_can_be_set() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(
+        !network.hidden,
+        "visible networks are found by the wildcard probe"
+    );
+    network.set_hidden(true);
+    assert!(network.hidden);
+    network.set_hidden(false);
+    assert!(!network.hidden);
+}
+
+#[test]
 fn eap_config_defaults_to_none_and_can_be_set() {
     let mut network = NetworkConfig::new("Enterprise-WIFI");
     assert!(network.eap.is_none(), "EAP credentials must be opt-in");
