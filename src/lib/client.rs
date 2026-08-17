@@ -1,24 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! WPA client core: the per-interface connection flow.
+//! WPA client core: one `WifiIface` per wifi-phy, multiplexed by the
+//! shared `WifiClient` event dispatcher.
 //!
 //! The flow is a simple linear walk over [`WifiState`] - Init -> Scanning ->
 //! Authenticating -> Connected - driven by repeated calls to
-//! [`WifiClient::process`]. There is no internal transition table; events (SAE
-//! frames, association results, EAPOL-Key messages) advance the current state
-//! directly. Scan specifics live in `scan.rs`, pre-association authentication
-//! (SAE today, WPA2/EAP later) in `auth.rs`, and nl80211 details in `nl80211/`.
+//! [`WifiIface::run`]. There is no internal transition table; events
+//! (SAE frames, association results, EAPOL-Key messages) advance the
+//! current state directly. Scan specifics live in `scan.rs`,
+//! pre-association authentication (SAE today, WPA2/EAP later) in
+//! `auth.rs`, and nl80211 details in `nl80211/`.
+
+use std::collections::HashMap;
 
 use futures::{StreamExt, TryStreamExt};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
+use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 use wl_nl80211::{
     Ieee80211ReasonCode, Ieee80211StatusCode, Nl80211Associate, Nl80211Attr,
     Nl80211AuthType, Nl80211Authenticate, Nl80211Command,
     Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Event,
-    Nl80211Handle, Nl80211Key, Nl80211KeyDefaultType, Nl80211MulticastGroup,
-    Nl80211Pmksa, Nl80211RekeyOffload, Nl80211SchedScanMatch,
-    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
-    Nl80211UseMfp, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
-    Nl80211WowlanWakeup,
+    Nl80211Handle, Nl80211Key, Nl80211KeyDefaultType, Nl80211Message,
+    Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
+    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
+    Nl80211SchedScanPlanAttr, Nl80211UseMfp, Nl80211Wowlan,
+    Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
 };
 
 use crate::{
@@ -39,6 +45,12 @@ use crate::{
     },
     scan::{BssInfo, SecurityType},
 };
+
+type Nl80211EventMsg = NetlinkMessage<genetlink::message::RawGenlMessage>;
+type Nl80211EventSender =
+    futures::channel::mpsc::UnboundedSender<Nl80211EventMsg>;
+type Nl80211EventReceiver =
+    futures::channel::mpsc::UnboundedReceiver<Nl80211EventMsg>;
 
 /// Initial scan-retry backoff (seconds) used while hunting for the
 /// configured SSID. Doubles after each failed scan, capped at
@@ -109,13 +121,10 @@ pub enum WifiState {
     FailedAuthentication,
 }
 
-pub struct WifiClient {
+pub(crate) struct WifiIface {
     pub(crate) handle: Nl80211Handle,
     pub(crate) conn_handle: Nl80211ConnectionHandle,
-    pub(crate) event_receiver: futures::channel::mpsc::UnboundedReceiver<(
-        netlink_packet_core::NetlinkMessage<genetlink::message::RawGenlMessage>,
-        netlink_sys::SocketAddr,
-    )>,
+    pub(crate) event_receiver: Nl80211EventReceiver,
     pub(crate) state: WifiState,
     /// Current scan-retry backoff in seconds; doubles after each scan
     /// that fails to find the SSID (capped at `RETRY_BACKOFF_MAX_SEC`)
@@ -238,14 +247,60 @@ pub struct WifiClient {
     pub(crate) sae_hnp_attempted: bool,
 }
 
+/// One state change reported by [`WifiClient::run_multi`].
+///
+/// `error` is set when the interface's state machine hit a transient
+/// error; the client keeps running and will retry.
+#[derive(Debug)]
+pub struct WifiRunResult {
+    pub iface_name: String,
+    pub state: WifiState,
+    pub error: Option<WifiError>,
+}
+
+/// A single WiFi client managing one or more wifi-phy interfaces.
+///
+/// All interfaces share one nl80211 socket and one multicast event
+/// subscription. The event dispatcher routes each kernel event to the
+/// interface it belongs to, so concurrent interfaces do not see each
+/// other's scan/auth/disconnect/CQM events.
+pub struct WifiClient {
+    ifaces: HashMap<String, WifiIface>,
+    dispatcher_shutdown_tx: UnboundedSender<()>,
+}
+
 impl WifiClient {
-    /// Validate the configuration by checking the WiFi PHY interface exists,
-    /// then open the nl80211 connection and join the event multicast groups.
+    /// Create a client managing the single wifi-phy in `config`.
     pub async fn init(config: WifiConfig) -> Result<Self, WifiError> {
-        // One socket for everything: it issues commands (and owns the
-        // connection, so the kernel unicasts EAPOL control-port frames to
-        // it) and is joined to the event multicast groups. A dedicated
-        // event-only socket would miss those unicast EAPOL frames.
+        Self::init_multi(vec![config]).await
+    }
+
+    /// Create one client managing every wifi-phy in `configs`.
+    ///
+    /// All interfaces share one nl80211 socket and one multicast event
+    /// subscription. Run one `WifiClient` per network namespace.
+    pub async fn init_multi(
+        configs: Vec<WifiConfig>,
+    ) -> Result<Self, WifiError> {
+        if configs.is_empty() {
+            return Err(WifiError::new(
+                ErrorKind::InvalidConfig,
+                "WifiClient::init_multi(): at least one WifiConfig required",
+            ));
+        }
+        let mut iface_names = std::collections::HashSet::new();
+        for config in &configs {
+            if !iface_names.insert(&config.iface_name) {
+                return Err(WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    format!(
+                        "WifiClient::init_multi(): duplicate interface {}",
+                        config.iface_name
+                    ),
+                ));
+            }
+        }
+
         let (conn, handle, event_receiver) =
             wl_nl80211::new_multicast_connection(&[
                 Nl80211MulticastGroup::Scan,
@@ -255,6 +310,301 @@ impl WifiClient {
             .map_err(|e| WifiError::new(ErrorKind::Config, e.to_string()))?;
         tokio::spawn(conn);
 
+        let mut ifaces = HashMap::new();
+        let mut iface_tx_by_if_index: HashMap<u32, Nl80211EventSender> =
+            HashMap::new();
+        for config in configs {
+            let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
+            let conn_handle = handle.connection();
+            let iface =
+                WifiIface::init(handle.clone(), conn_handle, event_rx, config)
+                    .await?;
+            iface_tx_by_if_index.insert(iface.if_index, event_tx);
+            ifaces.insert(iface.config.iface_name.clone(), iface);
+        }
+
+        let (dispatcher_shutdown_tx, dispatcher_shutdown_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let _dispatcher = run_event_dispatcher(
+            event_receiver,
+            iface_tx_by_if_index,
+            dispatcher_shutdown_rx,
+        );
+
+        Ok(Self {
+            ifaces,
+            dispatcher_shutdown_tx,
+        })
+    }
+
+    /// Drive every managed interface until one of them reports a state
+    /// change, then return that change.
+    pub async fn run_multi(&mut self) -> Result<WifiRunResult, WifiError> {
+        if self.ifaces.is_empty() {
+            return Err(WifiError::new(
+                ErrorKind::Config,
+                "WifiClient has no interfaces",
+            ));
+        }
+        let mut futures: Vec<
+            std::pin::Pin<
+                Box<dyn futures::Future<Output = WifiRunResult> + Send + '_>,
+            >,
+        > = Vec::new();
+        for (iface_name, iface) in &mut self.ifaces {
+            let iface_name = iface_name.clone();
+            futures.push(Box::pin(async move {
+                match iface.run().await {
+                    Ok(state) => WifiRunResult {
+                        iface_name,
+                        state,
+                        error: None,
+                    },
+                    Err(e) => WifiRunResult {
+                        iface_name,
+                        state: WifiState::Failed,
+                        error: Some(e),
+                    },
+                }
+            }));
+        }
+        let (result, _index, _remaining) =
+            futures::future::select_all(futures).await;
+        Ok(result)
+    }
+
+    /// Convenience for a single-interface client: see
+    /// [`WifiClient::run_multi`] when managing more than one interface.
+    pub async fn run(&mut self) -> Result<WifiState, WifiError> {
+        if self.ifaces.len() != 1 {
+            return Err(WifiError::new(
+                ErrorKind::Config,
+                "WifiClient::run() requires exactly one interface; use \
+                 run_multi() for multiple interfaces",
+            ));
+        }
+        let result = self.run_multi().await?;
+        match result.error {
+            Some(e) => Err(e),
+            None => Ok(result.state),
+        }
+    }
+
+    pub fn current_ssid(&self) -> &str {
+        self.ifaces
+            .values()
+            .next()
+            .map(|iface| iface.current_ssid())
+            .unwrap_or("")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iface(&self) -> Option<&WifiIface> {
+        self.ifaces.values().next()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iface_mut(&mut self) -> Option<&mut WifiIface> {
+        self.ifaces.values_mut().next()
+    }
+
+    pub fn current_ssid_of(&self, iface_name: &str) -> Option<&str> {
+        self.ifaces
+            .get(iface_name)
+            .map(|iface| iface.current_ssid())
+    }
+
+    pub fn current_bssid(&self) -> [u8; ETH_ALEN] {
+        self.ifaces
+            .values()
+            .next()
+            .map(|iface| iface.current_bssid())
+            .unwrap_or([0; ETH_ALEN])
+    }
+
+    pub fn current_bssid_of(&self, iface_name: &str) -> Option<[u8; ETH_ALEN]> {
+        self.ifaces
+            .get(iface_name)
+            .map(|iface| iface.current_bssid())
+    }
+
+    /// Convenience for a single-interface client.
+    pub async fn update_networks(
+        &mut self,
+        networks: Vec<NetworkConfig>,
+    ) -> Result<(), WifiError> {
+        if self.ifaces.len() != 1 {
+            return Err(WifiError::new(
+                ErrorKind::Config,
+                "WifiClient::update_networks() requires exactly one \
+                 interface; use update_networks_of() for multiple",
+            ));
+        }
+        let iface = self.ifaces.values_mut().next().expect("len checked");
+        iface.update_networks(networks).await
+    }
+
+    pub async fn update_networks_of(
+        &mut self,
+        iface_name: &str,
+        networks: Vec<NetworkConfig>,
+    ) -> Result<(), WifiError> {
+        let iface = self.ifaces.get_mut(iface_name).ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InterfaceNotFound,
+                format!("wifi interface {iface_name} not found"),
+            )
+        })?;
+        iface.update_networks(networks).await
+    }
+
+    pub fn wowlan_supported(&self) -> bool {
+        self.ifaces
+            .values()
+            .next()
+            .map(WifiIface::wowlan_supported)
+            .unwrap_or(false)
+    }
+
+    pub fn wowlan_supported_of(&self, iface_name: &str) -> bool {
+        self.ifaces
+            .get(iface_name)
+            .map(WifiIface::wowlan_supported)
+            .unwrap_or(false)
+    }
+
+    /// Convenience for a single-interface client.
+    pub async fn arm_wowlan(&mut self) -> Result<bool, WifiError> {
+        if self.ifaces.len() != 1 {
+            return Err(WifiError::new(
+                ErrorKind::Config,
+                "WifiClient::arm_wowlan() requires exactly one interface; use \
+                 arm_wowlan_of() for multiple",
+            ));
+        }
+        let iface = self.ifaces.values_mut().next().expect("len checked");
+        iface.arm_wowlan().await
+    }
+
+    pub async fn arm_wowlan_of(
+        &mut self,
+        iface_name: &str,
+    ) -> Result<bool, WifiError> {
+        let iface = self.ifaces.get_mut(iface_name).ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InterfaceNotFound,
+                format!("wifi interface {iface_name} not found"),
+            )
+        })?;
+        iface.arm_wowlan().await
+    }
+
+    /// Convenience for a single-interface client.
+    pub async fn disarm_wowlan(&mut self) -> Result<(), WifiError> {
+        if self.ifaces.len() != 1 {
+            return Err(WifiError::new(
+                ErrorKind::Config,
+                "WifiClient::disarm_wowlan() requires exactly one interface; \
+                 use disarm_wowlan_of() for multiple",
+            ));
+        }
+        let iface = self.ifaces.values_mut().next().expect("len checked");
+        iface.disarm_wowlan().await
+    }
+
+    pub async fn disarm_wowlan_of(
+        &mut self,
+        iface_name: &str,
+    ) -> Result<(), WifiError> {
+        let iface = self.ifaces.get_mut(iface_name).ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InterfaceNotFound,
+                format!("wifi interface {iface_name} not found"),
+            )
+        })?;
+        iface.disarm_wowlan().await
+    }
+
+    /// Cleanly disconnect every managed interface and stop the event
+    /// dispatcher. Call this before dropping the client.
+    pub async fn shutdown(&mut self) {
+        let _ = self.dispatcher_shutdown_tx.send(());
+        for iface in self.ifaces.values_mut() {
+            iface.shutdown().await;
+        }
+    }
+}
+
+impl Drop for WifiClient {
+    fn drop(&mut self) {
+        let _ = self.dispatcher_shutdown_tx.send(());
+    }
+}
+
+fn run_event_dispatcher(
+    mut event_receiver: futures::channel::mpsc::UnboundedReceiver<(
+        Nl80211EventMsg,
+        netlink_sys::SocketAddr,
+    )>,
+    iface_tx_by_if_index: HashMap<u32, Nl80211EventSender>,
+    mut shutdown_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => break,
+                event = event_receiver.next() => {
+                    let Some((raw_msg, _addr)) = event else {
+                        break;
+                    };
+                    let Some(if_index) = event_if_index(&raw_msg) else {
+                        // A few events may lack IFINDEX; keep the old
+                        // broadcast behaviour for those rare messages.
+                        for tx in iface_tx_by_if_index.values() {
+                            if tx.unbounded_send(raw_msg.clone()).is_err() {
+                                log::debug!("wifi event queue closed");
+                            }
+                        }
+                        continue;
+                    };
+                    if let Some(tx) = iface_tx_by_if_index.get(&if_index)
+                        && tx.unbounded_send(raw_msg).is_err()
+                    {
+                        log::debug!(
+                            "wifi event queue closed for if_index {if_index}"
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn event_if_index(msg: &Nl80211EventMsg) -> Option<u32> {
+    if let NetlinkPayload::InnerMessage(raw_genlmsg) = &msg.payload
+        && let Ok(genl_msg) = raw_genlmsg.parse_into_genlmsg::<Nl80211Message>()
+    {
+        return genl_msg.payload.attributes.iter().find_map(
+            |attr| match attr {
+                Nl80211Attr::IfIndex(if_index) => Some(*if_index),
+                _ => None,
+            },
+        );
+    }
+    None
+}
+
+impl WifiIface {
+    /// Validate the configuration and prepare one interface state machine.
+    /// The nl80211 connection is shared with every other interface in the
+    /// parent [`WifiClient`].
+    pub(crate) async fn init(
+        handle: Nl80211Handle,
+        mut conn_handle: Nl80211ConnectionHandle,
+        event_receiver: Nl80211EventReceiver,
+        config: WifiConfig,
+    ) -> Result<Self, WifiError> {
         let (if_index, mac, wiphy_idx) =
             get_if_index_and_mac(&handle, &config.iface_name).await?;
 
@@ -311,8 +661,6 @@ impl WifiClient {
                 }
             };
 
-        let mut conn_handle = handle.connection();
-
         // clear any WoWLAN triggers a previous (possibly crashed)
         // run left armed. The daemon arms them again right before the
         // next suspend; a leftover configuration would keep the device
@@ -339,7 +687,7 @@ impl WifiClient {
             )
         })?;
 
-        let mut client = WifiClient {
+        let mut client = WifiIface {
             handle,
             conn_handle,
             event_receiver,
@@ -397,7 +745,7 @@ impl WifiClient {
     /// Roam scans started from the connected state (CQM event or the
     /// low-frequency background safety net) are internal housekeeping:
     /// when they find no better BSS the client stays connected, so
-    /// [`WifiClient::run`] keeps driving without surfacing the
+    /// [`WifiIface::run`] keeps driving without surfacing the
     /// `Connected -> Scanning -> Connected` round trip to the caller.
     pub async fn run(&mut self) -> Result<WifiState, WifiError> {
         // The state to which an in-flight roam scan will return. A scan
@@ -512,7 +860,7 @@ impl WifiClient {
                 )
                 .await;
                 match timed {
-                    Ok(Some((raw_msg, _addr))) => {
+                    Ok(Some(raw_msg)) => {
                         if let Some(event) =
                             wl_nl80211::Nl80211Event::parse(raw_msg)
                         {
@@ -586,7 +934,7 @@ impl WifiClient {
                     )
                     .await;
                     match timed {
-                        Ok(Some((raw_msg, _addr))) => {
+                        Ok(Some(raw_msg)) => {
                             if let Some(event) =
                                 wl_nl80211::Nl80211Event::parse(raw_msg)
                             {
@@ -683,7 +1031,7 @@ impl WifiClient {
                     Ok(self.event_receiver.next().await)
                 };
                 match next {
-                    Ok(Some((raw_msg, _addr))) => {
+                    Ok(Some(raw_msg)) => {
                         if let Some(event) =
                             wl_nl80211::Nl80211Event::parse(raw_msg)
                         {
@@ -740,7 +1088,7 @@ impl WifiClient {
                     )
                     .await
                     {
-                        Ok(Some((raw_msg, _addr))) => {
+                        Ok(Some(raw_msg)) => {
                             if let Some(event) =
                                 wl_nl80211::Nl80211Event::parse(raw_msg)
                             {
@@ -2349,7 +2697,7 @@ impl WifiClient {
     }
 }
 
-impl WifiClient {
+impl WifiIface {
     /// Process the Association Response IEs for OWE: find the AP's
     /// DH Parameter Element and derive PMK/PMKID (RFC 8110 §4.4).
     /// Returns true on success.
@@ -2374,7 +2722,7 @@ impl WifiClient {
     }
 }
 
-impl WifiClient {
+impl WifiIface {
     /// SSID of the network the client is currently working toward.
     /// Before the first scan selects a BSS this is the first configured
     /// network; after a successful scan it is the network whose BSS was
@@ -2578,7 +2926,7 @@ impl WifiClient {
     }
 }
 
-impl Drop for WifiClient {
+impl Drop for WifiIface {
     fn drop(&mut self) {
         let mut conn_handle = self.conn_handle.clone();
         let handle = self.handle.clone();
@@ -2712,7 +3060,7 @@ async fn send_ctrl_port_frame(
     drain_request(conn_handle.control_port_frame(attrs).execute().await).await
 }
 
-impl WifiClient {
+impl WifiIface {
     /// enable OCV on the 4-way state with our OCI derived
     /// from the BSS frequency, but only when the AP's RSNE actually
     /// advertises OCVC support. Otherwise Message 3 will never carry an
@@ -2808,7 +3156,7 @@ impl WifiClient {
     }
 }
 
-impl WifiClient {
+impl WifiIface {
     /// The RSNE sent in the association request / 4-way Message 2 for the
     /// current security type, optionally carrying a PMKID (PMKSA caching).
     /// Both sites must stay byte-identical - the AP verifies that.

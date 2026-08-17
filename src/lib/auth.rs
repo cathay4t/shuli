@@ -9,7 +9,7 @@
 //! passphrase) and EAP/802.1X plug in here without touching the client flow.
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiClient, WifiError, crypto::sae::SaeAuth,
+    ETH_ALEN, ErrorKind, WifiError, WifiIface, crypto::sae::SaeAuth,
     eap::EapPeer, eap_tls::EapTlsMethod, scan::SecurityType,
 };
 
@@ -244,7 +244,7 @@ fn is_temporary_reject_status(status: u16) -> bool {
     )
 }
 
-impl WifiClient {
+impl WifiIface {
     /// Start authentication with the selected BSS.
     ///
     /// PMKSA cache hit: send open-system AUTHENTICATE and

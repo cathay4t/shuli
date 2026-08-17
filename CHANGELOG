@@ -1,4 +1,15 @@
 # Changelog
+## [Unreleased]
+### Breaking changes
+ * `WifiClient` now manages all wifi-phy interfaces in one object; use
+   `WifiClient::init_multi()` and the `WifiRunResult`-returning
+   `run_multi()` when managing multiple interfaces.
+
+### New features
+ * One `WifiClient` per network namespace: all interfaces share one
+   nl80211 socket and one event dispatcher that routes multicast events
+   by `IFINDEX`.
+
 ## [0.2.0] - 2026-08-16
 ### Breaking changes
  - `WifiConfig` now holds a network list; use `add_network()` instead

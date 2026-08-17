@@ -21,8 +21,8 @@ modern WiFi networks written entirely in Rust.
   Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
   CMAC-128).
 * **Rust crate** - Async crate for WIFI authentication.
-* **shulid daemon** - YAML configuration, one client per interface,
-  systemd unit, handling both WIFI and IP config.
+* **shulid daemon** - YAML configuration, one client per network
+  namespace, systemd unit, handling both WIFI and IP config.
 
 ## Using the daemon for simple WiFi configuration
 
@@ -106,12 +106,17 @@ Add these lines to your Cargo.toml:
 ```toml
 [dependencies.shuli]
 package = "shuli"
-version = "0.1.0"
+version = "0.2.0"
 ```
 
-The crate exposes a `WifiClient` that drives the whole connection flow -
-scan, authentication, association, and the 4-way handshake - one step per
-call to `run()`:
+A `WifiClient` manages one or more wifi-phy interfaces with a single
+nl80211 socket and a single multicast event subscription. Run **one**
+`WifiClient` per network namespace: creating multiple clients in the
+same namespace would make every client receive the same kernel
+multicast events (scan, MLME and config groups), and the client has no
+way to know an event belongs to another interface.
+
+Single interface:
 
 ```rust
 use shuli::{WifiClient, WifiConfig, WifiState};
@@ -133,15 +138,43 @@ async fn main() -> Result<(), shuli::WifiError> {
             Ok(WifiState::ConnectedWithOffloadRekey) => {
                 println!("WIFI connected");
             }
-            Ok(s) => {
-                // Keep the client alive to handle rekey and disconnection
-                println!("WIFI state {s}");
-            }
+            Ok(s) => println!("WIFI state {s}"),
             Err(e) => eprintln!("{e}"),
         }
     }
 }
 ```
+
+Multiple interfaces with one client:
+
+```rust
+use shuli::{WifiClient, WifiConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), shuli::WifiError> {
+    let mut wlan0 = WifiConfig::new("wlan0");
+    wlan0.add_network("Home", Some("home-secret"));
+    let mut wlan1 = WifiConfig::new("wlan1");
+    wlan1.add_network("Office", Some("office-secret"));
+
+    let mut client = WifiClient::init_multi(vec![wlan0, wlan1]).await?;
+
+    loop {
+        // Returns the first interface that changed state.
+        let result = client.run_multi().await?;
+        if let Some(e) = result.error {
+            eprintln!("{}: {e}", result.iface_name);
+        }
+        if let Some(ssid) = client.current_ssid_of(&result.iface_name) {
+            println!("{}: {}", result.iface_name, ssid);
+        }
+    }
+}
+```
+
+`WifiRunResult` carries the interface name, so callers can tell which
+interface changed. Use `update_networks_of()`, `current_ssid_of()` and
+`current_bssid_of()` when more than one interface is managed.
 
 ## Contact
 

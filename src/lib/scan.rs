@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface,
     nl80211::scan::{
         extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
         extract_ssid_from_ies, get_scan_results, trigger_scan,
@@ -17,7 +17,7 @@ use crate::{
 };
 
 const SCAN_SLEEP_SECS: u64 = 3;
-/// Bounds how long [`WifiClient::wait_scan_finish`] waits for the
+/// Bounds how long [`WifiIface::wait_scan_finish`] waits for the
 /// `NL80211_CMD_NEW_SCAN_RESULTS` completion event before giving up and
 /// dumping the scan results anyway.  Generous on purpose: the event is the
 /// completion signal (a busy environment can keep a scan running for
@@ -230,7 +230,7 @@ impl PartialOrd for BssInfo {
     }
 }
 
-impl WifiClient {
+impl WifiIface {
     pub(crate) async fn send_out_scan_request(
         &mut self,
     ) -> Result<(), WifiError> {
@@ -305,7 +305,7 @@ impl WifiClient {
             match tokio::time::timeout(remaining, self.event_receiver.next())
                 .await
             {
-                Ok(Some((raw_msg, _addr))) => {
+                Ok(Some(raw_msg)) => {
                     if let Some(event) =
                         wl_nl80211::Nl80211Event::parse(raw_msg)
                     {

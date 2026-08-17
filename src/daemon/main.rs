@@ -4,7 +4,7 @@ mod config;
 mod dhcp;
 mod ip;
 
-use std::{path::Path, process::ExitCode};
+use std::{collections::HashMap, path::Path, process::ExitCode};
 
 use futures::StreamExt as _;
 use tokio::{
@@ -44,9 +44,9 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
         ));
     }
 
-    // run one WifiClient per distinct interface. Entries with
-    // `interface: any` (or absent) all bind to the first WiFi NIC found;
-    // entries with an explicit interface bind to that one.
+    // Entries with `interface: any` (or absent) all bind to the first
+    // WiFi NIC found; entries with an explicit interface bind to that
+    // one. All interfaces share a single WifiClient.
     let needs_any = wifis
         .iter()
         .any(|entry| entry.interface.as_deref().is_none_or(|i| i == "any"));
@@ -66,17 +66,17 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
             .join(", ")
     );
 
-    // Init every client up front so an invalid interface fails fast
-    // instead of only part of the daemon running.
-    let mut clients = Vec::new();
-    for (iface_name, entries) in &groups {
-        let wifi_config =
-            config::ShuliConfig::wifi_config_for_entries(iface_name, entries);
-        let client = shuli::WifiClient::init(wifi_config).await?;
-        clients.push((iface_name.clone(), entries.clone(), client));
-    }
+    // Init the single client up front so an invalid interface fails
+    // fast instead of only part of the daemon running.
+    let wifi_configs: Vec<shuli::WifiConfig> = groups
+        .iter()
+        .map(|(iface_name, entries)| {
+            config::ShuliConfig::wifi_config_for_entries(iface_name, entries)
+        })
+        .collect();
+    let client = shuli::WifiClient::init_multi(wifi_configs).await?;
 
-    // One task per interface; a watch channel broadcasts shutdown.
+    // A watch channel broadcasts shutdown.
     // `tasks` is polled in the select so the daemon also exits when
     // every interface task ends on its own (e.g. the event channel
     // closed) instead of idling with zero live tasks.
@@ -89,12 +89,12 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     })?;
 
     let mut tasks = futures::stream::FuturesUnordered::new();
-    for (iface_name, entries, client) in clients {
-        let shutdown_rx = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            run_interface(&iface_name, &entries, client, shutdown_rx).await
-        }));
-    }
+    let wifi_shutdown_rx = shutdown_rx.clone();
+    tasks.push(tokio::spawn(run_wifi_interfaces(
+        client,
+        groups,
+        wifi_shutdown_rx,
+    )));
     // one wired 802.1X task per configured Ethernet port.
     for entry in &shuli_config.ethernets {
         let shutdown_rx = shutdown_rx.clone();
@@ -166,36 +166,56 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     }
 }
 
-/// Drive one interface's `WifiClient` until shutdown: apply the
-/// network's IP config whenever a connection lands, keep retrying
-/// otherwise. Returns whether a connection was ever established.
-async fn run_interface(
-    iface_name: &str,
-    entries: &[config::WifiEntry],
+/// Drive the single multi-interface `WifiClient` until shutdown: apply
+/// each interface's IP config whenever a connection lands, keep
+/// retrying otherwise. Returns whether any connection was ever
+/// established.
+async fn run_wifi_interfaces(
     mut client: shuli::WifiClient,
+    groups: Vec<(String, Vec<config::WifiEntry>)>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool, shuli::WifiError> {
-    // SSID whose IP config was last applied; lets us re-apply when a
-    // later connection lands on a different configured network.
-    let mut applied_ssid: Option<String> = None;
+    // SSID whose IP config was last applied per interface; lets us
+    // re-apply when a later connection lands on a different configured
+    // network.
+    let mut applied_ssid: HashMap<String, String> = HashMap::new();
     let mut connected = false;
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 // The sender dropped the channel or signalled shutdown.
-                log::info!("shutting down interface {iface_name}");
+                log::info!("shutting down wifi interfaces");
                 client.shutdown().await;
                 return Ok(connected);
             }
-            result = client.run() => {
+            result = client.run_multi() => {
                 match result {
-                    Ok(state) => match state {
+                    Ok(run_result) => {
+                        let iface_name = &run_result.iface_name;
+                        if let Some(e) = run_result.error.as_ref() {
+                            log::warn!("WIFI {iface_name} error: {e}");
+                        }
+                        match run_result.state {
                         shuli::WifiState::ConnectedWithoutOffloadRekey
                         | shuli::WifiState::ConnectedWithOffloadRekey => {
                             connected = true;
-                            let ssid = client.current_ssid().to_string();
-                            if applied_ssid.as_deref() != Some(ssid.as_str()) {
-                                applied_ssid = Some(ssid.clone());
+                            let Some(ssid) =
+                                client.current_ssid_of(iface_name)
+                            else {
+                                log::warn!(
+                                    "WIFI {iface_name} connected but no \
+                                     current SSID"
+                                );
+                                continue;
+                            };
+                            let ssid = ssid.to_string();
+                            if applied_ssid
+                                .get(iface_name)
+                                .map(String::as_str)
+                                != Some(ssid.as_str())
+                            {
+                                applied_ssid
+                                    .insert(iface_name.clone(), ssid.clone());
                                 log::info!(
                                     "connection established to '{ssid}' on \
                                      {iface_name} - link up"
@@ -203,6 +223,11 @@ async fn run_interface(
                                 // Apply the IP config of the network we
                                 // actually connected to; never fall back
                                 // to another network's config silently.
+                                let entries = groups
+                                    .iter()
+                                    .find(|(name, _)| name == iface_name)
+                                    .map(|(_, entries)| entries.as_slice())
+                                    .unwrap_or(&[]);
                                 match entries
                                     .iter()
                                     .find(|entry| entry.ssid == ssid)
@@ -242,10 +267,9 @@ async fn run_interface(
                             );
                         }
                         _ => {}
-                    },
-                    Err(e) => {
-                        log::warn!("{e}");
                     }
+                    }
+                    Err(e) => log::warn!("WIFI client error: {e}"),
                 }
             }
         }
@@ -397,7 +421,7 @@ async fn run_wired_interface(
 }
 
 /// Group configured networks by their resolved interface: one
-/// `WifiClient` per distinct interface. `any_iface` is the concrete
+/// `WifiConfig` per distinct interface. `any_iface` is the concrete
 /// NIC that `interface: any` / absent entries bind to.
 fn group_by_interface(
     wifis: &[config::WifiEntry],

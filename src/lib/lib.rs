@@ -19,9 +19,9 @@ pub mod scan;
 mod tests;
 pub mod wired;
 
-pub(crate) use self::mac::ETH_ALEN;
+pub(crate) use self::{client::WifiIface, mac::ETH_ALEN};
 pub use self::{
-    client::{WifiClient, WifiState},
+    client::{WifiClient, WifiRunResult, WifiState},
     config::{
         DEFAULT_ROAM_THRESHOLD_DBM, DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
         EapConfig, NetworkConfig, SaePwe, WifiConfig,

@@ -10,12 +10,13 @@ version: 1
 # threshold of -70 dBm. BSS Transition Management (802.11v) requests
 # are honoured regardless.
 wifis:
-  # One `WifiClient` runs per distinct interface: entries with the same
-  # `interface` (explicit or resolved from `any`) share one client and
-  # scan schedule, different interfaces connect concurrently.  The
-  # `interface: any` (or absent) entries all bind to the first
-  # available WiFi interface; Test-WIFI omits the key, Test-WIFI-OPEN
-  # spells it out.
+  # A single `WifiClient` runs for the whole daemon: every interface in
+  # this network namespace shares one client and one event
+  # subscription.  Entries with the same `interface` (explicit or
+  # resolved from `any`) share one scan schedule; different interfaces
+  # connect concurrently.  The `interface: any` (or absent) entries
+  # all bind to the first available WiFi interface; Test-WIFI omits the
+  # key, Test-WIFI-OPEN spells it out.
   - ssid: Test-WIFI
     password: "12345678"
     # sae_password_id: corp-id # optional SAE password identifier (H2E-only)
@@ -70,8 +71,8 @@ wifis:
 #       auto: true
 #     ipv6:
 #       auto: true
-  # A second NIC: its networks run in a second WifiClient concurrently
-  # with the ones above.
+  # A second NIC: managed by the same WifiClient concurrently with the
+  # ones above.
   # - ssid: Test-WIFI-2
   #   password: "12345678"
   #   interface: wlan1

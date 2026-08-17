@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""The daemon runs one `WifiClient` per configured interface, so
-two interfaces connect to two APs concurrently.  Each interface gets its
+"""The daemon runs a single multi-interface `WifiClient`, so two
+interfaces connect to two APs concurrently.  Each interface gets its
 own static IP config applied.
 
 Topology: 4 mac80211_hwsim radios - two STAs (default netns, driven by

@@ -24,7 +24,7 @@ use wl_nl80211::{
 };
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError, WifiState,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface, WifiState,
     client::drain_request,
     config::SaePwe,
     crypto::ft::{
@@ -119,7 +119,7 @@ fn ft_reassoc_uses_rsnxe(
         && (sae_password_id.is_some() || sae_pwe.starts_h2e(ap_supports_h2e))
 }
 
-impl WifiClient {
+impl WifiIface {
     /// Register for the action frames roaming needs: WNM (category 10)
     /// so BTM Requests reach us (802.11-2020 §11.11.9), and the 802.11k
     /// Radio Measurement Neighbor Report Response (category 5, action 5)
@@ -734,7 +734,7 @@ impl WifiClient {
             match tokio::time::timeout(remaining, self.event_receiver.next())
                 .await
             {
-                Ok(Some((raw_msg, _addr))) => {
+                Ok(Some(raw_msg)) => {
                     if let Some(wl_nl80211::Nl80211Event::Frame { frame }) =
                         wl_nl80211::Nl80211Event::parse(raw_msg)
                         && frame.len() > 25
