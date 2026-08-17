@@ -157,6 +157,30 @@ fn test_sae_pk_status_127_fails_cleanly() {
     assert!(err.to_string().contains("SAE-PK"));
 }
 
+/// hostapd rejects a wrong-password SAE confirm with IEEE status 15
+/// (challenge failure); that must be reported as
+/// `ErrorKind::WrongPassword`, not a generic auth failure.
+#[test]
+fn test_sae_status_15_reports_wrong_password() {
+    let (mac_sta, mac_ap) = test_macs();
+    let mut auth = AuthMethod::new_sae(
+        "12345678",
+        "Test-WIFI",
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+        None,
+    )
+    .unwrap();
+    let err = match auth.process_frame(2, 15, &[]) {
+        Err(e) => e,
+        Ok(_) => panic!("expected a wrong-password failure"),
+    };
+    assert_eq!(err.kind, crate::ErrorKind::WrongPassword);
+    assert!(err.to_string().contains("wrong password"));
+}
+
 /// A transient SAE commit rejection (status 30 "refused temporarily")
 /// must not be treated as a fatal credential failure: 802.11-2020
 /// §12.4.8.6.4 discards the frame and retransmits the commit on the
@@ -324,4 +348,38 @@ fn test_sae_different_passwords() {
     ap.process_commit(&supp_scalar, &supp_elem).unwrap();
 
     assert_ne!(supp.pmk(), ap.pmk(), "PMK must differ");
+}
+
+/// When the AP and the STA use different passphrases, the SAE confirm
+/// verification must fail with an explicit wrong-password error (not a
+/// generic crypto failure) so callers know what went wrong.
+#[test]
+fn test_sae_wrong_password_confirm_mismatch() {
+    let mut rng = getrandom::SysRng;
+    let (mac_sta, mac_ap) = test_macs();
+    let ssid = "Test-WIFI";
+
+    let mut supp =
+        SaeAuth::new("12345678", ssid, mac_sta, mac_ap, true, false).unwrap();
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
+
+    let mut ap =
+        SaeAuth::new("wrong_password", ssid, mac_ap, mac_sta, true, false)
+            .unwrap();
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
+
+    supp.process_commit(&ap_scalar, &ap_elem).unwrap();
+    let ap_confirm = ap.process_commit(&supp_scalar, &supp_elem).unwrap();
+
+    let mut ap_confirm_body = vec![1u8, 0u8];
+    ap_confirm_body.extend_from_slice(&ap_confirm);
+
+    let err = supp
+        .process_confirm(&ap_confirm_body)
+        .expect_err("wrong password must fail the SAE confirm");
+    assert_eq!(err.kind, crate::ErrorKind::WrongPassword);
+    assert!(
+        err.to_string().contains("wrong password"),
+        "unexpected error: {err}"
+    );
 }

@@ -730,6 +730,38 @@ async fn wifi_client_sae_connect() {
     client.shutdown().await;
 }
 
+/// A wrong SAE passphrase must surface as an explicit
+/// `ErrorKind::WrongPassword` from `WifiClient::run()` instead of a
+/// generic retry state, so callers can tell the user to check the
+/// configured password.
+#[tokio::test]
+async fn wifi_client_wrong_sae_password_raises_error() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wrong_sae_password_raises_error: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("wrong-password"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let err = run_until_connected(&mut client, 20)
+        .await
+        .expect_err("wrong SAE password must raise an error");
+    assert_eq!(err.kind, crate::ErrorKind::WrongPassword);
+    assert!(
+        err.to_string().contains("wrong password"),
+        "unexpected error: {err}"
+    );
+    client.shutdown().await;
+}
+
 /// anti-clogging token. `anti_clogging_threshold=0` makes hostapd
 /// demand a token on every SAE commit (`use_anti_clogging()` returns 1
 /// unconditionally), so a successful connection proves the client
@@ -1200,6 +1232,37 @@ async fn wifi_client_wpa2_psk_connect() {
     assert!(
         ponged,
         "ICMP echo through the WPA2-PSK data path never succeeded:\n{last_err}"
+    );
+    client.shutdown().await;
+}
+
+/// A wrong WPA2-PSK passphrase must surface as an explicit
+/// `ErrorKind::WrongPassword` (either from the Message 3 MIC check or
+/// from the AP disconnecting the initial 4-way handshake).
+#[tokio::test]
+async fn wifi_client_wrong_wpa2_password_raises_error() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_wrong_wpa2_password_raises_error: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("wrong-password"));
+    let mut client = WifiClient::init(config).await.expect("init");
+    let err = run_until_connected(&mut client, 20)
+        .await
+        .expect_err("wrong WPA2-PSK password must raise an error");
+    assert_eq!(err.kind, crate::ErrorKind::WrongPassword);
+    assert!(
+        err.to_string().contains("wrong password"),
+        "unexpected error: {err}"
     );
     client.shutdown().await;
 }

@@ -10,6 +10,12 @@
    nl80211 socket and one event dispatcher that routes multicast events
    by `IFINDEX`.
 
+### Bug fixes
+ - Report wrong-password authentication failures as
+   `ErrorKind::WrongPassword` on `WifiClient::run()` /
+   `WifiRunResult::error` instead of only entering the generic
+   `FailedAuthentication` retry state.
+
 ## [0.2.0] - 2026-08-16
 ### Breaking changes
  - `WifiConfig` now holds a network list; use `add_network()` instead

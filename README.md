@@ -133,6 +133,7 @@ async fn main() -> Result<(), shuli::WifiError> {
 
     // Drive the connection: scan -> authenticate -> 4-way handshake.
     // Failed states retry on the next call; errors are logged and retried.
+    // A wrong password is returned as `ErrorKind::WrongPassword`.
     loop {
         match client.run().await {
             Ok(WifiState::ConnectedWithoutOffloadRekey) |

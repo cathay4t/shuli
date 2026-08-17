@@ -132,6 +132,10 @@ pub(crate) struct WifiIface {
     pub(crate) conn_handle: Nl80211ConnectionHandle,
     pub(crate) event_receiver: Nl80211EventReceiver,
     pub(crate) state: WifiState,
+    /// The most recent connection/auth error attached to a state
+    /// change, surfaced once to the caller by `run_multi()` (e.g. a
+    /// wrong-password rejection). Cleared when reported.
+    pub(crate) last_error: Option<WifiError>,
     /// Current scan-retry backoff in seconds; doubles after each scan
     /// that fails to find the SSID (capped at `RETRY_BACKOFF_MAX_SEC`)
     /// and resets to `RETRY_BACKOFF_INIT_SEC` once the SSID is found or
@@ -291,8 +295,10 @@ pub(crate) struct WifiIface {
 
 /// One state change reported by [`WifiClient::run_multi`].
 ///
-/// `error` is set when the interface's state machine hit a transient
-/// error; the client keeps running and will retry.
+/// `error` is set when the interface's state machine hit an error; the
+/// client keeps running and will retry. Authentication failures such as
+/// a wrong password are reported here with the exact `WifiError` (for
+/// example `ErrorKind::WrongPassword`).
 #[derive(Debug)]
 pub struct WifiRunResult {
     pub iface_name: String,
@@ -396,17 +402,17 @@ impl WifiClient {
         for (iface_name, iface) in &mut self.ifaces {
             let iface_name = iface_name.clone();
             futures.push(Box::pin(async move {
-                match iface.run().await {
-                    Ok(state) => WifiRunResult {
-                        iface_name,
-                        state,
-                        error: None,
-                    },
-                    Err(e) => WifiRunResult {
-                        iface_name,
-                        state: WifiState::Failed,
-                        error: Some(e),
-                    },
+                let (state, error) = match iface.run().await {
+                    Ok(state) => (state, iface.last_error.take()),
+                    Err(e) => {
+                        iface.last_error = None;
+                        (iface.state, Some(e))
+                    }
+                };
+                WifiRunResult {
+                    iface_name,
+                    state,
+                    error,
                 }
             }));
         }
@@ -417,6 +423,10 @@ impl WifiClient {
 
     /// Convenience for a single-interface client: see
     /// [`WifiClient::run_multi`] when managing more than one interface.
+    ///
+    /// Authentication failures such as a wrong password are returned as
+    /// `Err(WifiError)` with `ErrorKind::WrongPassword`; the client
+    /// still retries on the next call.
     pub async fn run(&mut self) -> Result<WifiState, WifiError> {
         if self.ifaces.len() != 1 {
             return Err(WifiError::new(
@@ -763,6 +773,7 @@ impl WifiIface {
             conn_handle,
             event_receiver,
             state: WifiState::Init,
+            last_error: None,
             scan_retry_interval: RETRY_BACKOFF_INIT_SEC,
             sched_scan_supported,
             sched_scan_active: false,
@@ -843,6 +854,7 @@ impl WifiIface {
             let prev_state = self.state;
             if let Err(e) = self._run().await {
                 log::warn!("WPA process error: {e}");
+                self.last_error = None;
                 self.state = if self.state == WifiState::Authenticating {
                     WifiState::FailedAuthentication
                 } else {
@@ -859,6 +871,13 @@ impl WifiIface {
                 return Ok(self.state);
             }
         }
+    }
+
+    /// Move into [`WifiState::FailedAuthentication`] and record the
+    /// error for the caller.
+    fn fail_auth(&mut self, error: WifiError) {
+        self.last_error = Some(error);
+        self.state = WifiState::FailedAuthentication;
     }
 
     async fn _run(&mut self) -> Result<(), WifiError> {
@@ -1120,6 +1139,19 @@ impl WifiIface {
                                 );
                                 self.restart_sae_with_hnp().await;
                                 continue;
+                            }
+                            if self.is_psk_4way_in_progress()
+                                && self.fourway.is_some()
+                            {
+                                let err = WifiError::wrong_password(
+                                    &self.network.ssid,
+                                );
+                                log::warn!(
+                                    "WPA2-PSK 4-way handshake timed out; \
+                                     treating as wrong password"
+                                );
+                                self.fail_auth(err);
+                                break;
                             }
                             log::warn!("authentication timed out; will retry");
                             self.state = WifiState::Failed;
@@ -1691,7 +1723,20 @@ impl WifiIface {
                     self.handle_auth_frame(&frame).await;
                 } else if status != Ieee80211StatusCode::Success {
                     log::warn!("AUTHENTICATE failed: status={status}");
-                    self.state = WifiState::FailedAuthentication;
+                    let err = if status == Ieee80211StatusCode::ChallengeFail {
+                        WifiError::new(
+                            ErrorKind::WrongPassword,
+                            "wrong password (SAE confirm rejected by AP)",
+                        )
+                    } else {
+                        WifiError::new(
+                            ErrorKind::AuthFailed,
+                            format!(
+                                "SAE authentication failed: status={status}"
+                            ),
+                        )
+                    };
+                    self.fail_auth(err);
                 } else {
                     log::debug!("AUTHENTICATE event without frame (status=0)");
                 }
@@ -1828,17 +1873,14 @@ impl WifiIface {
                     self.state,
                     WifiState::ConnectedWithoutOffloadRekey
                         | WifiState::ConnectedWithOffloadRekey
-                ) {
+                ) || (self.state == WifiState::Authenticating
+                    && self.is_psk_4way_in_progress())
+                {
                     // cfg80211-style drivers (e.g. brcmfmac) report the
                     // AP-initiated disconnect through CMD_DISCONNECT
                     // with the same IEEE 802.11 reason code; classify
                     // it like the deauth/disassoc events.
-                    log::warn!("DISCONNECT: reason={reason}");
-                    self.state = if is_fatal_disconnect_reason(Some(reason)) {
-                        WifiState::FailedAuthentication
-                    } else {
-                        WifiState::Failed
-                    };
+                    self.handle_ap_disconnect(Some(reason)).await;
                 } else {
                     // The kernel can trail a CMD_DISCONNECT behind the
                     // deauth/disassoc event (or a previous disconnect)
@@ -1914,8 +1956,8 @@ impl WifiIface {
     }
 
     /// An AP-initiated disconnect (deauth/disassoc, protected or not)
-    /// while connected: clean up the kernel connection state and
-    /// schedule a reconnect.
+    /// during a connection attempt or while connected: clean up the
+    /// kernel connection state and schedule a reconnect.
     ///
     /// Reason codes 2 (`PrevAuthNotValid`) and 23 (`Ieee8021xFailed`)
     /// mean the AP no longer accepts the current credentials/PMKSA -
@@ -1928,13 +1970,16 @@ impl WifiIface {
         &mut self,
         reason: Option<Ieee80211ReasonCode>,
     ) {
-        // Only act while connected: the kernel delivers the same
-        // disconnect as several events with a long delay between them,
-        // and acting on a stale one would tear down the reconnection
-        // already in flight (wpa_supplicant drops stale events the same
-        // way). During an FT roam these events are the expected
-        // consequence of CMD_AUTHENTICATE disconnecting the old AP -
-        // let the roam continue.
+        // During an FT roam these events are the expected consequence of
+        // CMD_AUTHENTICATE disconnecting the old AP - let the roam
+        // continue. While connected, classify credential failures. An
+        // initial WPA2-PSK handshake also counts as a credential
+        // failure: the passphrase is only verified by that handshake,
+        // so an AP disconnect there means the configured key is wrong.
+        // Stale events in every other state are ignored: the kernel
+        // delivers the same disconnect as several events with a long
+        // delay between them, and acting on a stale one would tear down
+        // the reconnection already in flight.
         if self.ft_roam.is_some() {
             log::debug!("AP disconnect during FT roam ignored (expected)");
         } else if matches!(
@@ -1961,11 +2006,28 @@ impl WifiIface {
             {
                 log::debug!("disconnect cleanup failed: {e}");
             }
-            self.state = if fatal {
-                WifiState::FailedAuthentication
+            if fatal {
+                self.fail_auth(fatal_disconnect_error(reason));
             } else {
-                WifiState::Failed
-            };
+                self.state = WifiState::Failed;
+            }
+        } else if self.state == WifiState::Authenticating
+            && self.is_psk_4way_in_progress()
+        {
+            // wpa_supplicant's `could_be_psk_mismatch()` treats an AP
+            // disconnect during the initial PSK 4-way handshake as a
+            // wrong passphrase. Surface it as `WrongPassword` instead of
+            // silently retrying on the short backoff.
+            log::warn!(
+                "AP disconnect during WPA2-PSK/FT-PSK 4-way handshake \
+                 (reason={reason:?}); treating as wrong password"
+            );
+            if let Err(e) =
+                connect::disconnect(&mut self.conn_handle, self.if_index).await
+            {
+                log::debug!("disconnect cleanup failed: {e}");
+            }
+            self.fail_auth(WifiError::wrong_password(&self.network.ssid));
         } else {
             log::debug!(
                 "stale AP disconnect (reason={reason:?}) in state {:?}; \
@@ -1973,6 +2035,19 @@ impl WifiIface {
                 self.state
             );
         }
+    }
+
+    /// Whether the current connection attempt is an initial WPA2-PSK /
+    /// FT-PSK 4-way handshake (i.e. the passphrase is verified by the
+    /// handshake, not by an earlier SAE/PMKSA exchange).
+    fn is_psk_4way_in_progress(&self) -> bool {
+        self.pmksa_in_use.is_none()
+            && matches!(
+                self.bss_info.security,
+                SecurityType::Wpa2Psk
+                    | SecurityType::Wpa2PskSha256
+                    | SecurityType::FtPsk
+            )
     }
 
     /// the device woke the host while it was suspended. Clear the
@@ -2062,7 +2137,7 @@ impl WifiIface {
                         // SAE crypto failure (wrong password / confirm
                         // mismatch): use the long retry backoff.
                         log::warn!("{e}");
-                        self.state = WifiState::FailedAuthentication;
+                        self.fail_auth(e);
                         return;
                     }
                 }
@@ -2113,7 +2188,7 @@ impl WifiIface {
                         Ok(data) => data,
                         Err(e) => {
                             log::warn!("SAE token commit failed: {e}");
-                            self.state = WifiState::FailedAuthentication;
+                            self.fail_auth(e);
                             return;
                         }
                     },
@@ -2226,7 +2301,10 @@ impl WifiIface {
     async fn restart_sae_with_hnp(&mut self) {
         let Some(password) = self.network.password.as_deref() else {
             log::warn!("no password for HnP SAE restart");
-            self.state = WifiState::FailedAuthentication;
+            self.fail_auth(WifiError::new(
+                ErrorKind::InvalidConfig,
+                "no password for HnP SAE restart",
+            ));
             return;
         };
         let auth = match AuthMethod::new_sae(
@@ -2241,7 +2319,7 @@ impl WifiIface {
             Ok(auth) => auth,
             Err(e) => {
                 log::warn!("HnP SAE restart failed: {e}");
-                self.state = WifiState::FailedAuthentication;
+                self.fail_auth(e);
                 return;
             }
         };
@@ -2251,7 +2329,7 @@ impl WifiIface {
             Ok(data) => data,
             Err(e) => {
                 log::warn!("HnP SAE commit failed: {e}");
-                self.state = WifiState::FailedAuthentication;
+                self.fail_auth(e);
                 return;
             }
         };
@@ -2567,6 +2645,20 @@ impl WifiIface {
                         log::warn!("process_message_3 failed: {e}");
                         if self.pmksa_in_use.is_some() {
                             self.pmksa_fallback().await;
+                        } else if matches!(
+                            self.bss_info.security,
+                            SecurityType::Wpa2Psk
+                                | SecurityType::Wpa2PskSha256
+                                | SecurityType::FtPsk
+                        ) && e.msg == "MIC mismatch"
+                        {
+                            // WPA2-PSK/FT-PSK verifies the passphrase
+                            // only in the 4-way handshake; a Message 3
+                            // MIC mismatch is the wrong-password signal.
+                            let err =
+                                WifiError::wrong_password(&self.network.ssid);
+                            log::warn!("{err}");
+                            self.fail_auth(err);
                         } else {
                             self.state = WifiState::Failed;
                         }
@@ -2885,7 +2977,10 @@ impl WifiIface {
             Ok(EapAction::Success) => {
                 let Some(msk) = peer.msk() else {
                     log::warn!("EAP-Success without an MSK");
-                    self.state = WifiState::FailedAuthentication;
+                    self.fail_auth(WifiError::new(
+                        ErrorKind::AuthFailed,
+                        "EAP-Success without an MSK",
+                    ));
                     return;
                 };
                 let mut pmk = [0u8; 32];
@@ -2898,12 +2993,19 @@ impl WifiIface {
             }
             Ok(EapAction::Failure) => {
                 log::warn!("EAP failure");
-                self.state = WifiState::FailedAuthentication;
+                self.fail_auth(WifiError::new(
+                    ErrorKind::AuthFailed,
+                    "EAP authentication failed: check the configured EAP \
+                     credentials",
+                ));
             }
             Ok(EapAction::Wait) => {}
             Err(e) => {
                 log::warn!("EAP error: {e}");
-                self.state = WifiState::FailedAuthentication;
+                self.fail_auth(WifiError::new(
+                    ErrorKind::AuthFailed,
+                    format!("EAP authentication failed: {e}"),
+                ));
             }
         }
     }
@@ -3236,6 +3338,27 @@ fn wowlan_wakeup_requires_reconnect(reasons: &[Nl80211WowlanWakeup]) -> bool {
                 | Nl80211WowlanWakeup::Disconnect
         )
     })
+}
+
+/// The error reported to callers when the AP rejects the current
+/// credentials/PMKSA with a fatal disconnect reason.
+fn fatal_disconnect_error(reason: Option<Ieee80211ReasonCode>) -> WifiError {
+    match reason {
+        Some(Ieee80211ReasonCode::PrevAuthNotValid) => WifiError::new(
+            ErrorKind::WrongPassword,
+            "AP rejected authentication (prev_auth_not_valid): the configured \
+             password is wrong or the PMKSA is stale",
+        ),
+        Some(Ieee80211ReasonCode::Ieee8021xFailed) => WifiError::new(
+            ErrorKind::AuthFailed,
+            "AP rejected 802.1X authentication (ieee8021x_failed): check the \
+             configured EAP credentials",
+        ),
+        _ => WifiError::new(
+            ErrorKind::AuthFailed,
+            "AP rejected authentication; check the configured credentials",
+        ),
+    }
 }
 
 /// Whether an AP-initiated disconnect reason means a fatal
@@ -3808,9 +3931,9 @@ mod tests {
     };
 
     use super::{
-        MAX_SCHED_SCAN_SSIDS, desired_wowlan_triggers, fmt_transition_disable,
-        is_fatal_disconnect_reason, next_sched_scan_ssids,
-        wowlan_wakeup_requires_reconnect,
+        MAX_SCHED_SCAN_SSIDS, desired_wowlan_triggers, fatal_disconnect_error,
+        fmt_transition_disable, is_fatal_disconnect_reason,
+        next_sched_scan_ssids, wowlan_wakeup_requires_reconnect,
     };
 
     /// reasons 2 (PREV_AUTH_NOT_VALID) and 23
@@ -3825,6 +3948,21 @@ mod tests {
         assert!(is_fatal_disconnect_reason(Some(
             Ieee80211ReasonCode::Ieee8021xFailed
         )));
+    }
+
+    #[test]
+    fn fatal_disconnect_error_reports_wrong_password() {
+        let err =
+            fatal_disconnect_error(Some(Ieee80211ReasonCode::PrevAuthNotValid));
+        assert_eq!(err.kind, crate::ErrorKind::WrongPassword);
+        assert!(
+            err.to_string().contains("password is wrong"),
+            "unexpected error: {err}"
+        );
+
+        let err =
+            fatal_disconnect_error(Some(Ieee80211ReasonCode::Ieee8021xFailed));
+        assert_eq!(err.kind, crate::ErrorKind::AuthFailed);
     }
 
     #[test]

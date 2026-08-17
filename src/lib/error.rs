@@ -11,6 +11,7 @@ pub enum ErrorKind {
     ScanFailed,
     ConnectFailed,
     AuthFailed,
+    WrongPassword,
     KeyInstallFailed,
     SaeFailed,
     HandshakeFailed,
@@ -32,6 +33,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::ScanFailed => "scan-failed",
             ErrorKind::ConnectFailed => "connect-failed",
             ErrorKind::AuthFailed => "auth-failed",
+            ErrorKind::WrongPassword => "wrong-password",
             ErrorKind::KeyInstallFailed => "key-install-failed",
             ErrorKind::SaeFailed => "sae-failed",
             ErrorKind::HandshakeFailed => "handshake-failed",
@@ -58,6 +60,14 @@ impl WifiError {
             kind,
             msg: msg.into(),
         }
+    }
+
+    /// A credential failure against a password-protected network.
+    pub fn wrong_password(ssid: &str) -> Self {
+        WifiError::new(
+            ErrorKind::WrongPassword,
+            format!("wrong password for SSID '{ssid}'"),
+        )
     }
 }
 

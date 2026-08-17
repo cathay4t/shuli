@@ -150,6 +150,17 @@ fn process_sae_frame(
         ));
     }
 
+    // status 15 = challenge failure. hostapd answers the STA's SAE
+    // confirm with this status when the confirm verification failed,
+    // which for a password-protected network means the configured
+    // passphrase is wrong.
+    if auth_seq == 2 && status == 15 {
+        return Err(WifiError::new(
+            ErrorKind::WrongPassword,
+            "wrong password (SAE confirm rejected by AP)",
+        ));
+    }
+
     // status 127 = SAE-PK required.  shuli does not
     // implement the SAE-PK crypto (PWE + ECDSA confirm signature) yet,
     // so fail cleanly instead of looping with regular SAE.

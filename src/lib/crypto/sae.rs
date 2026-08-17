@@ -330,8 +330,8 @@ impl SaeAuth {
         .is_err()
         {
             return Err(WifiError::new(
-                ErrorKind::SaeFailed,
-                "confirm mismatch",
+                ErrorKind::WrongPassword,
+                "wrong password (SAE confirm mismatch)",
             ));
         }
 
