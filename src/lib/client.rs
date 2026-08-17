@@ -781,11 +781,12 @@ impl WifiIface {
 
     async fn _run(&mut self) -> Result<(), WifiError> {
         // With no configured networks the client idles: never start a
-        // scan with an empty SSID list. The owner (nipart wifi plugin)
-        // keeps calling run() only while networks are configured, this
-        // guard just makes an accidental call harmless.
+        // scan with an empty SSID list. Sleep instead of busy-looping so
+        // a multi-interface `WifiClient` can keep an empty interface
+        // without spinning the runtime.
         if self.config.networks.is_empty() {
             self.state = WifiState::Init;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return Ok(());
         }
         match self.state {
