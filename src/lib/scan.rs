@@ -243,20 +243,25 @@ impl WifiIface {
         // per-scan cap and always keep one wildcard entry, so every scan
         // also finds all visible networks. The hidden list rotates across
         // scans when it does not fit in one request.
-        let hidden_ssids: Vec<String> =
-            self.config.hidden_ssids().map(str::to_string).collect();
+        let hidden_ssids: Vec<String> = self
+            .core
+            .config
+            .hidden_ssids()
+            .map(str::to_string)
+            .collect();
         let ssids = next_scan_ssids(
             &hidden_ssids,
-            &mut self.scan_ssid_cursor,
-            &mut self.scan_wildcard_next,
-            self.max_scan_ssids,
+            &mut self.scan.scan_ssid_cursor,
+            &mut self.scan.scan_wildcard_next,
+            self.caps.max_scan_ssids,
         );
         // Roam scans start as *quick* scans restricted to frequencies
         // where the ESS has already been seen (last scan results + BTM
         // neighbor-report entries); only the full-scan fallback sweeps
         // every channel. Non-roam scans always sweep everything.
-        let freqs = if self.roam_scan && !self.roam_scan_full {
+        let freqs = if self.roam.roam_scan && !self.roam.roam_scan_full {
             let freqs: Vec<u32> = self
+                .roam
                 .roam_freqs
                 .iter()
                 .copied()
@@ -266,7 +271,7 @@ impl WifiIface {
         } else {
             None
         };
-        match (&freqs, self.roam_scan) {
+        match (&freqs, self.roam.roam_scan) {
             (Some(freqs), true) => log::trace!(
                 "roam quick scan for SSIDs [{}] on {} known frequencies [{}]",
                 format_ssids(&ssids),
@@ -289,8 +294,8 @@ impl WifiIface {
             (Some(_), false) => unreachable!("non-roam scans never restrict"),
         }
         trigger_scan(
-            &self.handle,
-            self.if_index,
+            &self.core.handle,
+            self.core.if_index,
             Some(&ssids),
             freqs.as_deref(),
         )
@@ -316,8 +321,11 @@ impl WifiIface {
             if remaining.is_zero() {
                 break;
             }
-            match tokio::time::timeout(remaining, self.event_receiver.next())
-                .await
+            match tokio::time::timeout(
+                remaining,
+                self.core.event_receiver.next(),
+            )
+            .await
             {
                 Ok(Some(raw_msg)) => {
                     if let Some(event) =
@@ -325,7 +333,7 @@ impl WifiIface {
                     {
                         match event {
                             Nl80211Event::NewScanResults => {
-                                if self.roam_scan {
+                                if self.roam.roam_scan {
                                     log::trace!("scan finished");
                                 } else {
                                     log::debug!("scan finished");
@@ -359,14 +367,16 @@ impl WifiIface {
 
         // A roam that fell back to full reconnection steers the retry
         // loop to its target BSSID; otherwise the strongest BSS wins.
-        let hinted = self.roam_target.take().and_then(|hint| {
-            self.last_scan_candidates
+        let hinted = self.roam.roam_target.take().and_then(|hint| {
+            self.roam
+                .last_scan_candidates
                 .iter()
                 .find(|(bss, _)| bss.bssid == hint)
                 .cloned()
         });
         let best = hinted.or_else(|| {
-            self.last_scan_candidates
+            self.roam
+                .last_scan_candidates
                 .iter()
                 .max_by(|a, b| a.0.cmp(&b.0))
                 .cloned()
@@ -376,18 +386,18 @@ impl WifiIface {
                 ErrorKind::SsidNotFound,
                 format!(
                     "no configured SSID ([{}]) found in scan results",
-                    self.config.ssids().collect::<Vec<_>>().join(", ")
+                    self.core.config.ssids().collect::<Vec<_>>().join(", ")
                 ),
             ));
         };
-        self.bss_info = bss_info;
-        self.network = network;
+        self.link.bss_info = bss_info;
+        self.link.network = network;
         log::info!(
             "selected BSS: ssid={}, bssid={:02x?}, freq={} MHz, signal={} dBm",
-            self.network.ssid,
-            self.bss_info.bssid,
-            self.bss_info.freq_mhz,
-            self.bss_info.signal_dbm
+            self.link.network.ssid,
+            self.link.bss_info.bssid,
+            self.link.bss_info.freq_mhz,
+            self.link.bss_info.signal_dbm
         );
         Ok(())
     }
@@ -406,9 +416,9 @@ impl WifiIface {
             log::warn!("roam scan failed: {e}");
             return;
         }
-        self.roam_scan_count += 1;
-        let current_base = self.bss_info.security.base();
-        let current_ssid = self.network.ssid.clone();
+        self.roam.roam_scan_count += 1;
+        let current_base = self.link.bss_info.security.base();
+        let current_ssid = self.link.network.ssid.clone();
         // The scan was started because the signal measured below the roam
         // threshold (CQM LOW / poll), but the live signal of the current
         // BSS may have recovered while the scan ran - the scan dump of the
@@ -420,11 +430,12 @@ impl WifiIface {
         // healthy again, so stay instead of roaming to a possibly weaker
         // BSS.
         let scan_dump_current = self
+            .roam
             .last_scan_candidates
             .iter()
-            .find(|(bss, _)| bss.bssid == self.bss_info.bssid)
+            .find(|(bss, _)| bss.bssid == self.link.bss_info.bssid)
             .map(|(bss, _)| bss.signal_dbm)
-            .unwrap_or(self.bss_info.signal_dbm);
+            .unwrap_or(self.link.bss_info.signal_dbm);
         let current_signal = match self.current_signal_dbm().await {
             Ok(Some(live)) => {
                 // The current link is healthy again - stay instead of
@@ -442,16 +453,17 @@ impl WifiIface {
             }
             _ => scan_dump_current,
         };
-        let strict = self.background_scan;
+        let strict = self.roam.background_scan;
         // Same-network candidates: any BSS of the *connected* SSID (its
         // security family, FT or not) that is not weaker than the current
         // one. A different configured SSID only qualifies through the
         // critical-link branch below.
         let best = self
+            .roam
             .last_scan_candidates
             .iter()
             .filter(|(bss, network)| {
-                bss.bssid != self.bss_info.bssid
+                bss.bssid != self.link.bss_info.bssid
                     && network.ssid == current_ssid
                     && bss.security.base() == current_base
                     && if strict {
@@ -463,21 +475,22 @@ impl WifiIface {
             .max_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(bss, _)| bss.clone());
         let mut target = best;
-        let mut target_network = self.network.clone();
+        let mut target_network = self.link.network.clone();
         if target.is_none()
-            && current_signal < self.network.switch_ssid_lower_than_dbm
+            && current_signal < self.link.network.switch_ssid_lower_than_dbm
         {
             // The current link is critical: abandon it for a
             // well-signalled BSS of a different configured SSID, even
             // though switching terminates the current session.
             let good_signal = self
                 .roam_threshold()
-                .unwrap_or(self.network.switch_ssid_lower_than_dbm);
+                .unwrap_or(self.link.network.switch_ssid_lower_than_dbm);
             if let Some((bss, network)) = self
+                .roam
                 .last_scan_candidates
                 .iter()
                 .filter(|(bss, network)| {
-                    bss.bssid != self.bss_info.bssid
+                    bss.bssid != self.link.bss_info.bssid
                         && network.ssid != current_ssid
                         && bss.signal_dbm >= good_signal
                         && network.can_roam_to_security(bss.security)
@@ -488,7 +501,7 @@ impl WifiIface {
                     "current signal {current_signal} dBm is below the \
                      critical {} dBm; switching to configured SSID {} (bssid \
                      {:02x?}, signal {} dBm)",
-                    self.network.switch_ssid_lower_than_dbm,
+                    self.link.network.switch_ssid_lower_than_dbm,
                     network.ssid,
                     bss.bssid,
                     bss.signal_dbm
@@ -503,7 +516,7 @@ impl WifiIface {
             // threshold (iwd escalates the same way in
             // `station_roam_failed`). The full scan runs at most once
             // per episode.
-            if !self.roam_scan_full
+            if !self.roam.roam_scan_full
                 && self
                     .roam_threshold()
                     .is_some_and(|threshold| current_signal < threshold)
@@ -511,7 +524,7 @@ impl WifiIface {
                 log::info!(
                     "roam quick scan found no better BSS on {} known \
                      frequencies; falling back to a full scan",
-                    self.roam_freqs.len()
+                    self.roam.roam_freqs.len()
                 );
                 self.trigger_roam_scan(true).await;
                 return;
@@ -531,7 +544,8 @@ impl WifiIface {
     /// Dump the scan results and record every BSS whose SSID matches a
     /// configured network in `last_scan_candidates`.
     async fn collect_scan_candidates(&mut self) -> Result<(), WifiError> {
-        let bss_list = get_scan_results(&self.handle, self.if_index).await?;
+        let bss_list =
+            get_scan_results(&self.core.handle, self.core.if_index).await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
         let mut candidates: Vec<(BssInfo, NetworkConfig)> = Vec::new();
@@ -543,6 +557,7 @@ impl WifiIface {
                 continue;
             };
             let Some(network) = self
+                .core
                 .config
                 .networks
                 .iter()
@@ -597,13 +612,14 @@ impl WifiIface {
             ));
         }
 
-        self.last_scan_candidates = candidates;
+        self.roam.last_scan_candidates = candidates;
         // Keep the channels where the ESS has been seen so the next
         // signal-triggered roam starts with a quick scan instead of a
         // full multi-band sweep (iwd / wpa_supplicant bgscan=learn do
         // the same). The current BSS frequency is included so a
         // same-channel peer is probed too.
         let mut freqs: Vec<u32> = self
+            .roam
             .last_scan_candidates
             .iter()
             .map(|(bss, _)| bss.freq_mhz)
@@ -612,12 +628,12 @@ impl WifiIface {
         // freq 0; never let a zero frequency into the kernel's
         // NL80211_ATTR_SCAN_FREQUENCIES (it rejects the scan with
         // EINVAL, silently downgrading every quick scan to a full one).
-        if self.bss_info.freq_mhz != 0 {
-            freqs.push(self.bss_info.freq_mhz);
+        if self.link.bss_info.freq_mhz != 0 {
+            freqs.push(self.link.bss_info.freq_mhz);
         }
         freqs.sort_unstable();
         freqs.dedup();
-        self.roam_freqs = freqs
+        self.roam.roam_freqs = freqs
             .into_iter()
             .take(crate::roam::ROAM_QUICK_SCAN_MAX_FREQS)
             .collect();

@@ -268,52 +268,52 @@ impl WifiIface {
     pub(crate) async fn send_out_auth_request(
         &mut self,
     ) -> Result<(), WifiError> {
-        self.auth = None;
-        self.fourway = None;
+        self.auth.method = None;
+        self.link.fourway = None;
         // A new connection attempt starts a fresh SAE/PSK exchange, so the
         // previous attempt's FT key hierarchy (PMK-R0/R1, derived from the
         // old PMK) is invalid. Keeping it would let an early 4-way Message 1
         // (arriving before the association response) answer with a stale
         // PMK-R1 and stall the handshake.
-        self.ft = None;
-        self.psk_pmk = None;
-        self.pmksa_in_use = None;
-        self.pending_ft_msg1 = None;
-        self.ft_roam = None;
-        self.sae_commit_sent = false;
-        self.sae_sync = 0;
-        self.sae_commit_auth_data.clear();
-        self.sae_hnp_attempted = false;
-        self.eap_peer = None;
-        self.eap_pmk = None;
+        self.link.ft = None;
+        self.auth.psk_pmk = None;
+        self.link.pmksa_in_use = None;
+        self.link.pending_ft_msg1 = None;
+        self.roam.ft_roam = None;
+        self.auth.sae_commit_sent = false;
+        self.auth.sae_sync = 0;
+        self.auth.sae_commit_auth_data.clear();
+        self.auth.sae_hnp_attempted = false;
+        self.auth.eap_peer = None;
+        self.auth.eap_pmk = None;
 
         // WPA2-Enterprise runs EAP over the control port
         // after association.  Prepare the EAP peer + EAP-TLS method
         // now, so the first EAP-Request/Identity finds it ready.
         if matches!(
-            self.bss_info.security,
+            self.link.bss_info.security,
             SecurityType::Wpa2Ent | SecurityType::Wpa2EntSha256
         ) {
-            let eap_cfg = self.network.eap.as_ref().ok_or_else(|| {
+            let eap_cfg = self.link.network.eap.as_ref().ok_or_else(|| {
                 WifiError::new(
                     ErrorKind::InvalidConfig,
                     format!(
                         "{:?} network requires EAP credentials",
-                        self.bss_info.security
+                        self.link.bss_info.security
                     ),
                 )
             })?;
             let method = EapTlsMethod::from_config(eap_cfg)?;
             let mut peer = EapPeer::new(eap_cfg.identity.clone());
             peer.set_method(Box::new(method));
-            self.eap_peer = Some(peer);
+            self.auth.eap_peer = Some(peer);
         }
 
         // a cached PMKSA for the selected BSS replaces the full
         // authentication (SAE) with open-system auth + a PMKID-bearing
         // RSNE at association time.
         if matches!(
-            self.bss_info.security,
+            self.link.bss_info.security,
             SecurityType::Sae
                 | SecurityType::SaeExtKey
                 | SecurityType::Wpa2Psk
@@ -323,20 +323,20 @@ impl WifiIface {
                 | SecurityType::FtPsk
         ) && let Some(entry) = self
             .pmksa_cache
-            .lookup(&self.network.ssid, self.bss_info.bssid)
+            .lookup(&self.link.network.ssid, self.link.bss_info.bssid)
         {
             log::info!(
                 "PMKSA cache hit for BSSID {:02x?} (pmkid {:02x?}); skipping \
                  full authentication",
-                self.bss_info.bssid,
+                self.link.bss_info.bssid,
                 entry.pmkid
             );
-            self.pmksa_in_use = Some(entry);
+            self.link.pmksa_in_use = Some(entry);
         }
 
-        if self.pmksa_in_use.is_some()
+        if self.link.pmksa_in_use.is_some()
             || !matches!(
-                self.bss_info.security,
+                self.link.bss_info.security,
                 SecurityType::Sae
                     | SecurityType::SaeExtKey
                     | SecurityType::FtSae
@@ -347,88 +347,90 @@ impl WifiIface {
             // and cached-PMKSA connections. OWE's DH exchange happens in
             // the association request/response; the PSK AKMs derive the
             // PMK from the passphrase via PBKDF2.
-            if self.pmksa_in_use.is_none()
+            if self.link.pmksa_in_use.is_none()
                 && matches!(
-                    self.bss_info.security,
+                    self.link.bss_info.security,
                     SecurityType::Wpa2Psk
                         | SecurityType::Wpa2PskSha256
                         | SecurityType::FtPsk
                 )
             {
                 let password =
-                    self.network.password.as_deref().ok_or_else(|| {
+                    self.link.network.password.as_deref().ok_or_else(|| {
                         WifiError::new(
                             ErrorKind::InvalidConfig,
                             "password required for WPA2-PSK",
                         )
                     })?;
-                self.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
+                self.auth.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
                     password,
-                    &self.network.ssid,
+                    &self.link.network.ssid,
                 ));
             }
             log::info!(
                 "open-system AUTHENTICATE ({:?} network)",
-                self.bss_info.security
+                self.link.bss_info.security
             );
-            let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
-                .ssid(&self.network.ssid)
-                .mac(self.bss_info.bssid)
-                .frequency(self.bss_info.freq_mhz)
-                .auth_type(wl_nl80211::Nl80211AuthType::OpenSystem)
-                .build();
+            let attrs =
+                wl_nl80211::Nl80211Authenticate::new(self.core.if_index)
+                    .ssid(&self.link.network.ssid)
+                    .mac(self.link.bss_info.bssid)
+                    .frequency(self.link.bss_info.freq_mhz)
+                    .auth_type(wl_nl80211::Nl80211AuthType::OpenSystem)
+                    .build();
             return crate::client::drain_request(
-                self.conn_handle.authenticate(attrs).execute().await,
+                self.core.conn_handle.authenticate(attrs).execute().await,
             )
             .await;
         }
 
-        let password = self.network.password.as_deref().ok_or_else(|| {
-            WifiError::new(
-                ErrorKind::InvalidConfig,
-                "password required for encrypted network",
-            )
-        })?;
+        let password =
+            self.link.network.password.as_deref().ok_or_else(|| {
+                WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    "password required for encrypted network",
+                )
+            })?;
         // `Auto` follows the AP's RSNXE from the scan instead of
         // guessing H2E first - an AP that never advertises H2E support
         // (or advertises none at all) gets hunting-and-pecking on the
         // very first commit, instead of one shuli discovers only after
         // the H2E commit is silently dropped and times out.
-        let ap_supports_h2e = self.bss_info.ap_supports_sae_h2e();
+        let ap_supports_h2e = self.link.bss_info.ap_supports_sae_h2e();
         log::debug!(
             "AP RSNXE advertises SAE H2E: {ap_supports_h2e} (sae_pwe={:?})",
-            self.network.sae_pwe
+            self.link.network.sae_pwe
         );
-        self.auth = Some(AuthMethod::new_sae(
+        self.auth.method = Some(AuthMethod::new_sae(
             password,
-            &self.network.ssid,
-            self.mac,
-            self.bss_info.bssid,
-            self.network.sae_pwe.starts_h2e(ap_supports_h2e)
-                || self.network.sae_password_id.is_some(),
-            self.network.sae_pwe.allows_hnp_fallback()
-                && self.network.sae_password_id.is_none(),
-            self.network.sae_password_id.as_deref(),
+            &self.link.network.ssid,
+            self.core.mac,
+            self.link.bss_info.bssid,
+            self.link.network.sae_pwe.starts_h2e(ap_supports_h2e)
+                || self.link.network.sae_password_id.is_some(),
+            self.link.network.sae_pwe.allows_hnp_fallback()
+                && self.link.network.sae_password_id.is_none(),
+            self.link.network.sae_password_id.as_deref(),
         )?);
 
-        let auth_data = self.auth.as_mut().unwrap().initial_frame()?;
-        let attrs = wl_nl80211::Nl80211Authenticate::new(self.if_index)
-            .ssid(&self.network.ssid)
-            .mac(self.bss_info.bssid)
-            .frequency(self.bss_info.freq_mhz)
+        let auth_data = self.auth.method.as_mut().unwrap().initial_frame()?;
+        let attrs = wl_nl80211::Nl80211Authenticate::new(self.core.if_index)
+            .ssid(&self.link.network.ssid)
+            .mac(self.link.bss_info.bssid)
+            .frequency(self.link.bss_info.freq_mhz)
             .auth_type(wl_nl80211::Nl80211AuthType::Sae)
             // NL80211_ATTR_AUTH_DATA: SAE commit (trans||status||body)
             .auth_data(auth_data.clone())
             .build();
         crate::client::drain_request(
-            self.conn_handle.authenticate(attrs).execute().await,
+            self.core.conn_handle.authenticate(attrs).execute().await,
         )
         .await?;
         // remember the commit so a lost frame is answered with a
         // retransmission (SAE Sync) instead of a full rescan cycle.
-        self.sae_commit_sent = true;
-        self.sae_sync = 0;
-        self.sae_commit_auth_data = auth_data;
+        self.auth.sae_commit_sent = true;
+        self.auth.sae_sync = 0;
+        self.auth.sae_commit_auth_data = auth_data;
         Ok(())
     }
 }

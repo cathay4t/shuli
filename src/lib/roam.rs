@@ -125,18 +125,18 @@ impl WifiIface {
     /// Radio Measurement Neighbor Report Response (category 5, action 5)
     /// so the active neighbor-report path sees the AP's answer.
     pub(crate) async fn register_roam_frames(&mut self) {
-        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.if_index)
+        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.core.if_index)
             .frame_type(FRAME_TYPE_ACTION)
             .frame_match(vec![WNM_ACTION_CATEGORY])
             .build();
         if let Err(e) = drain_request(
-            self.conn_handle.register_frame(attrs).execute().await,
+            self.core.conn_handle.register_frame(attrs).execute().await,
         )
         .await
         {
             log::debug!("register WNM action frames failed: {e}");
         }
-        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.if_index)
+        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.core.if_index)
             .frame_type(FRAME_TYPE_ACTION)
             .frame_match(vec![
                 RRM_ACTION_CATEGORY,
@@ -144,7 +144,7 @@ impl WifiIface {
             ])
             .build();
         if let Err(e) = drain_request(
-            self.conn_handle.register_frame(attrs).execute().await,
+            self.core.conn_handle.register_frame(attrs).execute().await,
         )
         .await
         {
@@ -155,9 +155,10 @@ impl WifiIface {
     /// The roam threshold, or `None` when signal-triggered roaming is
     /// disabled for the connected network.
     pub(crate) fn roam_threshold(&self) -> Option<i32> {
-        self.network
+        self.link
+            .network
             .roaming
-            .then_some(self.network.roaming_threshold)
+            .then_some(self.link.network.roaming_threshold)
     }
 
     /// Append the Mobility Domain element to the association request IEs
@@ -167,7 +168,7 @@ impl WifiIface {
         &self,
         ies: &mut Vec<u8>,
     ) -> Result<(), WifiError> {
-        let Some(mdie) = self.bss_info.mdie else {
+        let Some(mdie) = self.link.bss_info.mdie else {
             return Err(WifiError::new(
                 ErrorKind::Roaming,
                 "FT BSS without MDIE in scan results",
@@ -220,13 +221,13 @@ impl WifiIface {
             )
         })?;
 
-        let xxkey = match self.bss_info.security {
+        let xxkey = match self.link.bss_info.security {
             SecurityType::FtSae | SecurityType::FtSaeExtKey => {
-                self.auth.as_ref().and_then(|a| a.pmk()).ok_or_else(|| {
-                    WifiError::new(ErrorKind::Roaming, "no SAE PMK for FT")
-                })?
+                self.auth.method.as_ref().and_then(|a| a.pmk()).ok_or_else(
+                    || WifiError::new(ErrorKind::Roaming, "no SAE PMK for FT"),
+                )?
             }
-            SecurityType::FtPsk => self.psk_pmk.ok_or_else(|| {
+            SecurityType::FtPsk => self.auth.psk_pmk.ok_or_else(|| {
                 WifiError::new(ErrorKind::Roaming, "no PSK PMK for FT")
             })?,
             other => {
@@ -237,9 +238,14 @@ impl WifiIface {
             }
         };
 
-        let pmk_r0 =
-            derive_pmk_r0(&xxkey, &self.network.ssid, mdid, &r0kh_id, self.mac);
-        let pmk_r1 = derive_pmk_r1(&pmk_r0, r1kh_id, self.mac);
+        let pmk_r0 = derive_pmk_r0(
+            &xxkey,
+            &self.link.network.ssid,
+            mdid,
+            &r0kh_id,
+            self.core.mac,
+        );
+        let pmk_r1 = derive_pmk_r1(&pmk_r0, r1kh_id, self.core.mac);
 
         // MDIE + FTIE of the response are echoed in the 4-way Message 2
         // key data for FT AKMs.
@@ -256,7 +262,7 @@ impl WifiIface {
              r1kh-id={r1kh_id:02x?} pmkr0name={:02x?}",
             pmk_r0.name
         );
-        self.ft = Some(FtContext {
+        self.link.ft = Some(FtContext {
             mdid,
             ft_capab,
             r0kh_id,
@@ -275,15 +281,15 @@ impl WifiIface {
         let Some(threshold) = self.roam_threshold() else {
             return;
         };
-        if !self.bss_info.ap_supports_signal_roam() {
+        if !self.link.bss_info.ap_supports_signal_roam() {
             return;
         }
-        if self.ft_roam.is_some() || self.roam_scan {
+        if self.roam.ft_roam.is_some() || self.roam.roam_scan {
             return;
         }
         // Cooldown after the previous roam: with equal-signal BSSes the
         // threshold check alone would ping-pong the client forever.
-        if let Some(last) = self.last_roam
+        if let Some(last) = self.roam.last_roam
             && last.elapsed() < ROAM_COOLDOWN
         {
             return;
@@ -303,7 +309,7 @@ impl WifiIface {
             "signal {signal} dBm below roam threshold {threshold} dBm; \
              scanning for roam candidates"
         );
-        self.background_scan = false;
+        self.roam.background_scan = false;
         self.trigger_roam_scan(false).await;
     }
 
@@ -318,18 +324,18 @@ impl WifiIface {
         if self.roam_threshold().is_none() {
             return;
         }
-        if !self.bss_info.ap_supports_signal_roam() {
+        if !self.link.bss_info.ap_supports_signal_roam() {
             return;
         }
-        if self.ft_roam.is_some() || self.roam_scan {
+        if self.roam.ft_roam.is_some() || self.roam.roam_scan {
             return;
         }
-        if let Some(last) = self.last_roam
+        if let Some(last) = self.roam.last_roam
             && last.elapsed() < ROAM_COOLDOWN
         {
             return;
         }
-        self.background_scan = true;
+        self.roam.background_scan = true;
         log::trace!("background roam scan: looking for a better BSS");
         // The background safety net is low-frequency (every
         // `BACKGROUND_SCAN_SECS`), so it keeps the full scan: a quick
@@ -348,7 +354,7 @@ impl WifiIface {
     /// the client stays on its (now healthy) current BSS instead of
     /// switching to a possibly weaker one.
     pub(crate) async fn handle_cqm_rssi(&mut self, cqm: Nl80211CqmRssiEvent) {
-        let in_roam_scan = self.roam_scan;
+        let in_roam_scan = self.roam.roam_scan;
         if !matches!(
             self.state,
             WifiState::ConnectedWithoutOffloadRekey
@@ -374,18 +380,18 @@ impl WifiIface {
                 if self.roam_threshold().is_none() {
                     return;
                 }
-                if !self.bss_info.ap_supports_signal_roam() {
+                if !self.link.bss_info.ap_supports_signal_roam() {
                     log::debug!(
                         "CQM LOW but AP {:02x?} advertises no BSS Transition \
                          / Neighbor Report capability; staying",
-                        self.bss_info.bssid
+                        self.link.bss_info.bssid
                     );
                     return;
                 }
-                if self.ft_roam.is_some() || self.roam_scan {
+                if self.roam.ft_roam.is_some() || self.roam.roam_scan {
                     return;
                 }
-                if let Some(last) = self.last_roam
+                if let Some(last) = self.roam.last_roam
                     && last.elapsed() < ROAM_COOLDOWN
                 {
                     return;
@@ -394,27 +400,27 @@ impl WifiIface {
                     "kernel CQM: signal {rssi} dBm below the roam threshold; \
                      scanning for roam candidates"
                 );
-                self.background_scan = false;
+                self.roam.background_scan = false;
                 self.trigger_roam_scan(false).await;
             }
             Nl80211CqmRssiThresholdEvent::High => {
                 log::debug!("kernel CQM: signal {rssi} dBm recovered");
                 // The low-signal episode is over: the next LOW starts a
                 // fresh quick scan again.
-                self.roam_scan_full = false;
+                self.roam.roam_scan_full = false;
                 // The signal recovered above the roam threshold while a
                 // roam scan started by the earlier LOW crossing is still
                 // in flight: the current BSS is healthy again, so cancel
                 // the pending roam scan and stay on it (iwd does the same
                 // in `station_ok_rssi`).
-                if self.roam_scan {
+                if self.roam.roam_scan {
                     log::info!(
                         "kernel CQM: signal {rssi} dBm recovered during roam \
                          scan; cancelling roam"
                     );
-                    self.roam_scan = false;
-                    self.background_scan = false;
-                    if let Some(prev) = self.pre_roam_state.take() {
+                    self.roam.roam_scan = false;
+                    self.roam.background_scan = false;
+                    if let Some(prev) = self.roam.pre_roam_state.take() {
                         self.state = prev;
                     }
                 }
@@ -433,12 +439,14 @@ impl WifiIface {
         let Some(threshold) = self.roam_threshold() else {
             return false;
         };
-        let attrs = Nl80211Cqm::new(self.if_index)
+        let attrs = Nl80211Cqm::new(self.core.if_index)
             .rssi_thold(threshold)
             .rssi_hyst(CQM_RSSI_HYST_DBM)
             .build();
-        match drain_request(self.conn_handle.set_cqm(attrs).execute().await)
-            .await
+        match drain_request(
+            self.core.conn_handle.set_cqm(attrs).execute().await,
+        )
+        .await
         {
             Ok(()) => {
                 log::info!(
@@ -476,8 +484,8 @@ impl WifiIface {
         if !full {
             self.request_neighbor_report_freqs().await;
         }
-        self.roam_scan = true;
-        self.roam_scan_full = full;
+        self.roam.roam_scan = true;
+        self.roam.roam_scan_full = full;
         // Remember the connected state so a roam scan that decides to
         // stay can restore it instead of leaving the state machine in
         // Scanning (which would re-authenticate the already-connected
@@ -485,8 +493,8 @@ impl WifiIface {
         // The fallback scan is triggered while the quick scan's results
         // are being processed (state is still Scanning): keep the
         // originally recorded pre-roam state instead of overwriting it.
-        if self.pre_roam_state.is_none() {
-            self.pre_roam_state = Some(self.state);
+        if self.roam.pre_roam_state.is_none() {
+            self.roam.pre_roam_state = Some(self.state);
         }
         if let Err(e) = self.send_out_scan_request().await {
             if !full {
@@ -496,8 +504,8 @@ impl WifiIface {
             } else {
                 log::warn!("roam scan trigger failed: {e}");
             }
-            let prev = self.pre_roam_state.take();
-            self.roam_scan = false;
+            let prev = self.roam.pre_roam_state.take();
+            self.roam.roam_scan = false;
             if let Some(prev) = prev {
                 self.state = prev;
             }
@@ -519,8 +527,10 @@ impl WifiIface {
             Nl80211Attr, Nl80211StationHandle, Nl80211StationInfo,
         };
 
-        let mut station_handle = Nl80211StationHandle::new(self.handle.clone());
-        let mut stream = station_handle.dump(self.if_index).execute().await;
+        let mut station_handle =
+            Nl80211StationHandle::new(self.core.handle.clone());
+        let mut stream =
+            station_handle.dump(self.core.if_index).execute().await;
         while let Some(msg) = stream
             .try_next()
             .await
@@ -541,7 +551,7 @@ impl WifiIface {
                     _ => {}
                 }
             }
-            if mac == Some(self.bss_info.bssid) && signal.is_some() {
+            if mac == Some(self.link.bss_info.bssid) && signal.is_some() {
                 return Ok(signal);
             }
         }
@@ -581,7 +591,7 @@ impl WifiIface {
         // scans: the frequencies the AP itself considers part of the
         // ESS are the best starting point for a signal-triggered roam.
         for candidate in &btm.candidates {
-            if self.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
+            if self.roam.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
                 break;
             }
             let Some(freq) =
@@ -592,13 +602,13 @@ impl WifiIface {
             else {
                 continue;
             };
-            if !self.roam_freqs.contains(&freq) {
+            if !self.roam.roam_freqs.contains(&freq) {
                 log::trace!(
                     "BTM candidate {:02x?} adds freq {freq} MHz to roam \
                      quick-scan set",
                     candidate.bssid
                 );
-                self.roam_freqs.push(freq);
+                self.roam.roam_freqs.push(freq);
             }
         }
 
@@ -611,7 +621,7 @@ impl WifiIface {
                     target.bssid,
                 )
                 .await;
-                self.start_roam(target, self.network.clone()).await;
+                self.start_roam(target, self.link.network.clone()).await;
             }
             None => {
                 log::info!("no usable BTM candidate; rejecting");
@@ -638,7 +648,7 @@ impl WifiIface {
             log::debug!("RRM action {} ignored", frame[25]);
             return;
         }
-        let Some(dialog) = self.pending_nr_dialog else {
+        let Some(dialog) = self.roam.pending_nr_dialog else {
             log::trace!(
                 "802.11k Neighbor Report Response without pending request"
             );
@@ -647,7 +657,7 @@ impl WifiIface {
         let Some(response) = parse_neighbor_report_response(&frame[26..])
         else {
             log::warn!("malformed 802.11k Neighbor Report Response; ignored");
-            self.pending_nr_dialog = None;
+            self.roam.pending_nr_dialog = None;
             return;
         };
         if response.dialog_token != dialog {
@@ -658,12 +668,12 @@ impl WifiIface {
             );
             return;
         }
-        self.pending_nr_dialog = None;
-        self.neighbor_report_responses += 1;
+        self.roam.pending_nr_dialog = None;
+        self.roam.neighbor_report_responses += 1;
 
         let mut added = 0;
         for entry in &response.entries {
-            if self.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
+            if self.roam.roam_freqs.len() >= ROAM_QUICK_SCAN_MAX_FREQS {
                 break;
             }
             let Some(freq) =
@@ -674,13 +684,13 @@ impl WifiIface {
             else {
                 continue;
             };
-            if !self.roam_freqs.contains(&freq) {
+            if !self.roam.roam_freqs.contains(&freq) {
                 log::trace!(
                     "802.11k neighbor {:02x?} adds freq {freq} MHz to roam \
                      quick-scan set",
                     entry.bssid
                 );
-                self.roam_freqs.push(freq);
+                self.roam.roam_freqs.push(freq);
                 added += 1;
             }
         }
@@ -700,27 +710,28 @@ impl WifiIface {
     /// scan proceeds with the frequencies already known. Non-response
     /// events are left queued for the regular state machine.
     async fn request_neighbor_report_freqs(&mut self) {
-        if !self.bss_info.rm_neighbor_report {
+        if !self.link.bss_info.rm_neighbor_report {
             return;
         }
-        if self.pending_nr_dialog.is_some() {
+        if self.roam.pending_nr_dialog.is_some() {
             return;
         }
         // iwd uses a constant non-zero dialog token: at most one request
         // is outstanding and we match the response by token.
         let dialog = 1;
         let frame = self.action_frame(build_neighbor_report_request(dialog));
-        let attrs = wl_nl80211::Nl80211Frame::new(self.if_index)
+        let attrs = wl_nl80211::Nl80211Frame::new(self.core.if_index)
             .frame(frame)
-            .frequency(self.bss_info.freq_mhz)
+            .frequency(self.link.bss_info.freq_mhz)
             .build();
         if let Err(e) =
-            drain_request(self.conn_handle.frame(attrs).execute().await).await
+            drain_request(self.core.conn_handle.frame(attrs).execute().await)
+                .await
         {
             log::debug!("802.11k neighbor report request failed: {e}");
             return;
         }
-        self.pending_nr_dialog = Some(dialog);
+        self.roam.pending_nr_dialog = Some(dialog);
         log::debug!("802.11k neighbor report request sent (dialog {dialog})");
 
         let deadline = tokio::time::Instant::now()
@@ -731,8 +742,11 @@ impl WifiIface {
             if remaining.is_zero() {
                 break;
             }
-            match tokio::time::timeout(remaining, self.event_receiver.next())
-                .await
+            match tokio::time::timeout(
+                remaining,
+                self.core.event_receiver.next(),
+            )
+            .await
             {
                 Ok(Some(raw_msg)) => {
                     if let Some(wl_nl80211::Nl80211Event::Frame { frame }) =
@@ -742,7 +756,7 @@ impl WifiIface {
                         && frame[25] == NEIGHBOR_REPORT_RESPONSE_ACTION
                     {
                         self.handle_rrm_frame(&frame).await;
-                        if self.pending_nr_dialog.is_none() {
+                        if self.roam.pending_nr_dialog.is_none() {
                             return;
                         }
                     }
@@ -757,7 +771,7 @@ impl WifiIface {
                 Err(_) => break, // timeout
             }
         }
-        self.pending_nr_dialog = None;
+        self.roam.pending_nr_dialog = None;
         log::debug!(
             "802.11k neighbor report request timed out; using known \
              frequencies"
@@ -770,9 +784,9 @@ impl WifiIface {
         let mut frame = Vec::with_capacity(24 + body.len());
         frame.extend_from_slice(&FRAME_TYPE_ACTION.to_le_bytes());
         frame.extend_from_slice(&[0, 0]); // duration
-        frame.extend_from_slice(&self.bss_info.bssid); // DA = AP
-        frame.extend_from_slice(&self.mac); // SA
-        frame.extend_from_slice(&self.bss_info.bssid); // BSSID
+        frame.extend_from_slice(&self.link.bss_info.bssid); // DA = AP
+        frame.extend_from_slice(&self.core.mac); // SA
+        frame.extend_from_slice(&self.link.bss_info.bssid); // BSSID
         frame.extend_from_slice(&[0, 0]); // sequence control
         frame.extend_from_slice(&body);
         frame
@@ -783,10 +797,11 @@ impl WifiIface {
     /// network's security family, and differ from the current BSS.
     fn pick_btm_target(&mut self, btm: &BtmRequest) -> Option<BssInfo> {
         for candidate in &btm.candidates {
-            if candidate.bssid == self.bss_info.bssid {
+            if candidate.bssid == self.link.bss_info.bssid {
                 continue;
             }
             let Some((bss, _)) = self
+                .roam
                 .last_scan_candidates
                 .iter()
                 .find(|(b, _)| b.bssid == candidate.bssid)
@@ -797,13 +812,13 @@ impl WifiIface {
                 );
                 continue;
             };
-            if bss.security.base() != self.bss_info.security.base() {
+            if bss.security.base() != self.link.bss_info.security.base() {
                 log::debug!(
                     "BTM candidate {:02x?} security {:?} incompatible with \
                      current {:?}",
                     candidate.bssid,
                     bss.security,
-                    self.bss_info.security
+                    self.link.bss_info.security
                 );
                 continue;
             }
@@ -825,12 +840,13 @@ impl WifiIface {
             target_bssid,
         ));
 
-        let attrs = wl_nl80211::Nl80211Frame::new(self.if_index)
+        let attrs = wl_nl80211::Nl80211Frame::new(self.core.if_index)
             .frame(frame)
-            .frequency(self.bss_info.freq_mhz)
+            .frequency(self.link.bss_info.freq_mhz)
             .build();
         if let Err(e) =
-            drain_request(self.conn_handle.frame(attrs).execute().await).await
+            drain_request(self.core.conn_handle.frame(attrs).execute().await)
+                .await
         {
             log::warn!("send BTM Response failed: {e}");
         }
@@ -850,7 +866,7 @@ impl WifiIface {
         // An FT roam only applies within the connected network (the FT
         // context is bound to the current SSID); a different configured
         // SSID always goes through a full reconnection.
-        let switching_network = target_network.ssid != self.network.ssid;
+        let switching_network = target_network.ssid != self.link.network.ssid;
         if switching_network
             && !target_network.can_roam_to_security(target.security)
         {
@@ -864,9 +880,10 @@ impl WifiIface {
             return;
         }
         if !switching_network
-            && self.ft.is_some()
+            && self.link.ft.is_some()
             && target.security.is_ft()
-            && target.mdie.map(|m| m.mdid) == self.ft.as_ref().map(|ft| ft.mdid)
+            && target.mdie.map(|m| m.mdid)
+                == self.link.ft.as_ref().map(|ft| ft.mdid)
         {
             if let Err(e) = self.start_ft_roam(target.clone()).await {
                 log::warn!("FT roam start failed: {e}");
@@ -881,7 +898,7 @@ impl WifiIface {
                 target_network.ssid,
                 target.bssid
             );
-            self.network = target_network;
+            self.link.network = target_network;
         }
         // No FT path: leave the current BSS and let the retry loop
         // reconnect to the target. An exact PMKSA cache hit skips the
@@ -894,20 +911,20 @@ impl WifiIface {
         if !switching_network
             && self
                 .pmksa_cache
-                .lookup(&self.network.ssid, target.bssid)
+                .lookup(&self.link.network.ssid, target.bssid)
                 .is_none()
         {
             self.synthesize_okc_entry(&target);
         }
         log::info!("roam to {:02x?} via full reconnection", target.bssid);
-        self.roam_target = Some(target.bssid);
+        self.roam.roam_target = Some(target.bssid);
         // Cooldown from the roam decision so equal-signal BSSes do not
         // ping-pong through repeated full reconnections.
-        self.last_roam = Some(std::time::Instant::now());
-        self.roam_scan_full = false;
+        self.roam.last_roam = Some(std::time::Instant::now());
+        self.roam.roam_scan_full = false;
         if let Err(e) = crate::nl80211::connect::disconnect(
-            &mut self.conn_handle,
-            self.if_index,
+            &mut self.core.conn_handle,
+            self.core.if_index,
         )
         .await
         {
@@ -923,19 +940,23 @@ impl WifiIface {
     /// SAE PMKIDs come from the SAE exchange itself and cannot be
     /// cloned.
     fn synthesize_okc_entry(&mut self, target: &BssInfo) {
-        let Some(pmk) = self.psk_pmk else {
+        let Some(pmk) = self.auth.psk_pmk else {
             return;
         };
-        let (pmkid, mic_alg) = match self.bss_info.security {
+        let (pmkid, mic_alg) = match self.link.bss_info.security {
             SecurityType::Wpa2Psk => (
-                crate::crypto::kdf::pmkid_sha1(&pmk, &target.bssid, &self.mac),
+                crate::crypto::kdf::pmkid_sha1(
+                    &pmk,
+                    &target.bssid,
+                    &self.core.mac,
+                ),
                 crate::crypto::handshake4::MicAlg::HmacSha1,
             ),
             SecurityType::Wpa2PskSha256 => (
                 crate::crypto::kdf::pmkid_sha256(
                     &pmk,
                     &target.bssid,
-                    &self.mac,
+                    &self.core.mac,
                 ),
                 crate::crypto::handshake4::MicAlg::AesCmac,
             ),
@@ -946,7 +967,7 @@ impl WifiIface {
             target.bssid
         );
         self.pmksa_cache.insert(crate::pmksa::PmksaEntry {
-            ssid: self.network.ssid.clone(),
+            ssid: self.link.network.ssid.clone(),
             bssid: target.bssid,
             pmkid,
             pmk,
@@ -963,7 +984,7 @@ impl WifiIface {
         &mut self,
         target: BssInfo,
     ) -> Result<(), WifiError> {
-        let ft = self.ft.as_ref().ok_or_else(|| {
+        let ft = self.link.ft.as_ref().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT context")
         })?;
         let Some(target_mdie) = target.mdie else {
@@ -982,18 +1003,18 @@ impl WifiIface {
         // then MDIE and FTIE (SNonce + R0KH-ID). hostapd rejects the
         // request with INVALID_PMKID when the RSNE / PMKR0Name is
         // missing.
-        let rsne = match self.bss_info.security {
+        let rsne = match self.link.bss_info.security {
             SecurityType::FtSae => elements::ft_sae_rsne_cipher(
                 Some(ft.pmk_r0.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
             SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
                 Some(ft.pmk_r0.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
             _ => elements::ft_psk_rsne_cipher(
                 Some(ft.pmk_r0.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
         };
         let mut ft_ies = rsne;
@@ -1013,16 +1034,17 @@ impl WifiIface {
         );
         // FT authentication carries the MDIE + FTIE in NL80211_ATTR_IE;
         // NL80211_ATTR_AUTH_DATA is rejected for AUTHTYPE_FT.
-        let attrs = Nl80211Authenticate::new(self.if_index)
-            .ssid(&self.network.ssid)
+        let attrs = Nl80211Authenticate::new(self.core.if_index)
+            .ssid(&self.link.network.ssid)
             .mac(target.bssid)
             .frequency(target.freq_mhz)
             .auth_type(Nl80211AuthType::Ft)
             .ie(ft_ies)
             .build();
-        if let Err(e) =
-            drain_request(self.conn_handle.authenticate(attrs).execute().await)
-                .await
+        if let Err(e) = drain_request(
+            self.core.conn_handle.authenticate(attrs).execute().await,
+        )
+        .await
         {
             // CMD_AUTHENTICATE disconnects the old AP even when it
             // fails, so the connection is gone either way; the retry
@@ -1040,7 +1062,7 @@ impl WifiIface {
         // roam. Moving out of Scanning/Connected keeps the state
         // machine from restarting the normal connection flow.
         self.state = WifiState::Authenticating;
-        self.ft_roam = Some(FtRoam {
+        self.roam.ft_roam = Some(FtRoam {
             target,
             snonce,
             pmk_r1: None,
@@ -1059,7 +1081,7 @@ impl WifiIface {
             // CMD_AUTHENTICATE already disconnected the old AP, so the
             // roam cannot fall back to it; the retry loop reconnects.
             log::warn!("FT roam authentication failed: {e}; reconnecting");
-            self.ft_roam = None;
+            self.roam.ft_roam = None;
             self.state = WifiState::Failed;
         }
     }
@@ -1068,10 +1090,10 @@ impl WifiIface {
         &mut self,
         frame: &[u8],
     ) -> Result<(), WifiError> {
-        let roam = self.ft_roam.as_mut().ok_or_else(|| {
+        let roam = self.roam.ft_roam.as_mut().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT roam in progress")
         })?;
-        let ft = self.ft.as_ref().ok_or_else(|| {
+        let ft = self.link.ft.as_ref().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT context")
         })?;
 
@@ -1160,13 +1182,13 @@ impl WifiIface {
             ));
         }
 
-        let pmk_r1 = derive_pmk_r1(&ft.pmk_r0, r1kh_id, self.mac);
+        let pmk_r1 = derive_pmk_r1(&ft.pmk_r0, r1kh_id, self.core.mac);
         let ptk = derive_ft_ptk(
             &pmk_r1,
             &roam.snonce,
             &ftie.anonce,
             roam.target.bssid,
-            self.mac,
+            self.core.mac,
         );
         log::debug!(
             "FT roam: PMK-R1/PTK derived for {:02x?}",
@@ -1201,7 +1223,7 @@ impl WifiIface {
         snonce: &[u8; 32],
         anonce: &[u8; 32],
     ) -> Result<(), WifiError> {
-        let ft = self.ft.as_ref().ok_or_else(|| {
+        let ft = self.link.ft.as_ref().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT context")
         })?;
         let target_mdie = target.mdie.ok_or_else(|| {
@@ -1211,15 +1233,15 @@ impl WifiIface {
         let rsne = match target.security {
             SecurityType::FtSae => elements::ft_sae_rsne_cipher(
                 Some(pmk_r1.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
             SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
                 Some(pmk_r1.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
             _ => elements::ft_psk_rsne_cipher(
                 Some(pmk_r1.name),
-                self.bss_info.group_mgmt_cipher,
+                self.link.bss_info.group_mgmt_cipher,
             ),
         };
         let mdie = elements::mdie(target_mdie.mdid, target_mdie.ft_capab);
@@ -1228,16 +1250,16 @@ impl WifiIface {
         // actually used for the exchange.
         let rsnxe = ft_reassoc_uses_rsnxe(
             target.security,
-            self.network.sae_pwe,
+            self.link.network.sae_pwe,
             target.ap_supports_sae_h2e(),
-            self.network.sae_password_id.as_deref(),
+            self.link.network.sae_password_id.as_deref(),
         )
         .then(elements::sae_rsnxe);
 
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
         let ftie = elements::ftie_reassoc_request(
             &kck,
-            self.mac,
+            self.core.mac,
             target.bssid,
             anonce,
             snonce,
@@ -1263,10 +1285,10 @@ impl WifiIface {
             }
             _ => target.ap_mfp_capable().then_some(Nl80211UseMfp::Required),
         };
-        let mut builder = Nl80211Associate::new(self.if_index)
-            .ssid(&self.network.ssid)
+        let mut builder = Nl80211Associate::new(self.core.if_index)
+            .ssid(&self.link.network.ssid)
             .mac(target.bssid)
-            .prev_bssid(self.bss_info.bssid)
+            .prev_bssid(self.link.bss_info.bssid)
             .frequency(target.freq_mhz)
             .ie(ies)
             .control_port_over_nl80211(true)
@@ -1277,7 +1299,11 @@ impl WifiIface {
 
         log::info!("FT roam: sending REASSOCIATE to {:02x?}", target.bssid);
         drain_request(
-            self.conn_handle.associate(builder.build()).execute().await,
+            self.core
+                .conn_handle
+                .associate(builder.build())
+                .execute()
+                .await,
         )
         .await
     }
@@ -1296,7 +1322,7 @@ impl WifiIface {
             Ok(()) => Ok(()),
             Err(e) => {
                 log::warn!("FT roam reassociation failed: {e}");
-                self.ft_roam = None;
+                self.roam.ft_roam = None;
                 Err(e)
             }
         }
@@ -1306,10 +1332,10 @@ impl WifiIface {
         &mut self,
         ies: &[u8],
     ) -> Result<(), WifiError> {
-        let roam = self.ft_roam.as_ref().ok_or_else(|| {
+        let roam = self.roam.ft_roam.as_ref().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT roam in progress")
         })?;
-        let ft = self.ft.as_ref().ok_or_else(|| {
+        let ft = self.link.ft.as_ref().ok_or_else(|| {
             WifiError::new(ErrorKind::Roaming, "no FT context")
         })?;
         let ptk = roam.ptk.ok_or_else(|| {
@@ -1402,7 +1428,7 @@ impl WifiIface {
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
         let expected_mic = crate::crypto::ft::ft_mic(
             &kck,
-            self.mac,
+            self.core.mac,
             target.bssid,
             6,
             &mic_data,
@@ -1421,13 +1447,13 @@ impl WifiIface {
         if let Some(ref gtk) = ftie.gtk {
             let key = elements::unwrap_ft_key(&kek, gtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_gtk(
-                self.if_index,
+                self.core.if_index,
                 key,
                 gtk.key_index,
             )
             .seq(gtk.rsc.clone())
             .build();
-            drain_request(self.conn_handle.new_key(attrs).execute().await)
+            drain_request(self.core.conn_handle.new_key(attrs).execute().await)
                 .await
                 .map_err(|e| {
                     WifiError::new(
@@ -1440,15 +1466,16 @@ impl WifiIface {
         if let Some(ref igtk) = ftie.igtk {
             let key = elements::unwrap_ft_key(&kek, igtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_igtk(
-                self.if_index,
+                self.core.if_index,
                 key,
                 igtk.key_index,
                 igtk.rsc.clone(),
             )
             .build();
-            if let Err(e) =
-                drain_request(self.conn_handle.new_key(attrs).execute().await)
-                    .await
+            if let Err(e) = drain_request(
+                self.core.conn_handle.new_key(attrs).execute().await,
+            )
+            .await
             {
                 log::warn!("FT roam: IGTK install failed: {e}");
             } else {
@@ -1458,15 +1485,16 @@ impl WifiIface {
         if let Some(ref bigtk) = ftie.bigtk {
             let key = elements::unwrap_ft_key(&kek, bigtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_bigtk(
-                self.if_index,
+                self.core.if_index,
                 key,
                 bigtk.key_index,
                 bigtk.rsc.clone(),
             )
             .build();
-            if let Err(e) =
-                drain_request(self.conn_handle.new_key(attrs).execute().await)
-                    .await
+            if let Err(e) = drain_request(
+                self.core.conn_handle.new_key(attrs).execute().await,
+            )
+            .await
             {
                 log::warn!("FT roam: BIGTK install failed: {e}");
             } else {
@@ -1484,7 +1512,7 @@ impl WifiIface {
         if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_FTIE) {
             assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
         }
-        self.ft = Some(FtContext {
+        self.link.ft = Some(FtContext {
             mdid: ft_mdid,
             ft_capab,
             r0kh_id: ft_r0kh_id,
@@ -1492,13 +1520,13 @@ impl WifiIface {
             pmk_r1,
             assoc_resp_ft_ies,
         });
-        self.bss_info = target.clone();
-        self.ft_roam = None;
-        self.last_roam = Some(std::time::Instant::now());
-        self.roam_scan_full = false;
-        self.fourway = None;
-        self.auth = None;
-        self.scan_retry_interval = crate::client::RETRY_BACKOFF_INIT_SEC;
+        self.link.bss_info = target.clone();
+        self.roam.ft_roam = None;
+        self.roam.last_roam = Some(std::time::Instant::now());
+        self.roam.roam_scan_full = false;
+        self.link.fourway = None;
+        self.auth.method = None;
+        self.scan.scan_retry_interval = crate::client::RETRY_BACKOFF_INIT_SEC;
         self.state = WifiState::ConnectedWithoutOffloadRekey;
         log::info!(
             "FT roam complete: connected to {:02x?} (freq {} MHz)",
@@ -1518,13 +1546,13 @@ impl WifiIface {
     ) -> Result<(), WifiError> {
         use crate::crypto::ft::{FT_KCK_LEN, FT_KEK_LEN, FT_TK_LEN};
         let tk = ptk[FT_KCK_LEN + FT_KEK_LEN..][..FT_TK_LEN].to_vec();
-        let attrs = wl_nl80211::Nl80211Key::new(self.if_index)
+        let attrs = wl_nl80211::Nl80211Key::new(self.core.if_index)
             .mac(target.bssid)
             .key_data(tk)
             .key_index(0)
             .key_type(wl_nl80211::Nl80211KeyType::Pairwise)
             .build();
-        drain_request(self.conn_handle.new_key(attrs).execute().await)
+        drain_request(self.core.conn_handle.new_key(attrs).execute().await)
             .await
             .map_err(|e| {
                 WifiError::new(

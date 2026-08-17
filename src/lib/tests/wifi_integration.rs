@@ -829,7 +829,7 @@ async fn wifi_client_sae_hnp_fallback() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        !client.iface_mut().unwrap().sae_hnp_attempted,
+        !client.iface_mut().unwrap().auth.sae_hnp_attempted,
         "expected the RSNXE up-front check to pick hunting-and-pecking \
          directly, without needing an H2E-rejection restart"
     );
@@ -906,7 +906,7 @@ async fn wifi_client_sae_bip_gmac256() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().bss_info.group_mgmt_cipher,
+        client.iface_mut().unwrap().link.bss_info.group_mgmt_cipher,
         wl_nl80211::Ieee80211CipherSuite::BipGmac256,
         "BIP-GMAC-256 must be negotiated"
     );
@@ -916,6 +916,7 @@ async fn wifi_client_sae_bip_gmac256() {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1042,7 +1043,7 @@ async fn wifi_client_multi_network_connect() {
         client.run().await.expect("scan triggered"),
         WifiState::Scanning
     );
-    if client.iface_mut().unwrap().sched_scan_supported {
+    if client.iface_mut().unwrap().caps.sched_scan_supported {
         assert_eq!(
             client.run().await.expect("sched scan"),
             WifiState::SchedScanWait
@@ -1052,7 +1053,7 @@ async fn wifi_client_multi_network_connect() {
         assert_eq!(err.kind, ErrorKind::SsidNotFound);
         assert_eq!(client.iface_mut().unwrap().state, WifiState::Failed);
         assert_eq!(
-            client.iface_mut().unwrap().scan_retry_interval,
+            client.iface_mut().unwrap().scan.scan_retry_interval,
             RETRY_BACKOFF_INIT_SEC
         );
     }
@@ -1103,6 +1104,7 @@ async fn wifi_client_sae_pmf_sa_query() {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1295,7 +1297,7 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().bss_info.security,
+        client.iface_mut().unwrap().link.bss_info.security,
         crate::SecurityType::Wpa2PskSha256,
         "scan must classify the AP as WPA2-PSK-SHA256"
     );
@@ -1370,12 +1372,12 @@ async fn wifi_client_wpa2_eap_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().bss_info.security,
+        client.iface_mut().unwrap().link.bss_info.security,
         crate::SecurityType::Wpa2Ent,
         "scan must classify the AP as WPA2-Enterprise"
     );
     assert!(
-        client.iface_mut().unwrap().eap_pmk.is_some(),
+        client.iface_mut().unwrap().auth.eap_pmk.is_some(),
         "EAP-Success must have produced the PMK from the MSK"
     );
 
@@ -1446,7 +1448,7 @@ async fn wifi_client_wpa3_eap_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().bss_info.security,
+        client.iface_mut().unwrap().link.bss_info.security,
         crate::SecurityType::Wpa2EntSha256,
         "scan must classify the AP as 802.1X-SHA256 / WPA3-Enterprise"
     );
@@ -1457,6 +1459,7 @@ async fn wifi_client_wpa3_eap_connect() {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1579,10 +1582,10 @@ async fn wifi_client_sae_pmksa_reconnect() {
     ));
     // First connection: full SAE exchange, PMKSA cached afterwards.
     assert!(
-        client.iface_mut().unwrap().auth.is_some(),
+        client.iface_mut().unwrap().auth.method.is_some(),
         "first connect must run full SAE"
     );
-    let cached_bssid = client.iface().unwrap().bss_info.bssid;
+    let cached_bssid = client.iface().unwrap().link.bss_info.bssid;
     assert!(
         client
             .iface_mut()
@@ -1602,6 +1605,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1622,7 +1626,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
     // No SAE auth state means no commit/confirm exchange happened on
     // the reconnect - the AP accepted the PMKID.
     assert!(
-        client.iface_mut().unwrap().auth.is_none(),
+        client.iface_mut().unwrap().auth.method.is_none(),
         "reconnect must skip SAE when the PMKSA cache hits"
     );
     client.shutdown().await;
@@ -1658,10 +1662,10 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     ));
     // First connection: PMK derived via PBKDF2, then cached.
     assert!(
-        client.iface_mut().unwrap().psk_pmk.is_some(),
+        client.iface_mut().unwrap().auth.psk_pmk.is_some(),
         "first connect must derive the PSK PMK"
     );
-    let cached_bssid = client.iface().unwrap().bss_info.bssid;
+    let cached_bssid = client.iface().unwrap().link.bss_info.bssid;
     assert!(
         client
             .iface_mut()
@@ -1681,6 +1685,7 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1699,7 +1704,7 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     // Cache hit: PBKDF2 was skipped, so the PSK PMK was never derived
     // for the reconnect (the 4-way runs with the cached PMK).
     assert!(
-        client.iface_mut().unwrap().psk_pmk.is_none(),
+        client.iface_mut().unwrap().auth.psk_pmk.is_none(),
         "reconnect must use the cached PMKSA instead of re-deriving the PMK"
     );
     client.shutdown().await;
@@ -1834,14 +1839,14 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     ));
     // Initial connection: full SAE (FT-SAE), FT context established.
     assert!(
-        client.iface_mut().unwrap().auth.is_some(),
+        client.iface_mut().unwrap().auth.method.is_some(),
         "first connect must run full SAE"
     );
     assert!(
-        client.iface_mut().unwrap().ft.is_some(),
+        client.iface_mut().unwrap().link.ft.is_some(),
         "FT context expected after connecting"
     );
-    let start_bssid = client.iface_mut().unwrap().bss_info.bssid;
+    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
 
     drain_pending_events(&mut client).await;
 
@@ -1849,6 +1854,7 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     let target = client
         .iface_mut()
         .unwrap()
+        .roam
         .last_scan_candidates
         .iter()
         .map(|(bss, _)| bss)
@@ -1868,6 +1874,7 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     let sta_mac = client
         .iface_mut()
         .unwrap()
+        .core
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1888,16 +1895,16 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().bss_info.bssid,
+        client.iface_mut().unwrap().link.bss_info.bssid,
         target.bssid,
         "the roam must land on the BTM candidate BSS"
     );
     assert!(
-        client.iface_mut().unwrap().auth.is_none(),
+        client.iface_mut().unwrap().auth.method.is_none(),
         "an FT roam must not run a new SAE exchange"
     );
     assert!(
-        client.iface_mut().unwrap().ft_roam.is_none(),
+        client.iface_mut().unwrap().roam.ft_roam.is_none(),
         "the FT roam must be complete"
     );
 
@@ -1915,7 +1922,7 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
             panic!("client error after the BTM roam: {e}");
         }
         assert_eq!(
-            client.iface_mut().unwrap().bss_info.bssid,
+            client.iface_mut().unwrap().link.bss_info.bssid,
             target.bssid,
             "the client must stay on the BTM candidate BSS"
         );
@@ -1954,7 +1961,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        client.iface_mut().unwrap().ft.is_some(),
+        client.iface_mut().unwrap().link.ft.is_some(),
         "FT context expected after connecting"
     );
     drain_pending_events(&mut client).await;
@@ -1963,9 +1970,9 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
     // kernel association, then start a fresh authentication. This resets
     // the per-attempt 4-way state, but the previous FT context (PMK-R1
     // derived from the old SAE PMK) must not survive into the new attempt.
-    let if_index = client.iface().unwrap().if_index;
+    let if_index = client.iface().unwrap().core.if_index;
     crate::nl80211::connect::disconnect(
-        &mut client.iface_mut().unwrap().conn_handle,
+        &mut client.iface_mut().unwrap().core.conn_handle,
         if_index,
     )
     .await
@@ -1977,11 +1984,11 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         .await
         .expect("start reconnect authentication");
     assert!(
-        client.iface_mut().unwrap().ft.is_none(),
+        client.iface_mut().unwrap().link.ft.is_none(),
         "stale FT context must be cleared when a new attempt starts"
     );
     assert!(
-        client.iface_mut().unwrap().fourway.is_none(),
+        client.iface_mut().unwrap().link.fourway.is_none(),
         "4-way state must be reset"
     );
 
@@ -2009,11 +2016,11 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         .await;
 
     assert!(
-        client.iface_mut().unwrap().pending_ft_msg1.is_some(),
+        client.iface_mut().unwrap().link.pending_ft_msg1.is_some(),
         "early Message 1 must be buffered until the new FT context exists"
     );
     assert!(
-        client.iface_mut().unwrap().fourway.is_none(),
+        client.iface_mut().unwrap().link.fourway.is_none(),
         "no 4-way state may be built from a stale FT context"
     );
     client.shutdown().await;
@@ -2049,13 +2056,14 @@ async fn wifi_client_ft_psk_signal_roam() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
-    let start_bssid = client.iface_mut().unwrap().bss_info.bssid;
+    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
 
     drain_pending_events(&mut client).await;
 
     let target = client
         .iface_mut()
         .unwrap()
+        .roam
         .last_scan_candidates
         .iter()
         .map(|(bss, _)| bss)
@@ -2079,14 +2087,14 @@ async fn wifi_client_ft_psk_signal_roam() {
             Ok(Err(e)) => panic!("client error during signal roam: {e}"),
             Err(_) => {} // 15 s without a state change
         }
-        if client.iface_mut().unwrap().bss_info.bssid == target.bssid {
+        if client.iface_mut().unwrap().link.bss_info.bssid == target.bssid {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "signal-triggered FT roam did not happen in time (still on \
              {:02x?})",
-            client.iface().unwrap().bss_info.bssid
+            client.iface().unwrap().link.bss_info.bssid
         );
     }
     assert!(matches!(
@@ -2095,11 +2103,11 @@ async fn wifi_client_ft_psk_signal_roam() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        client.iface_mut().unwrap().auth.is_none(),
+        client.iface_mut().unwrap().auth.method.is_none(),
         "an FT roam must not run a new PSK/4-way full authentication"
     );
     assert!(
-        client.iface_mut().unwrap().neighbor_report_responses > 0,
+        client.iface_mut().unwrap().roam.neighbor_report_responses > 0,
         "the signal roam must actively request and receive an 802.11k \
          neighbor report before the quick scan"
     );
@@ -2118,7 +2126,7 @@ async fn wifi_client_ft_psk_signal_roam() {
             panic!("client error after the signal roam: {e}");
         }
         assert_eq!(
-            client.iface_mut().unwrap().bss_info.bssid,
+            client.iface_mut().unwrap().link.bss_info.bssid,
             target.bssid,
             "the roam cooldown must keep the client on the target BSS"
         );
@@ -2163,7 +2171,7 @@ async fn wifi_client_roam_scan_stays_connected() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
-    let start_bssid = client.iface_mut().unwrap().bss_info.bssid;
+    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
     let start_ssid = client.current_ssid().to_string();
 
     drain_pending_events(&mut client).await;
@@ -2214,7 +2222,7 @@ async fn wifi_client_roam_scan_stays_connected() {
             client.iface_mut().unwrap().state
         );
         assert_eq!(
-            client.iface_mut().unwrap().bss_info.bssid,
+            client.iface_mut().unwrap().link.bss_info.bssid,
             start_bssid,
             "the client must stay on its current BSS"
         );
@@ -2224,7 +2232,7 @@ async fn wifi_client_roam_scan_stays_connected() {
             "the client must stay on its current network"
         );
         assert!(
-            client.iface_mut().unwrap().auth.is_none(),
+            client.iface_mut().unwrap().auth.method.is_none(),
             "no new authentication may start while the roam scan stays"
         );
         if tokio::time::Instant::now() >= deadline {
@@ -2235,11 +2243,11 @@ async fn wifi_client_roam_scan_stays_connected() {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     }
     assert!(
-        client.iface_mut().unwrap().roam_scan_count > 0,
+        client.iface_mut().unwrap().roam.roam_scan_count > 0,
         "the weak-signal roam engine must have run at least one scan"
     );
     assert!(
-        client.iface_mut().unwrap().neighbor_report_responses > 0,
+        client.iface_mut().unwrap().roam.neighbor_report_responses > 0,
         "the roam engine must actively request and receive an 802.11k \
          neighbor report before the quick scan"
     );
@@ -2490,7 +2498,7 @@ async fn wifi_client_cross_ssid_critical_switch() {
             "cross-SSID switch did not happen in time (still on {} at bssid \
              {:02x?})",
             client.current_ssid(),
-            client.iface().unwrap().bss_info.bssid
+            client.iface().unwrap().link.bss_info.bssid
         );
     }
     assert!(matches!(
