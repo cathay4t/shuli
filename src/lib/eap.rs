@@ -116,21 +116,6 @@ pub trait EapMethod: Send {
     fn msk(&self) -> Option<[u8; MSK_LEN]>;
 }
 
-/// EAP peer state (RFC 4137, condensed to what the supplicant needs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EapState {
-    /// Waiting for the authenticator's first Request.
-    Initial,
-    /// Identity exchange in progress.
-    Identity,
-    /// An EAP method exchange in progress.
-    Method,
-    /// EAP-Success received; the port is authorized.
-    Success,
-    /// EAP-Failure received or the exchange aborted.
-    Failure,
-}
-
 /// What the caller should do after feeding a packet to
 /// [`EapPeer::handle_packet`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +134,6 @@ pub enum EapAction {
 /// delegated to an [`EapMethod`] when one is set, otherwise answered
 /// with a Nak listing `supported_types`.
 pub struct EapPeer {
-    state: EapState,
     identity: String,
     method: Option<Box<dyn EapMethod>>,
     supported_types: Vec<u8>,
@@ -158,26 +142,15 @@ pub struct EapPeer {
 impl EapPeer {
     pub fn new(identity: String) -> Self {
         Self {
-            state: EapState::Initial,
             identity,
             method: None,
             supported_types: Vec::new(),
         }
     }
 
-    pub fn state(&self) -> EapState {
-        self.state
-    }
-
     /// Install the active EAP method (e.g. EAP-TLS).
     pub fn set_method(&mut self, method: Box<dyn EapMethod>) {
         self.method = Some(method);
-    }
-
-    /// Types offered in a Nak response when a Request asks for a
-    /// method the peer does not have.
-    pub fn set_supported_types(&mut self, types: Vec<u8>) {
-        self.supported_types = types;
     }
 
     /// The method's MSK, once the method completed.
@@ -191,11 +164,9 @@ impl EapPeer {
         packet: &EapPacket,
     ) -> Result<EapAction, WifiError> {
         if packet.is_success() {
-            self.state = EapState::Success;
             return Ok(EapAction::Success);
         }
         if packet.is_failure() {
-            self.state = EapState::Failure;
             return Ok(EapAction::Failure);
         }
         if packet.code != CODE_REQUEST {
@@ -211,15 +182,12 @@ impl EapPeer {
             ));
         };
         let response = match type_ {
-            TYPE_IDENTITY => {
-                self.state = EapState::Identity;
-                EapPacket::build(
-                    CODE_RESPONSE,
-                    packet.identifier,
-                    Some(TYPE_IDENTITY),
-                    self.identity.as_bytes(),
-                )
-            }
+            TYPE_IDENTITY => EapPacket::build(
+                CODE_RESPONSE,
+                packet.identifier,
+                Some(TYPE_IDENTITY),
+                self.identity.as_bytes(),
+            ),
             TYPE_NOTIFICATION => {
                 // RFC 3748 §5.2: acknowledge with an empty
                 // Notification response.
@@ -240,7 +208,6 @@ impl EapPeer {
                     .as_ref()
                     .is_some_and(|m| m.method_type() == type_) =>
             {
-                self.state = EapState::Method;
                 let method = self.method.as_mut().unwrap();
                 let body =
                     method.handle_request(packet.identifier, &packet.body)?;
@@ -254,7 +221,6 @@ impl EapPeer {
             _ => {
                 // Unknown / unsupported method: Nak with the types we
                 // can do (RFC 3748 §5.3).
-                self.state = EapState::Method;
                 let mut body = self.supported_types.clone();
                 body.retain(|t| *t != TYPE_IDENTITY && *t != TYPE_NAK);
                 EapPacket::build(

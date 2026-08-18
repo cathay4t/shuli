@@ -7,8 +7,8 @@ use crate::{
     ErrorKind, WifiError,
     eap::{
         CODE_FAILURE, CODE_REQUEST, CODE_RESPONSE, CODE_SUCCESS, EapAction,
-        EapMethod, EapPacket, EapPeer, EapState, MSK_LEN, TYPE_IDENTITY,
-        TYPE_NAK, TYPE_NOTIFICATION, TYPE_TLS,
+        EapMethod, EapPacket, EapPeer, MSK_LEN, TYPE_IDENTITY, TYPE_NAK,
+        TYPE_NOTIFICATION, TYPE_TLS,
     },
     ieee80211::eapol::{build_eapol_eap_frame, parse_eapol_eap_frame},
 };
@@ -84,7 +84,6 @@ fn test_peer_identity_exchange() {
     assert_eq!(parsed.identifier, 1);
     assert_eq!(parsed.type_, Some(TYPE_IDENTITY));
     assert_eq!(parsed.body, b"user@example.org");
-    assert_eq!(peer.state(), EapState::Identity);
 }
 
 #[test]
@@ -121,7 +120,6 @@ fn test_peer_nak_unsupported_method() {
     let parsed = EapPacket::parse(&response).unwrap();
     assert_eq!(parsed.type_, Some(TYPE_NAK));
     assert_eq!(parsed.body, vec![TYPE_TLS]);
-    assert_eq!(peer.state(), EapState::Method);
 }
 
 /// A minimal EAP-TLS stand-in for state machine tests; the real
@@ -169,7 +167,6 @@ fn test_peer_delegates_to_method() {
         parsed.body.as_slice(),
         &[4, b't', b'l', b's', b'-', b'd', b'a', b't', b'a']
     );
-    assert_eq!(peer.state(), EapState::Method);
     assert_eq!(peer.msk(), Some([0x5A; MSK_LEN]));
 }
 
@@ -181,7 +178,6 @@ fn test_peer_success_and_failure() {
         .handle_packet(&EapPacket::parse(&success).unwrap())
         .unwrap();
     assert_eq!(action, EapAction::Success);
-    assert_eq!(peer.state(), EapState::Success);
 
     let mut peer = EapPeer::new("user".to_string());
     let failure = EapPacket::build(CODE_FAILURE, 5, None, b"");
@@ -189,7 +185,6 @@ fn test_peer_success_and_failure() {
         .handle_packet(&EapPacket::parse(&failure).unwrap())
         .unwrap();
     assert_eq!(action, EapAction::Failure);
-    assert_eq!(peer.state(), EapState::Failure);
 }
 
 #[test]
@@ -201,7 +196,6 @@ fn test_peer_ignores_authenticator_responses() {
         .handle_packet(&EapPacket::parse(&response).unwrap())
         .unwrap();
     assert_eq!(action, EapAction::Wait);
-    assert_eq!(peer.state(), EapState::Initial);
 }
 
 #[test]

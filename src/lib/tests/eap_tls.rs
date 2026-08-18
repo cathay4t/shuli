@@ -11,7 +11,7 @@ use crate::{
     ErrorKind,
     eap::{
         CODE_REQUEST, CODE_RESPONSE, CODE_SUCCESS, EapAction, EapMethod,
-        EapPacket, EapPeer, EapState, TYPE_IDENTITY, TYPE_TLS,
+        EapPacket, EapPeer, TYPE_IDENTITY, TYPE_TLS,
     },
     eap_tls::{
         EAP_TLS_FLAG_START, EapTlsMethod, build_tls_message, cert_from_pem,
@@ -255,7 +255,6 @@ fn test_eap_peer_full_tls_exchange() {
         .handle_packet(&EapPacket::parse(&success).unwrap())
         .unwrap();
     assert_eq!(action, EapAction::Success);
-    assert_eq!(peer.state(), EapState::Success);
     assert!(
         peer.msk().expect("MSK") != [0u8; 64],
         "MSK must be non-zero"

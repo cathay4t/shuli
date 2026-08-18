@@ -4,9 +4,7 @@ mod auth;
 mod client;
 mod config;
 mod crypto;
-#[allow(dead_code)] // EAP transport API: wired into WiFi 802.1X
 mod eap;
-#[allow(dead_code)] // EAP-TLS method: wired into 802.1X
 mod eap_tls;
 mod error;
 mod ieee80211;
