@@ -9,7 +9,7 @@ use futures::StreamExt;
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface,
+    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError, WifiIface,
     client::{get_if_index_and_mac, wiphy_max_scan_ssids},
     nl80211::scan::{
         extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
@@ -826,121 +826,135 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
     }
 }
 
-/// Standalone scan: create a nl80211 handle, trigger a scan on the
-/// given interface, wait, and return all discovered BSSes with their
-/// raw IE buffers (for generation detection by the caller). Hidden
-/// SSIDs are probed by name (wpa_supplicant's `scan_ssid=1`); every
-/// scan also carries a wildcard entry so visible networks are found
-/// too, and the hidden list is chunked when the driver's per-scan SSID
-/// cap is smaller than the list.
-pub async fn scan_wifi_with_ies(
-    iface_name: &str,
-    hidden_ssids: Vec<String>,
-) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
-    let (conn, handle, _) = wl_nl80211::new_connection()
-        .map_err(|e| WifiError::new(ErrorKind::Nl80211, e.to_string()))?;
-    tokio::spawn(conn);
+impl WifiClient {
+    /// Standalone scan: create a nl80211 handle, trigger a scan on the
+    /// given interface, wait, and return all discovered BSSes with their
+    /// raw IE buffers (for generation detection by the caller). Hidden
+    /// SSIDs are probed by name (wpa_supplicant's `scan_ssid=1`); every
+    /// scan also carries a wildcard entry so visible networks are found
+    /// too, and the hidden list is chunked when the driver's per-scan SSID
+    /// cap is smaller than the list.
+    pub async fn scan(
+        iface_name: &str,
+        hidden_ssids: Vec<String>,
+    ) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
+        let (conn, handle, _) = wl_nl80211::new_connection()
+            .map_err(|e| WifiError::new(ErrorKind::Nl80211, e.to_string()))?;
+        tokio::spawn(conn);
 
-    let (if_index, _, wiphy_idx) =
-        get_if_index_and_mac(&handle, iface_name).await?;
-    let max_ssids = wiphy_max_scan_ssids(&handle, wiphy_idx).await? as usize;
+        let (if_index, _, wiphy_idx) =
+            get_if_index_and_mac(&handle, iface_name).await?;
+        let max_ssids =
+            wiphy_max_scan_ssids(&handle, wiphy_idx).await? as usize;
 
-    if max_ssids.clamp(1, MAX_SCAN_SSIDS) == 1 {
-        // One-SSID drivers cannot carry wildcard and specific SSIDs in
-        // the same request: probe the wildcard once for visible networks,
-        // then each hidden SSID by itself.
-        trigger_scan(&handle, if_index, Some(&[String::new()]), None).await?;
-        tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
-            .await;
-        for hidden in &hidden_ssids {
-            trigger_scan(
-                &handle,
-                if_index,
-                Some(std::slice::from_ref(hidden)),
-                None,
-            )
-            .await?;
+        if max_ssids.clamp(1, MAX_SCAN_SSIDS) == 1 {
+            // One-SSID drivers cannot carry wildcard and specific SSIDs in
+            // the same request: probe the wildcard once for visible networks,
+            // then each hidden SSID by itself.
+            trigger_scan(&handle, if_index, Some(&[String::new()]), None)
+                .await?;
             tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
                 .await;
-        }
-    } else {
-        // Rotate through the hidden list in chunks of max_ssids - 1,
-        // keeping a wildcard entry in every request, until all hidden
-        // SSIDs have been probed.
-        let mut cursor = 0usize;
-        let mut wildcard_next = true;
-        let max_rounds = hidden_ssids.len().saturating_add(1);
-        let mut rounds = 0usize;
-        loop {
-            let ssids = next_scan_ssids(
-                &hidden_ssids,
-                &mut cursor,
-                &mut wildcard_next,
-                max_ssids,
-            );
-            trigger_scan(&handle, if_index, Some(&ssids), None).await?;
-            tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
+            for hidden in &hidden_ssids {
+                trigger_scan(
+                    &handle,
+                    if_index,
+                    Some(std::slice::from_ref(hidden)),
+                    None,
+                )
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    SCAN_SLEEP_SECS,
+                ))
                 .await;
-            rounds += 1;
-            if hidden_ssids.is_empty() || cursor == 0 || rounds >= max_rounds {
-                break;
+            }
+        } else {
+            // Rotate through the hidden list in chunks of max_ssids - 1,
+            // keeping a wildcard entry in every request, until all hidden
+            // SSIDs have been probed.
+            let mut cursor = 0usize;
+            let mut wildcard_next = true;
+            let max_rounds = hidden_ssids.len().saturating_add(1);
+            let mut rounds = 0usize;
+            loop {
+                let ssids = next_scan_ssids(
+                    &hidden_ssids,
+                    &mut cursor,
+                    &mut wildcard_next,
+                    max_ssids,
+                );
+                trigger_scan(&handle, if_index, Some(&ssids), None).await?;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    SCAN_SLEEP_SECS,
+                ))
+                .await;
+                rounds += 1;
+                if hidden_ssids.is_empty()
+                    || cursor == 0
+                    || rounds >= max_rounds
+                {
+                    break;
+                }
             }
         }
-    }
 
-    let bss_list = get_scan_results(&handle, if_index).await?;
-    let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
-    for bss in &bss_list {
-        let Some(bssid) = extract_bssid(bss) else {
-            continue;
-        };
-        for info in bss {
-            if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info {
-                let ssid = extract_ssid_from_ies(ies);
-                beacon_has_ssid
-                    .insert(bssid, ssid.is_some_and(|s| !s.is_empty()));
+        let bss_list = get_scan_results(&handle, if_index).await?;
+        let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
+        for bss in &bss_list {
+            let Some(bssid) = extract_bssid(bss) else {
+                continue;
+            };
+            for info in bss {
+                if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info
+                {
+                    let ssid = extract_ssid_from_ies(ies);
+                    beacon_has_ssid
+                        .insert(bssid, ssid.is_some_and(|s| !s.is_empty()));
+                }
             }
         }
-    }
-    let mut results = Vec::new();
-    let mut seen_bssids = HashSet::new();
-    for bss in &bss_list {
-        let Some(ies) = extract_ies(bss) else {
-            continue;
-        };
-        let Some(ssid) = extract_ssid_from_ies(ies) else {
-            continue;
-        };
-        if ssid.is_empty() {
-            continue;
+        let mut results = Vec::new();
+        let mut seen_bssids = HashSet::new();
+        for bss in &bss_list {
+            let Some(ies) = extract_ies(bss) else {
+                continue;
+            };
+            let Some(ssid) = extract_ssid_from_ies(ies) else {
+                continue;
+            };
+            if ssid.is_empty() {
+                continue;
+            }
+            let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
+                extract_bssid(bss),
+                extract_freq(bss),
+                extract_signal_dbm(bss),
+            ) else {
+                continue;
+            };
+            let bss_security = detect_security(ies);
+            let info = BssInfo {
+                bssid,
+                freq_mhz,
+                signal_dbm,
+                security: bss_security.security,
+                ap_rsne: bss_security.ap_rsne,
+                ap_rsnxe: bss_security.ap_rsnxe,
+                group_mgmt_cipher: bss_security.group_mgmt_cipher,
+                mdie: bss_security.mdie,
+                hidden: beacon_has_ssid.get(&bssid) == Some(&false),
+                btm_support: crate::ieee80211::elements::ap_supports_btm(ies),
+                rm_neighbor_report:
+                    crate::ieee80211::elements::ap_supports_rm_neighbor_report(
+                        ies,
+                    ),
+            };
+            if seen_bssids.insert(bssid) {
+                results.push((info, ies.to_vec()));
+            }
         }
-        let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
-            extract_bssid(bss),
-            extract_freq(bss),
-            extract_signal_dbm(bss),
-        ) else {
-            continue;
-        };
-        let bss_security = detect_security(ies);
-        let info = BssInfo {
-            bssid,
-            freq_mhz,
-            signal_dbm,
-            security: bss_security.security,
-            ap_rsne: bss_security.ap_rsne,
-            ap_rsnxe: bss_security.ap_rsnxe,
-            group_mgmt_cipher: bss_security.group_mgmt_cipher,
-            mdie: bss_security.mdie,
-            hidden: beacon_has_ssid.get(&bssid) == Some(&false),
-            btm_support: crate::ieee80211::elements::ap_supports_btm(ies),
-            rm_neighbor_report:
-                crate::ieee80211::elements::ap_supports_rm_neighbor_report(ies),
-        };
-        if seen_bssids.insert(bssid) {
-            results.push((info, ies.to_vec()));
-        }
+        Ok(results)
     }
-    Ok(results)
 }
 
 /// Build the SSID list for the next scan the way wpa_supplicant does:

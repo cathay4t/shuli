@@ -9,13 +9,14 @@ mod eap_tls;
 mod error;
 mod ieee80211;
 mod mac;
-pub mod nl80211;
+mod nl80211;
 mod pmksa;
 mod roam;
-pub mod scan;
+mod scan;
+mod wired;
+
 #[cfg(test)]
 mod tests;
-pub mod wired;
 
 pub(crate) use self::{client::WifiIface, mac::ETH_ALEN};
 pub use self::{
