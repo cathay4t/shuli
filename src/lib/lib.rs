@@ -18,9 +18,11 @@ mod wired;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::{client::WifiIface, mac::ETH_ALEN};
+pub(crate) use self::{
+    client::WifiIface, mac::ETH_ALEN, nl80211::ShuliNl80211Connection,
+};
 pub use self::{
-    client::{WifiClient, WifiRunResult, WifiState},
+    client::{WifiClient, WifiIfaceState, WifiState},
     config::{
         DEFAULT_ROAM_THRESHOLD_DBM, DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
         EapConfig, NetworkConfig, SaePwe, WifiConfig,

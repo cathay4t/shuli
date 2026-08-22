@@ -34,7 +34,7 @@ use rustls::{ServerConfig, ServerConnection};
 use tokio::sync::Mutex;
 
 use crate::{
-    ErrorKind, WifiClient, WifiConfig, WifiState,
+    ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
     client::RETRY_BACKOFF_INIT_SEC,
     eap::{CODE_REQUEST, CODE_SUCCESS, EapPacket, TYPE_IDENTITY, TYPE_TLS},
     eap_tls::{
@@ -601,9 +601,11 @@ async fn run_until_connected(
         )
         .await;
         match step {
-            Ok(Ok(state)) => match state {
+            Ok(Ok(iface_state)) => match iface_state.state {
                 WifiState::ConnectedWithoutOffloadRekey
-                | WifiState::ConnectedWithOffloadRekey => return Ok(state),
+                | WifiState::ConnectedWithOffloadRekey => {
+                    return Ok(iface_state.state);
+                }
                 _ => {}
             },
             Ok(Err(e)) => return Err(e),
@@ -656,7 +658,7 @@ async fn wifi_client_open_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-NOPASS", None);
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -687,12 +689,15 @@ async fn wifi_client_wowlan_unsupported_graceful() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-NOPASS", None);
     config.networks[0].wowlan = true;
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     assert!(
-        !client.wowlan_supported(),
+        !client.wowlan_supported(TEST_NIC),
         "mac80211_hwsim must not advertise WoWLAN triggers"
     );
-    let armed = client.arm_wowlan().await.expect("arm is best-effort");
+    let armed = client
+        .arm_wowlan(TEST_NIC)
+        .await
+        .expect("arm is best-effort");
     assert!(!armed, "WoWLAN must not be armed on hwsim");
 
     let state = run_until_connected(&mut client, 20).await.expect("connect");
@@ -720,7 +725,7 @@ async fn wifi_client_sae_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -750,7 +755,7 @@ async fn wifi_client_wrong_sae_password_raises_error() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("wrong-password"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let err = run_until_connected(&mut client, 20)
         .await
         .expect_err("wrong SAE password must raise an error");
@@ -782,7 +787,7 @@ async fn wifi_client_sae_anti_clogging() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -821,7 +826,7 @@ async fn wifi_client_sae_hnp_fallback() {
     // ever needing the reactive restart.
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -829,7 +834,13 @@ async fn wifi_client_sae_hnp_fallback() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        !client.iface_mut().unwrap().auth.sae_hnp_attempted,
+        !client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .sae_hnp_attempted,
         "expected the RSNXE up-front check to pick hunting-and-pecking \
          directly, without needing an H2E-rejection restart"
     );
@@ -839,7 +850,7 @@ async fn wifi_client_sae_hnp_fallback() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
     config.networks[0].sae_pwe = crate::SaePwe::H2E;
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await;
     assert!(
         state.is_err(),
@@ -869,7 +880,7 @@ async fn wifi_client_sae_password_identifier() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PWID", Some("12345678"));
     config.networks[0].set_sae_password_id(Some("corp-id"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -898,7 +909,7 @@ async fn wifi_client_sae_bip_gmac256() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-BIP", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -906,7 +917,14 @@ async fn wifi_client_sae_bip_gmac256() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().link.bss_info.group_mgmt_cipher,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .group_mgmt_cipher,
         wl_nl80211::Ieee80211CipherSuite::BipGmac256,
         "BIP-GMAC-256 must be negotiated"
     );
@@ -914,9 +932,12 @@ async fn wifi_client_sae_bip_gmac256() {
     // SA Query survival proves the IGTK was installed with a working
     // BIP cipher (mac80211 protects/answers the action frame).
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -932,14 +953,15 @@ async fn wifi_client_sae_bip_gmac256() {
         )
         .await;
         match step {
-            Ok(Ok(state)) => {
+            Ok(Ok(iface_state)) => {
                 assert!(
                     matches!(
-                        state,
+                        iface_state.state,
                         WifiState::ConnectedWithoutOffloadRekey
                             | WifiState::ConnectedWithOffloadRekey
                     ),
-                    "SA Query broke the connection: {state:?}"
+                    "SA Query broke the connection: {:?}",
+                    iface_state.state
                 );
             }
             Ok(Err(e)) => panic!("client error during SA Query: {e}"),
@@ -947,7 +969,7 @@ async fn wifi_client_sae_bip_gmac256() {
         }
     }
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
@@ -973,7 +995,7 @@ async fn wifi_client_sae_transition_disable() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-TD", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1002,7 +1024,7 @@ async fn wifi_client_sae_ext_key_id() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-EKID", Some("12345678"));
     config.networks[0].ext_key_id = true;
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1034,26 +1056,42 @@ async fn wifi_client_multi_network_connect() {
     config
         .add_network("Ghost-Network", Some("wrong-password"))
         .add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
 
     // First cycle: scan triggered. The empty result then hands the
     // periodic scanning to the firmware when PNO is available, or arms
     // the host-side retry backoff otherwise.
     assert_eq!(
-        client.run().await.expect("scan triggered"),
+        client.run().await.expect("scan triggered").state,
         WifiState::Scanning
     );
-    if client.iface_mut().unwrap().caps.sched_scan_supported {
+    if client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .caps
+        .sched_scan_supported
+    {
         assert_eq!(
-            client.run().await.expect("sched scan"),
+            client.run().await.expect("sched scan").state,
             WifiState::SchedScanWait
         );
     } else {
         let err = client.run().await.expect_err("empty scan");
         assert_eq!(err.kind, ErrorKind::SsidNotFound);
-        assert_eq!(client.iface_mut().unwrap().state, WifiState::Failed);
         assert_eq!(
-            client.iface_mut().unwrap().scan.scan_retry_interval,
+            client.ifaces.values_mut().next().unwrap().state,
+            WifiState::Failed
+        );
+        assert_eq!(
+            client
+                .ifaces
+                .values_mut()
+                .next()
+                .unwrap()
+                .scan
+                .scan_retry_interval,
             RETRY_BACKOFF_INIT_SEC
         );
     }
@@ -1067,7 +1105,7 @@ async fn wifi_client_multi_network_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
-    assert_eq!(client.current_ssid(), "Test-WIFI");
+    assert_eq!(client.current_ssid(TEST_NIC), Some("Test-WIFI"));
     client.shutdown().await;
 }
 
@@ -1093,7 +1131,7 @@ async fn wifi_client_sae_pmf_sa_query() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1102,9 +1140,12 @@ async fn wifi_client_sae_pmf_sa_query() {
     ));
 
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1124,14 +1165,15 @@ async fn wifi_client_sae_pmf_sa_query() {
         )
         .await;
         match step {
-            Ok(Ok(state)) => {
+            Ok(Ok(iface_state)) => {
                 assert!(
                     matches!(
-                        state,
+                        iface_state.state,
                         WifiState::ConnectedWithoutOffloadRekey
                             | WifiState::ConnectedWithOffloadRekey
                     ),
-                    "SA Query broke the connection: {state:?}"
+                    "SA Query broke the connection: {:?}",
+                    iface_state.state
                 );
             }
             Ok(Err(e)) => panic!("client error during SA Query: {e}"),
@@ -1139,7 +1181,7 @@ async fn wifi_client_sae_pmf_sa_query() {
         }
     }
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
@@ -1165,7 +1207,7 @@ async fn wifi_client_wpa2_psk_pmf_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1196,7 +1238,7 @@ async fn wifi_client_wpa2_psk_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1257,7 +1299,7 @@ async fn wifi_client_wrong_wpa2_password_raises_error() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("wrong-password"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let err = run_until_connected(&mut client, 20)
         .await
         .expect_err("wrong WPA2-PSK password must raise an error");
@@ -1289,7 +1331,7 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK-SHA256", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1297,7 +1339,14 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().link.bss_info.security,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .security,
         crate::SecurityType::Wpa2PskSha256,
         "scan must classify the AP as WPA2-PSK-SHA256"
     );
@@ -1364,7 +1413,7 @@ async fn wifi_client_wpa2_eap_connect() {
         client_key: Some(format!("{cert_dir}/client.key").into()),
         server_name: Some("eap-tls.test".to_string()),
     });
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1372,12 +1421,26 @@ async fn wifi_client_wpa2_eap_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().link.bss_info.security,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .security,
         crate::SecurityType::Wpa2Ent,
         "scan must classify the AP as WPA2-Enterprise"
     );
     assert!(
-        client.iface_mut().unwrap().auth.eap_pmk.is_some(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .eap_pmk
+            .is_some(),
         "EAP-Success must have produced the PMK from the MSK"
     );
 
@@ -1440,7 +1503,7 @@ async fn wifi_client_wpa3_eap_connect() {
         client_key: Some("/tmp/shuli_rs_test_certs/client.key".into()),
         server_name: Some("eap-tls.test".to_string()),
     });
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1448,7 +1511,14 @@ async fn wifi_client_wpa3_eap_connect() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().link.bss_info.security,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .security,
         crate::SecurityType::Wpa2EntSha256,
         "scan must classify the AP as 802.1X-SHA256 / WPA3-Enterprise"
     );
@@ -1457,9 +1527,12 @@ async fn wifi_client_wpa3_eap_connect() {
     // answer the AP's protected SA Query (same check as the SAE PMF
     // test); hostapd disassociates a STA that does not respond.
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1475,14 +1548,15 @@ async fn wifi_client_wpa3_eap_connect() {
         )
         .await;
         match step {
-            Ok(Ok(state)) => {
+            Ok(Ok(iface_state)) => {
                 assert!(
                     matches!(
-                        state,
+                        iface_state.state,
                         WifiState::ConnectedWithoutOffloadRekey
                             | WifiState::ConnectedWithOffloadRekey
                     ),
-                    "SA Query broke the connection: {state:?}"
+                    "SA Query broke the connection: {:?}",
+                    iface_state.state
                 );
             }
             Ok(Err(e)) => panic!("client error during SA Query: {e}"),
@@ -1490,7 +1564,7 @@ async fn wifi_client_wpa3_eap_connect() {
         }
     }
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
@@ -1573,7 +1647,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1582,13 +1656,23 @@ async fn wifi_client_sae_pmksa_reconnect() {
     ));
     // First connection: full SAE exchange, PMKSA cached afterwards.
     assert!(
-        client.iface_mut().unwrap().auth.method.is_some(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_some(),
         "first connect must run full SAE"
     );
-    let cached_bssid = client.iface().unwrap().link.bss_info.bssid;
+    let cached_bssid =
+        client.ifaces.values().next().unwrap().link.bss_info.bssid;
     assert!(
         client
-            .iface_mut()
+            .ifaces
+            .values_mut()
+            .next()
             .unwrap()
             .pmksa_cache
             .lookup("Test-WIFI", cached_bssid)
@@ -1603,9 +1687,12 @@ async fn wifi_client_sae_pmksa_reconnect() {
     // Force an AP-initiated disconnect; the retry loop must reconnect
     // through the cached PMKID.
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1626,7 +1713,14 @@ async fn wifi_client_sae_pmksa_reconnect() {
     // No SAE auth state means no commit/confirm exchange happened on
     // the reconnect - the AP accepted the PMKID.
     assert!(
-        client.iface_mut().unwrap().auth.method.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_none(),
         "reconnect must skip SAE when the PMKSA cache hits"
     );
     client.shutdown().await;
@@ -1653,7 +1747,7 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1662,13 +1756,23 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     ));
     // First connection: PMK derived via PBKDF2, then cached.
     assert!(
-        client.iface_mut().unwrap().auth.psk_pmk.is_some(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .psk_pmk
+            .is_some(),
         "first connect must derive the PSK PMK"
     );
-    let cached_bssid = client.iface().unwrap().link.bss_info.bssid;
+    let cached_bssid =
+        client.ifaces.values().next().unwrap().link.bss_info.bssid;
     assert!(
         client
-            .iface_mut()
+            .ifaces
+            .values_mut()
+            .next()
             .unwrap()
             .pmksa_cache
             .lookup("Test-WIFI-PSK", cached_bssid)
@@ -1683,9 +1787,12 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     // Force an AP-initiated disconnect; the retry loop must reconnect
     // through the cached PMKID.
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1704,7 +1811,14 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     // Cache hit: PBKDF2 was skipped, so the PSK PMK was never derived
     // for the reconnect (the 4-way runs with the cached PMK).
     assert!(
-        client.iface_mut().unwrap().auth.psk_pmk.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .psk_pmk
+            .is_none(),
         "reconnect must use the cached PMKSA instead of re-deriving the PMK"
     );
     client.shutdown().await;
@@ -1830,7 +1944,7 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1839,20 +1953,36 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     ));
     // Initial connection: full SAE (FT-SAE), FT context established.
     assert!(
-        client.iface_mut().unwrap().auth.method.is_some(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_some(),
         "first connect must run full SAE"
     );
     assert!(
-        client.iface_mut().unwrap().link.ft.is_some(),
+        client.ifaces.values_mut().next().unwrap().link.ft.is_some(),
         "FT context expected after connecting"
     );
-    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
+    let start_bssid = client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .bssid;
 
     drain_pending_events(&mut client).await;
 
     // The roam target is the other BSS of the ESS.
     let target = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .roam
         .last_scan_candidates
@@ -1872,9 +2002,12 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
     // target BSS (Neighbor Report entry), issued on the BSS the STA is
     // currently associated with.
     let sta_mac = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .core
+        .nl
         .mac
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1895,16 +2028,37 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        client.iface_mut().unwrap().link.bss_info.bssid,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .bssid,
         target.bssid,
         "the roam must land on the BTM candidate BSS"
     );
     assert!(
-        client.iface_mut().unwrap().auth.method.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_none(),
         "an FT roam must not run a new SAE exchange"
     );
     assert!(
-        client.iface_mut().unwrap().roam.ft_roam.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .roam
+            .ft_roam
+            .is_none(),
         "the FT roam must be complete"
     );
 
@@ -1922,7 +2076,14 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
             panic!("client error after the BTM roam: {e}");
         }
         assert_eq!(
-            client.iface_mut().unwrap().link.bss_info.bssid,
+            client
+                .ifaces
+                .values_mut()
+                .next()
+                .unwrap()
+                .link
+                .bss_info
+                .bssid,
             target.bssid,
             "the client must stay on the BTM candidate BSS"
         );
@@ -1953,7 +2114,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1961,7 +2122,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        client.iface_mut().unwrap().link.ft.is_some(),
+        client.ifaces.values_mut().next().unwrap().link.ft.is_some(),
         "FT context expected after connecting"
     );
     drain_pending_events(&mut client).await;
@@ -1970,25 +2131,37 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
     // kernel association, then start a fresh authentication. This resets
     // the per-attempt 4-way state, but the previous FT context (PMK-R1
     // derived from the old SAE PMK) must not survive into the new attempt.
-    let if_index = client.iface().unwrap().core.if_index;
-    crate::nl80211::connect::disconnect(
-        &mut client.iface_mut().unwrap().core.conn_handle,
-        if_index,
-    )
-    .await
-    .expect("disconnect before reconnect");
     client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .core
+        .nl
+        .disconnect()
+        .await
+        .expect("disconnect before reconnect");
+    client
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .send_out_auth_request()
         .await
         .expect("start reconnect authentication");
     assert!(
-        client.iface_mut().unwrap().link.ft.is_none(),
+        client.ifaces.values_mut().next().unwrap().link.ft.is_none(),
         "stale FT context must be cleared when a new attempt starts"
     );
     assert!(
-        client.iface_mut().unwrap().link.fourway.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .fourway
+            .is_none(),
         "4-way state must be reset"
     );
 
@@ -2008,7 +2181,9 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         b"",
     );
     client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .handle_event(wl_nl80211::Nl80211Event::ControlPortFrame {
             frame: msg1,
@@ -2016,11 +2191,25 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         .await;
 
     assert!(
-        client.iface_mut().unwrap().link.pending_ft_msg1.is_some(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .pending_ft_msg1
+            .is_some(),
         "early Message 1 must be buffered until the new FT context exists"
     );
     assert!(
-        client.iface_mut().unwrap().link.fourway.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .fourway
+            .is_none(),
         "no 4-way state may be built from a stale FT context"
     );
     client.shutdown().await;
@@ -2049,19 +2238,28 @@ async fn wifi_client_ft_psk_signal_roam() {
     // hwsim reports a fixed (weak) signal; any threshold above it starts
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
-    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
+    let start_bssid = client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .bssid;
 
     drain_pending_events(&mut client).await;
 
     let target = client
-        .iface_mut()
+        .ifaces
+        .values_mut()
+        .next()
         .unwrap()
         .roam
         .last_scan_candidates
@@ -2087,27 +2285,50 @@ async fn wifi_client_ft_psk_signal_roam() {
             Ok(Err(e)) => panic!("client error during signal roam: {e}"),
             Err(_) => {} // 15 s without a state change
         }
-        if client.iface_mut().unwrap().link.bss_info.bssid == target.bssid {
+        if client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .link
+            .bss_info
+            .bssid
+            == target.bssid
+        {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "signal-triggered FT roam did not happen in time (still on \
              {:02x?})",
-            client.iface().unwrap().link.bss_info.bssid
+            client.ifaces.values().next().unwrap().link.bss_info.bssid
         );
     }
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert!(
-        client.iface_mut().unwrap().auth.method.is_none(),
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_none(),
         "an FT roam must not run a new PSK/4-way full authentication"
     );
     assert!(
-        client.iface_mut().unwrap().roam.neighbor_report_responses > 0,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .roam
+            .neighbor_report_responses
+            > 0,
         "the signal roam must actively request and receive an 802.11k \
          neighbor report before the quick scan"
     );
@@ -2126,7 +2347,14 @@ async fn wifi_client_ft_psk_signal_roam() {
             panic!("client error after the signal roam: {e}");
         }
         assert_eq!(
-            client.iface_mut().unwrap().link.bss_info.bssid,
+            client
+                .ifaces
+                .values_mut()
+                .next()
+                .unwrap()
+                .link
+                .bss_info
+                .bssid,
             target.bssid,
             "the roam cooldown must keep the client on the target BSS"
         );
@@ -2164,15 +2392,25 @@ async fn wifi_client_roam_scan_stays_connected() {
     // hwsim reports a fixed (weak) signal; any threshold above it starts
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
-    let start_bssid = client.iface_mut().unwrap().link.bss_info.bssid;
-    let start_ssid = client.current_ssid().to_string();
+    let start_bssid = client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .bssid;
+    let start_ssid = client
+        .current_ssid(TEST_NIC)
+        .expect("connected")
+        .to_string();
 
     drain_pending_events(&mut client).await;
 
@@ -2189,19 +2427,23 @@ async fn wifi_client_roam_scan_stays_connected() {
         )
         .await;
         match step {
-            Ok(Ok(WifiState::Scanning)) => {
+            Ok(Ok(WifiIfaceState {
+                state: WifiState::Scanning,
+                ..
+            })) => {
                 panic!("roam scans must not surface Scanning to run() callers")
             }
-            Ok(Ok(state))
+            Ok(Ok(iface_state))
                 if matches!(
-                    state,
+                    iface_state.state,
                     WifiState::ConnectedWithoutOffloadRekey
                         | WifiState::ConnectedWithOffloadRekey
                 ) =>
             {
                 panic!(
                     "a roam scan that stays must not re-emit Connected (got \
-                     {state:?})"
+                     {:?})",
+                    iface_state.state
                 );
             }
             Ok(Ok(_)) => {}
@@ -2211,28 +2453,43 @@ async fn wifi_client_roam_scan_stays_connected() {
             Err(_) => {} // 15 s without a state change
         }
         assert!(
-            client.iface_mut().unwrap().state == WifiState::Scanning
+            client.ifaces.values_mut().next().unwrap().state
+                == WifiState::Scanning
                 || matches!(
-                    client.iface_mut().unwrap().state,
+                    client.ifaces.values_mut().next().unwrap().state,
                     WifiState::ConnectedWithoutOffloadRekey
                         | WifiState::ConnectedWithOffloadRekey
                 ),
             "client must stay connected after a roam scan that finds no \
              better BSS, got state {:?}",
-            client.iface_mut().unwrap().state
+            client.ifaces.values_mut().next().unwrap().state
         );
         assert_eq!(
-            client.iface_mut().unwrap().link.bss_info.bssid,
+            client
+                .ifaces
+                .values_mut()
+                .next()
+                .unwrap()
+                .link
+                .bss_info
+                .bssid,
             start_bssid,
             "the client must stay on its current BSS"
         );
         assert_eq!(
-            client.current_ssid(),
-            start_ssid,
+            client.current_ssid(TEST_NIC),
+            Some(start_ssid.as_str()),
             "the client must stay on its current network"
         );
         assert!(
-            client.iface_mut().unwrap().auth.method.is_none(),
+            client
+                .ifaces
+                .values_mut()
+                .next()
+                .unwrap()
+                .auth
+                .method
+                .is_none(),
             "no new authentication may start while the roam scan stays"
         );
         if tokio::time::Instant::now() >= deadline {
@@ -2243,11 +2500,25 @@ async fn wifi_client_roam_scan_stays_connected() {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     }
     assert!(
-        client.iface_mut().unwrap().roam.roam_scan_count > 0,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .roam
+            .roam_scan_count
+            > 0,
         "the weak-signal roam engine must have run at least one scan"
     );
     assert!(
-        client.iface_mut().unwrap().roam.neighbor_report_responses > 0,
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .roam
+            .neighbor_report_responses
+            > 0,
         "the roam engine must actively request and receive an 802.11k \
          neighbor report before the quick scan"
     );
@@ -2451,7 +2722,7 @@ async fn wifi_client_cross_ssid_critical_switch() {
         network.roaming_threshold = -40;
         network.switch_ssid_lower_than_dbm = -45;
     }
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2459,8 +2730,8 @@ async fn wifi_client_cross_ssid_critical_switch() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        "Test-WIFI-A",
-        client.current_ssid(),
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-A"),
         "the client must connect to the stronger AP1 first"
     );
 
@@ -2484,9 +2755,9 @@ async fn wifi_client_cross_ssid_critical_switch() {
             Ok(Err(e)) => panic!("client error during cross-SSID roam: {e}"),
             Err(_) => {}
         }
-        if client.current_ssid() == "Test-WIFI-B"
+        if client.current_ssid(TEST_NIC) == Some("Test-WIFI-B")
             && matches!(
-                client.iface_mut().unwrap().state,
+                client.ifaces.values_mut().next().unwrap().state,
                 WifiState::ConnectedWithoutOffloadRekey
                     | WifiState::ConnectedWithOffloadRekey
             )
@@ -2497,18 +2768,18 @@ async fn wifi_client_cross_ssid_critical_switch() {
             tokio::time::Instant::now() < deadline,
             "cross-SSID switch did not happen in time (still on {} at bssid \
              {:02x?})",
-            client.current_ssid(),
-            client.iface().unwrap().link.bss_info.bssid
+            client.current_ssid(TEST_NIC).unwrap_or("(none)"),
+            client.ifaces.values().next().unwrap().link.bss_info.bssid
         );
     }
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        "Test-WIFI-B",
-        client.current_ssid(),
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-B"),
         "the client must land on the other configured SSID"
     );
     client.shutdown().await;
@@ -2542,7 +2813,7 @@ async fn wifi_client_cross_ssid_critical_switch_rejects_open_downgrade() {
         network.roaming_threshold = -40;
         network.switch_ssid_lower_than_dbm = -45;
     }
-    let mut client = WifiClient::init(config).await.expect("init");
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2550,8 +2821,8 @@ async fn wifi_client_cross_ssid_critical_switch_rejects_open_downgrade() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     assert_eq!(
-        "Test-WIFI-A",
-        client.current_ssid(),
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-A"),
         "the client must connect to AP1 first"
     );
 
@@ -2575,18 +2846,18 @@ async fn wifi_client_cross_ssid_critical_switch_rejects_open_downgrade() {
             Err(_) => {}
         }
         assert_ne!(
-            "Test-WIFI-B",
-            client.current_ssid(),
+            client.current_ssid(TEST_NIC),
+            Some("Test-WIFI-B"),
             "the client must not roam to an open impostor SSID"
         );
     }
     assert_eq!(
-        "Test-WIFI-A",
-        client.current_ssid(),
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-A"),
         "the client must stay on the protected SSID"
     );
     assert!(matches!(
-        client.iface_mut().unwrap().state,
+        client.ifaces.values_mut().next().unwrap().state,
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));

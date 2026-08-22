@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use wl_nl80211::{Nl80211Associate, Nl80211Pmksa, Nl80211UseMfp};
+
+use super::{
+    MicAlg, PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaEntry,
+    WifiIface, elements, entry_with_fresh_lifetime, kdf,
+};
+use crate::{
+    SecurityType, WifiError, WifiState, crypto::handshake4::FourWayState,
+};
 
 impl WifiIface {
     /// enable OCV on the 4-way state with our OCI derived
@@ -77,7 +85,7 @@ impl WifiIface {
         if self.link.network.ext_key_id {
             elements::rsne_set_ext_key_id(&mut ie, true);
         }
-        let mut builder = Nl80211Associate::new(self.core.if_index)
+        let mut builder = Nl80211Associate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(self.link.bss_info.bssid)
             .frequency(self.link.bss_info.freq_mhz);
@@ -94,8 +102,7 @@ impl WifiIface {
                 builder.control_port_over_nl80211(true).socket_owner(true);
         }
         let attrs = builder.build();
-        drain_request(self.core.conn_handle.associate(attrs).execute().await)
-            .await
+        self.core.nl.associate(attrs).await
     }
 }
 
@@ -240,7 +247,7 @@ impl WifiIface {
                             kdf::pmkid_sha1(
                                 &pmk,
                                 &self.link.bss_info.bssid,
-                                &self.core.mac,
+                                &self.core.nl.mac,
                             ),
                             MicAlg::HmacSha1,
                         )
@@ -256,7 +263,7 @@ impl WifiIface {
                             kdf::pmkid_sha256(
                                 &pmk,
                                 &self.link.bss_info.bssid,
-                                &self.core.mac,
+                                &self.core.nl.mac,
                             ),
                             MicAlg::AesCmac,
                         )
@@ -288,18 +295,14 @@ impl WifiIface {
     /// (including mac80211_hwsim) return `-EOPNOTSUPP`, and the
     /// userspace cache works without them.
     pub(crate) async fn driver_set_pmksa(&mut self, entry: &PmksaEntry) {
-        let attrs = Nl80211Pmksa::new(self.core.if_index)
+        let attrs = Nl80211Pmksa::new(self.core.nl.if_index)
             .pmkid(entry.pmkid.to_vec())
             .mac(entry.bssid)
             .pmk(entry.pmk.to_vec())
             .pmk_lifetime(PMK_LIFETIME_SECS as u32)
             .pmk_reauth_threshold(PMK_REAUTH_THRESHOLD_PERCENT)
             .build();
-        match drain_request(
-            self.core.conn_handle.set_pmksa(attrs).execute().await,
-        )
-        .await
-        {
+        match self.core.nl.set_pmksa(attrs).await {
             Ok(()) => log::info!("PMKSA offloaded to driver"),
             Err(e) => log::debug!("driver PMKSA cache not available: {e}"),
         }
@@ -308,15 +311,11 @@ impl WifiIface {
     /// Drop a PMKSA entry from the driver/firmware cache
     /// (`NL80211_CMD_DEL_PMKSA`), best effort.
     pub(crate) async fn driver_del_pmksa(&mut self, entry: &PmksaEntry) {
-        let attrs = Nl80211Pmksa::new(self.core.if_index)
+        let attrs = Nl80211Pmksa::new(self.core.nl.if_index)
             .pmkid(entry.pmkid.to_vec())
             .mac(entry.bssid)
             .build();
-        if let Err(e) = drain_request(
-            self.core.conn_handle.del_pmksa(attrs).execute().await,
-        )
-        .await
-        {
+        if let Err(e) = self.core.nl.del_pmksa(attrs).await {
             log::debug!("driver del_pmksa not available: {e}");
         }
     }

@@ -1,69 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use futures::TryStreamExt;
+use wl_nl80211::{Nl80211Attr, Nl80211Handle, Nl80211WowlanTriggersSupport};
 
-pub(crate) async fn drain_request<S>(stream: S) -> Result<(), WifiError>
-where
-    S: futures::TryStream<
-            Ok = netlink_packet_generic::GenlMessage<
-                wl_nl80211::Nl80211Message,
-            >,
-            Error = wl_nl80211::Nl80211Error,
-        > + Unpin,
-{
-    let mut stream = stream;
-    while let Some(_msg) = stream.try_next().await? {}
-    Ok(())
-}
-
-pub(crate) async fn get_if_index_and_mac(
-    handle: &Nl80211Handle,
-    ifname: &str,
-) -> Result<(u32, [u8; ETH_ALEN], u32), WifiError> {
-    let mut dump = handle.interface().get(vec![]).execute().await;
-    while let Some(msg) = dump.try_next().await? {
-        if msg.payload.attributes.iter().any(
-            |attr| matches!(attr, Nl80211Attr::IfName(name) if name == ifname),
-        ) {
-            let mut index = 0;
-            let mut mac = [0u8; ETH_ALEN];
-            let mut wiphy = None;
-            for attr in &msg.payload.attributes {
-                if let Nl80211Attr::IfIndex(idx) = attr {
-                    index = *idx;
-                } else if let Nl80211Attr::Mac(mac_addr) = attr {
-                    mac.copy_from_slice(mac_addr);
-                } else if let Nl80211Attr::Wiphy(w) = attr {
-                    wiphy = Some(*w);
-                }
-            }
-            if index != 0 && mac != [0u8; ETH_ALEN] {
-                return match wiphy {
-                    Some(w) => Ok((index, mac, w)),
-                    None => Err(WifiError::new(
-                        ErrorKind::Nl80211,
-                        format!(
-                            "interface {ifname}: wiphy index missing from \
-                             netlink message: {msg:?}",
-                        ),
-                    )),
-                };
-            } else {
-                return Err(WifiError::new(
-                    ErrorKind::InterfaceNotFound,
-                    format!(
-                        "interface {ifname}: index or mac not found in \
-                         netlink message: {msg:?}",
-                    ),
-                ));
-            }
-        }
-    }
-    Err(WifiError::new(
-        ErrorKind::InterfaceNotFound,
-        format!("interface {ifname} not found"),
-    ))
-}
+use super::MAX_SCHED_SCAN_SSIDS;
+use crate::WifiError;
 
 /// Whether the netlink error is `-EOPNOTSUPP`, i.e. the driver has no
 /// `sched_scan_start` op. Netlink NACK codes carry the negated errno.
@@ -145,31 +86,6 @@ pub(crate) async fn wiphy_sched_scan_caps(
         max_ssids: 0,
         max_match_sets: 0,
     })
-}
-
-/// The maximum number of SSIDs the wiphy accepts in one scan request
-/// (`NL80211_ATTR_MAX_NUM_SCAN_SSIDS`). Returns 0 when the kernel did
-/// not advertise the attribute.
-pub(crate) async fn wiphy_max_scan_ssids(
-    handle: &Nl80211Handle,
-    wiphy_idx: u32,
-) -> Result<u8, WifiError> {
-    let mut dump = handle.wireless_physic().get().execute().await;
-    while let Some(msg) = dump.try_next().await? {
-        let mut idx = None;
-        let mut max_ssids = 0u8;
-        for attr in &msg.payload.attributes {
-            match attr {
-                Nl80211Attr::Wiphy(i) => idx = Some(*i),
-                Nl80211Attr::MaxNumScanSsids(n) => max_ssids = *n,
-                _ => {}
-            }
-        }
-        if idx == Some(wiphy_idx) {
-            return Ok(max_ssids);
-        }
-    }
-    Ok(0)
 }
 
 /// the WoWLAN triggers the wiphy owning `wiphy_idx` advertises via

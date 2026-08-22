@@ -188,19 +188,16 @@ async fn run_wifi_interfaces(
                 client.shutdown().await;
                 return Ok(connected);
             }
-            result = client.run_multi() => {
+            result = client.run() => {
                 match result {
                     Ok(run_result) => {
                         let iface_name = &run_result.iface_name;
-                        if let Some(e) = run_result.error.as_ref() {
-                            log::warn!("WIFI {iface_name} error: {e}");
-                        }
                         match run_result.state {
                         shuli::WifiState::ConnectedWithoutOffloadRekey
                         | shuli::WifiState::ConnectedWithOffloadRekey => {
                             connected = true;
                             let Some(ssid) =
-                                client.current_ssid_of(iface_name)
+                                client.current_ssid(iface_name)
                             else {
                                 log::warn!(
                                     "WIFI {iface_name} connected but no \

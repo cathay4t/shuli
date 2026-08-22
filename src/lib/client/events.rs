@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use wl_nl80211::{
+    Nl80211AuthType, Nl80211Command, Nl80211UseMfp, Nl80211WowlanWakeup,
+};
+
+use super::{
+    AuthAction, AuthMethod, EapAction, EapPacket, ErrorKind,
+    Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, Nl80211Authenticate,
+    Nl80211Event, Nl80211Key, Nl80211KeyDefaultType, Nl80211RekeyOffload,
+    OweAuth, RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError,
+    WifiIface, WifiState, auth, eapol, elements, fatal_disconnect_error,
+    fmt_transition_disable, is_fatal_disconnect_reason, owe,
+    wowlan_wakeup_requires_reconnect,
+};
+use crate::crypto::handshake4::FourWayState;
 
 impl WifiIface {
     pub(crate) async fn handle_event(&mut self, event: Nl80211Event) {
@@ -512,12 +525,7 @@ impl WifiIface {
             // up, and rejects the next ASSOCIATE with -EALREADY
             // otherwise. wpa_supplicant sends CMD_DEAUTHENTICATE here;
             // CMD_DISCONNECT clears the same state.
-            if let Err(e) = connect::disconnect(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.disconnect().await {
                 log::debug!("disconnect cleanup failed: {e}");
             }
             if fatal {
@@ -536,12 +544,7 @@ impl WifiIface {
                 "AP disconnect during WPA2-PSK/FT-PSK 4-way handshake \
                  (reason={reason:?}); treating as wrong password"
             );
-            if let Err(e) = connect::disconnect(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.disconnect().await {
                 log::debug!("disconnect cleanup failed: {e}");
             }
             self.fail_auth(WifiError::wrong_password(&self.link.network.ssid));
@@ -603,12 +606,7 @@ impl WifiIface {
             log::warn!("WoWLAN wake invalidated the connection; reconnecting");
             // Same kernel-state cleanup as an AP disconnect: clear
             // wdev->connected before the next ASSOCIATE.
-            if let Err(e) = connect::disconnect(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.disconnect().await {
                 log::debug!("disconnect cleanup after WoWLAN wake failed: {e}");
             }
             self.state = WifiState::Failed;
@@ -679,18 +677,14 @@ impl WifiIface {
                 auth_data.extend_from_slice(&1u16.to_le_bytes());
                 auth_data.extend_from_slice(&confirm);
 
-                let attrs = Nl80211Authenticate::new(self.core.if_index)
+                let attrs = Nl80211Authenticate::new(self.core.nl.if_index)
                     .ssid(&self.link.network.ssid)
                     .mac(self.link.bss_info.bssid)
                     .frequency(self.link.bss_info.freq_mhz)
                     .auth_type(Nl80211AuthType::Sae)
                     .auth_data(auth_data)
                     .build();
-                if let Err(e) = drain_request(
-                    self.core.conn_handle.authenticate(attrs).execute().await,
-                )
-                .await
-                {
+                if let Err(e) = self.core.nl.authenticate(attrs).await {
                     log::warn!("send SAE confirm failed: {e}");
                     self.state = WifiState::Failed;
                 } else {
@@ -795,18 +789,14 @@ impl WifiIface {
     /// record it for retransmission (SAE Sync). The commit being
     /// (re)sent stays in flight until the AP's commit arrives.
     pub(crate) async fn send_sae_commit(&mut self, auth_data: &[u8]) {
-        let attrs = Nl80211Authenticate::new(self.core.if_index)
+        let attrs = Nl80211Authenticate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(self.link.bss_info.bssid)
             .frequency(self.link.bss_info.freq_mhz)
             .auth_type(Nl80211AuthType::Sae)
             .auth_data(auth_data.to_vec())
             .build();
-        if let Err(e) = drain_request(
-            self.core.conn_handle.authenticate(attrs).execute().await,
-        )
-        .await
-        {
+        if let Err(e) = self.core.nl.authenticate(attrs).await {
             log::warn!("send SAE commit failed: {e}");
             self.state = WifiState::Failed;
             return;
@@ -831,7 +821,7 @@ impl WifiIface {
         let auth = match AuthMethod::new_sae(
             password,
             &self.link.network.ssid,
-            self.core.mac,
+            self.core.nl.mac,
             self.link.bss_info.bssid,
             false, // h2e
             false, // no further fallback
@@ -944,7 +934,7 @@ impl WifiIface {
                     }
                     let mut fw = FourWayState::new_ft(
                         ft.pmk_r1.clone(),
-                        self.core.mac,
+                        self.core.nl.mac,
                         self.link.bss_info.bssid,
                         rsne,
                         self.link.bss_info.ap_rsne.clone(),
@@ -1105,7 +1095,7 @@ impl WifiIface {
                     let mut fw = FourWayState::new_with_ap_ies(
                         &pmk,
                         mic_alg,
-                        self.core.mac,
+                        self.core.nl.mac,
                         self.link.bss_info.bssid,
                         rsne,
                         self.link.bss_info.ap_rsne.clone(),
@@ -1135,13 +1125,11 @@ impl WifiIface {
                     }
                 }
             };
-            if let Err(e) = send_ctrl_port_frame(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-                self.link.bss_info.bssid,
-                &msg2,
-            )
-            .await
+            if let Err(e) = self
+                .core
+                .nl
+                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg2)
+                .await
             {
                 log::warn!("send msg2 failed: {e}");
                 self.state = WifiState::Failed;
@@ -1218,17 +1206,13 @@ impl WifiIface {
                     self.link.fourway.as_ref().and_then(|fw| fw.tk())
             {
                 let attrs = Nl80211Key::new_ptk(
-                    self.core.if_index,
+                    self.core.nl.if_index,
                     self.link.bss_info.bssid,
                     tk.to_vec(),
                 )
                 .key_index(key_id)
                 .build();
-                if let Err(e) = drain_request(
-                    self.core.conn_handle.new_key(attrs).execute().await,
-                )
-                .await
-                {
+                if let Err(e) = self.core.nl.new_key(attrs).await {
                     log::warn!("install PTK (RX) failed: {e}");
                     self.state = WifiState::Failed;
                     return;
@@ -1236,13 +1220,11 @@ impl WifiIface {
                 log::info!("PTK installed for RX (key id {key_id})");
             }
 
-            if let Err(e) = send_ctrl_port_frame(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-                self.link.bss_info.bssid,
-                &msg4,
-            )
-            .await
+            if let Err(e) = self
+                .core
+                .nl
+                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg4)
+                .await
             {
                 log::warn!("send msg4 failed: {e}");
                 self.state = WifiState::Failed;
@@ -1253,7 +1235,7 @@ impl WifiIface {
             if let Some(tk) = self.link.fourway.as_ref().and_then(|fw| fw.tk())
             {
                 let mut builder = Nl80211Key::new_ptk(
-                    self.core.if_index,
+                    self.core.nl.if_index,
                     self.link.bss_info.bssid,
                     tk.to_vec(),
                 );
@@ -1264,15 +1246,7 @@ impl WifiIface {
                         .key_index(key_id)
                         .default_types(vec![Nl80211KeyDefaultType::Unicast]);
                 }
-                if let Err(e) = drain_request(
-                    self.core
-                        .conn_handle
-                        .new_key(builder.build())
-                        .execute()
-                        .await,
-                )
-                .await
-                {
+                if let Err(e) = self.core.nl.new_key(builder.build()).await {
                     log::warn!("install PTK failed: {e}");
                     self.state = WifiState::Failed;
                     return;
@@ -1285,21 +1259,18 @@ impl WifiIface {
             }
 
             if let Some((gtk_idx, gtk_data)) = &kdes.gtk {
-                if let Err(e) = drain_request(
-                    self.core
-                        .conn_handle
-                        .new_key(
-                            Nl80211Key::new_gtk(
-                                self.core.if_index,
-                                gtk_data.to_vec(),
-                                *gtk_idx,
-                            )
-                            .build(),
+                if let Err(e) = self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_gtk(
+                            self.core.nl.if_index,
+                            gtk_data.to_vec(),
+                            *gtk_idx,
                         )
-                        .execute()
-                        .await,
-                )
-                .await
+                        .build(),
+                    )
+                    .await
                 {
                     log::warn!("install GTK failed: {e}");
                     self.state = WifiState::Failed;
@@ -1314,23 +1285,20 @@ impl WifiIface {
             // switch announcements) the AP sends. Failures are logged but
             // not fatal: the data path works without them.
             if let Some(ref igtk) = kdes.igtk {
-                match drain_request(
-                    self.core
-                        .conn_handle
-                        .new_key(
-                            Nl80211Key::new_igtk(
-                                self.core.if_index,
-                                igtk.key.clone(),
-                                igtk.key_index,
-                                igtk.ipn.to_vec(),
-                            )
-                            .cipher(self.link.bss_info.group_mgmt_cipher)
-                            .build(),
+                match self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_igtk(
+                            self.core.nl.if_index,
+                            igtk.key.clone(),
+                            igtk.key_index,
+                            igtk.ipn.to_vec(),
                         )
-                        .execute()
-                        .await,
-                )
-                .await
+                        .cipher(self.link.bss_info.group_mgmt_cipher)
+                        .build(),
+                    )
+                    .await
                 {
                     Ok(()) => {
                         log::info!("IGTK[{}] installed", igtk.key_index)
@@ -1339,23 +1307,20 @@ impl WifiIface {
                 }
             }
             if let Some(ref bigtk) = kdes.bigtk {
-                match drain_request(
-                    self.core
-                        .conn_handle
-                        .new_key(
-                            Nl80211Key::new_bigtk(
-                                self.core.if_index,
-                                bigtk.key.clone(),
-                                bigtk.key_index,
-                                bigtk.ipn.to_vec(),
-                            )
-                            .cipher(self.link.bss_info.group_mgmt_cipher)
-                            .build(),
+                match self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_bigtk(
+                            self.core.nl.if_index,
+                            bigtk.key.clone(),
+                            bigtk.key_index,
+                            bigtk.ipn.to_vec(),
                         )
-                        .execute()
-                        .await,
-                )
-                .await
+                        .cipher(self.link.bss_info.group_mgmt_cipher)
+                        .build(),
+                    )
+                    .await
                 {
                     Ok(()) => {
                         log::info!("BIGTK[{}] installed", bigtk.key_index)
@@ -1377,20 +1342,12 @@ impl WifiIface {
                 &self.link.fourway,
             ) {
                 let rc = fw.replay_counter_bytes();
-                let attrs = Nl80211RekeyOffload::new(self.core.if_index)
+                let attrs = Nl80211RekeyOffload::new(self.core.nl.if_index)
                     .kek(kek.to_vec())
                     .kck(kck.to_vec())
                     .replay_ctr(rc)
                     .build();
-                match drain_request(
-                    self.core
-                        .conn_handle
-                        .set_rekey_offload(attrs)
-                        .execute()
-                        .await,
-                )
-                .await
-                {
+                match self.core.nl.set_rekey_offload(attrs).await {
                     Ok(()) => {
                         log::info!("GTK rekey offloaded to driver");
                         true
@@ -1448,13 +1405,11 @@ impl WifiIface {
                 }
             };
 
-            if let Err(e) = send_ctrl_port_frame(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-                self.link.bss_info.bssid,
-                &msg2,
-            )
-            .await
+            if let Err(e) = self
+                .core
+                .nl
+                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg2)
+                .await
             {
                 log::warn!("send group rekey reply failed: {e}");
                 return;
@@ -1466,21 +1421,18 @@ impl WifiIface {
                 None => (None, 0),
             };
             if let Some(gtk_data) = gtk_data {
-                if let Err(e) = drain_request(
-                    self.core
-                        .conn_handle
-                        .new_key(
-                            Nl80211Key::new_gtk(
-                                self.core.if_index,
-                                gtk_data,
-                                gtk_idx,
-                            )
-                            .build(),
+                if let Err(e) = self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_gtk(
+                            self.core.nl.if_index,
+                            gtk_data,
+                            gtk_idx,
                         )
-                        .execute()
-                        .await,
-                )
-                .await
+                        .build(),
+                    )
+                    .await
                 {
                     log::warn!("install rekeyed GTK failed: {e}");
                 } else {
@@ -1506,13 +1458,11 @@ impl WifiIface {
         match peer.handle_packet(&packet) {
             Ok(EapAction::Respond(response)) => {
                 let frame = eapol::build_eapol_eap_frame(&response);
-                if let Err(e) = send_ctrl_port_frame(
-                    &mut self.core.conn_handle,
-                    self.core.if_index,
-                    self.link.bss_info.bssid,
-                    &frame,
-                )
-                .await
+                if let Err(e) = self
+                    .core
+                    .nl
+                    .send_ctrl_port_frame(self.link.bss_info.bssid, &frame)
+                    .await
                 {
                     log::warn!("send EAP response failed: {e}");
                     self.state = WifiState::Failed;

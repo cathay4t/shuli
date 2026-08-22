@@ -9,26 +9,19 @@
 //! (SAE frames, association results, EAPOL-Key messages) advance the
 //! current state directly. Scan specifics live in `scan.rs`,
 //! pre-association authentication (SAE today, WPA2/EAP later) in
-//! `auth.rs`, and nl80211 details in `nl80211/`.
+//! `auth.rs`, and nl80211 details in `nl80211.rs`.
 
-use std::collections::HashMap;
-
-use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
-use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use netlink_packet_core::NetlinkMessage;
 use wl_nl80211::{
-    Ieee80211ReasonCode, Ieee80211StatusCode, Nl80211Associate, Nl80211Attr,
-    Nl80211AuthType, Nl80211Authenticate, Nl80211Command,
-    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Event,
-    Nl80211Handle, Nl80211Key, Nl80211KeyDefaultType, Nl80211Message,
-    Nl80211MulticastGroup, Nl80211Pmksa, Nl80211RekeyOffload,
-    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
-    Nl80211SchedScanPlanAttr, Nl80211UseMfp, Nl80211Wowlan,
-    Nl80211WowlanTriggersSupport, Nl80211WowlanWakeup,
+    Ieee80211ReasonCode, Ieee80211StatusCode, Nl80211Attr, Nl80211Authenticate,
+    Nl80211Disconnect, Nl80211Event, Nl80211Key, Nl80211KeyDefaultType,
+    Nl80211RekeyOffload, Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr,
+    Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr, Nl80211Wowlan,
+    Nl80211WowlanTriggersSupport,
 };
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, WifiError,
+    ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiError,
     auth::{AuthAction, AuthMethod},
     config::WifiConfig,
     crypto::{
@@ -38,12 +31,11 @@ use crate::{
     },
     eap::{EapAction, EapPacket, EapPeer},
     ieee80211::{auth, eapol, elements},
-    nl80211::connect,
     pmksa::{
         PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
         PmksaEntry, entry_with_fresh_lifetime,
     },
-    scan::{BssInfo, SecurityType, format_ssids},
+    scan::{SecurityType, format_ssids},
 };
 
 type Nl80211EventMsg = NetlinkMessage<genetlink::message::RawGenlMessage>;
@@ -114,17 +106,19 @@ pub(crate) use state::{
     AuthSession, IfaceCore, Link, RoamEngine, ScanEngine, WifiIface, WiphyCaps,
     WowlanState,
 };
-pub use wifi_client::{WifiClient, WifiRunResult};
+pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]
 pub(crate) use wifi_iface::desired_wowlan_triggers;
 pub(crate) use wifi_iface::{
     fatal_disconnect_error, fmt_transition_disable, is_fatal_disconnect_reason,
-    send_ctrl_port_frame, wowlan_wakeup_requires_reconnect,
+    wowlan_wakeup_requires_reconnect,
 };
 pub(crate) use wiphy::{
-    drain_request, get_if_index_and_mac, is_eopnotsupp, next_sched_scan_ssids,
-    wiphy_max_scan_ssids, wiphy_sched_scan_caps, wiphy_wowlan_support,
+    is_eopnotsupp, next_sched_scan_ssids, wiphy_sched_scan_caps,
+    wiphy_wowlan_support,
 };
+
+pub(crate) use crate::nl80211::drain_request;
 #[cfg(test)]
 mod tests {
     use wl_nl80211::{

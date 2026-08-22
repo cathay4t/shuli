@@ -31,6 +31,7 @@ pub const MSK_LEN: usize = 64;
 /// A parsed or built EAP packet.  `type_` is `None` for Success /
 /// Failure, which carry no Type field (RFC 3748 §4.2/4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EapPacket {
     pub code: u8,
     pub identifier: u8,
@@ -119,6 +120,7 @@ pub trait EapMethod: Send {
 /// What the caller should do after feeding a packet to
 /// [`EapPeer::handle_packet`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EapAction {
     /// Send this EAP-Response packet (already framed).
     Respond(Vec<u8>),
@@ -133,6 +135,7 @@ pub enum EapAction {
 /// EAP peer state machine.  Identity is handled here; method types are
 /// delegated to an [`EapMethod`] when one is set, otherwise answered
 /// with a Nak listing `supported_types`.
+#[non_exhaustive]
 pub struct EapPeer {
     identity: String,
     method: Option<Box<dyn EapMethod>>,

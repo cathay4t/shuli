@@ -20,6 +20,7 @@ pub const DEFAULT_SWITCH_SSID_LOWER_THAN_DBM: i32 = -80;
 /// other method if the first commit is rejected or silently dropped, so
 /// a missing/misleading RSNXE cannot strand the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SaePwe {
     /// Hash-to-element only.
     H2E,
@@ -59,6 +60,7 @@ impl SaePwe {
 /// No serde — the daemon layer deserializes its own `ShuliConfig` and
 /// converts it into this struct.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WifiConfig {
     pub iface_name: String,
     /// Networks to scan for and connect to. A single scan schedule
@@ -84,6 +86,7 @@ pub struct WifiConfig {
 /// Neighbor Report). BTM (802.11v) Requests are honoured regardless of
 /// `roaming`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NetworkConfig {
     pub ssid: String,
     pub password: Option<String>,
@@ -211,6 +214,7 @@ impl NetworkConfig {
 /// EAP credential configuration: identity, certificate
 /// paths, and the TLS server name used for certificate validation.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct EapConfig {
     /// EAP identity (outer identity) sent in the Identity exchange.
     pub identity: String,

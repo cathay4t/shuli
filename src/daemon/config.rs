@@ -133,13 +133,13 @@ pub(crate) struct EapEntry {
 
 impl EapEntry {
     pub(crate) fn to_lib(&self) -> shuli::EapConfig {
-        shuli::EapConfig {
-            identity: self.identity.clone(),
-            ca_cert: self.ca_cert.as_ref().map(PathBuf::from),
-            client_cert: self.client_cert.as_ref().map(PathBuf::from),
-            client_key: self.client_key.as_ref().map(PathBuf::from),
-            server_name: self.server_name.clone(),
-        }
+        let mut eap = shuli::EapConfig::default();
+        eap.identity = self.identity.clone();
+        eap.ca_cert = self.ca_cert.as_ref().map(PathBuf::from);
+        eap.client_cert = self.client_cert.as_ref().map(PathBuf::from);
+        eap.client_key = self.client_key.as_ref().map(PathBuf::from);
+        eap.server_name = self.server_name.clone();
+        eap
     }
 }
 

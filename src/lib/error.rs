@@ -3,6 +3,7 @@
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     Config,
     Nl80211,
@@ -48,10 +49,12 @@ impl fmt::Display for ErrorKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WifiError {
     pub kind: ErrorKind,
     pub msg: String,
+    pub iface_name: Option<String>,
 }
 
 impl WifiError {
@@ -59,7 +62,14 @@ impl WifiError {
         WifiError {
             kind,
             msg: msg.into(),
+            iface_name: None,
         }
+    }
+
+    /// Attach the interface the error belongs to.
+    pub fn with_iface_name(mut self, iface_name: impl Into<String>) -> Self {
+        self.iface_name = Some(iface_name.into());
+        self
     }
 
     /// A credential failure against a password-protected network.
@@ -73,7 +83,12 @@ impl WifiError {
 
 impl fmt::Display for WifiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind, self.msg)
+        match &self.iface_name {
+            Some(iface_name) => {
+                write!(f, "[{iface_name}] {}: {}", self.kind, self.msg)
+            }
+            None => write!(f, "{}: {}", self.kind, self.msg),
+        }
     }
 }
 

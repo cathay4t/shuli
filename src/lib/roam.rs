@@ -25,7 +25,6 @@ use wl_nl80211::{
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface, WifiState,
-    client::drain_request,
     config::SaePwe,
     crypto::ft::{
         FT_PTK_LEN, PmkR0, PmkR1, derive_ft_ptk, derive_pmk_r0, derive_pmk_r1,
@@ -125,29 +124,23 @@ impl WifiIface {
     /// Radio Measurement Neighbor Report Response (category 5, action 5)
     /// so the active neighbor-report path sees the AP's answer.
     pub(crate) async fn register_roam_frames(&mut self) {
-        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.core.if_index)
-            .frame_type(FRAME_TYPE_ACTION)
-            .frame_match(vec![WNM_ACTION_CATEGORY])
-            .build();
-        if let Err(e) = drain_request(
-            self.core.conn_handle.register_frame(attrs).execute().await,
-        )
-        .await
-        {
+        let attrs =
+            wl_nl80211::Nl80211RegisterFrame::new(self.core.nl.if_index)
+                .frame_type(FRAME_TYPE_ACTION)
+                .frame_match(vec![WNM_ACTION_CATEGORY])
+                .build();
+        if let Err(e) = self.core.nl.register_frame(attrs).await {
             log::debug!("register WNM action frames failed: {e}");
         }
-        let attrs = wl_nl80211::Nl80211RegisterFrame::new(self.core.if_index)
-            .frame_type(FRAME_TYPE_ACTION)
-            .frame_match(vec![
-                RRM_ACTION_CATEGORY,
-                NEIGHBOR_REPORT_RESPONSE_ACTION,
-            ])
-            .build();
-        if let Err(e) = drain_request(
-            self.core.conn_handle.register_frame(attrs).execute().await,
-        )
-        .await
-        {
+        let attrs =
+            wl_nl80211::Nl80211RegisterFrame::new(self.core.nl.if_index)
+                .frame_type(FRAME_TYPE_ACTION)
+                .frame_match(vec![
+                    RRM_ACTION_CATEGORY,
+                    NEIGHBOR_REPORT_RESPONSE_ACTION,
+                ])
+                .build();
+        if let Err(e) = self.core.nl.register_frame(attrs).await {
             log::debug!("register RRM neighbor report frames failed: {e}");
         }
     }
@@ -243,9 +236,9 @@ impl WifiIface {
             &self.link.network.ssid,
             mdid,
             &r0kh_id,
-            self.core.mac,
+            self.core.nl.mac,
         );
-        let pmk_r1 = derive_pmk_r1(&pmk_r0, r1kh_id, self.core.mac);
+        let pmk_r1 = derive_pmk_r1(&pmk_r0, r1kh_id, self.core.nl.mac);
 
         // MDIE + FTIE of the response are echoed in the 4-way Message 2
         // key data for FT AKMs.
@@ -439,15 +432,11 @@ impl WifiIface {
         let Some(threshold) = self.roam_threshold() else {
             return false;
         };
-        let attrs = Nl80211Cqm::new(self.core.if_index)
+        let attrs = Nl80211Cqm::new(self.core.nl.if_index)
             .rssi_thold(threshold)
             .rssi_hyst(CQM_RSSI_HYST_DBM)
             .build();
-        match drain_request(
-            self.core.conn_handle.set_cqm(attrs).execute().await,
-        )
-        .await
-        {
+        match self.core.nl.set_cqm(attrs).await {
             Ok(()) => {
                 log::info!(
                     "kernel CQM armed: roam below {threshold} dBm (hysteresis \
@@ -528,9 +517,9 @@ impl WifiIface {
         };
 
         let mut station_handle =
-            Nl80211StationHandle::new(self.core.handle.clone());
+            Nl80211StationHandle::new(self.core.nl.handle.clone());
         let mut stream =
-            station_handle.dump(self.core.if_index).execute().await;
+            station_handle.dump(self.core.nl.if_index).execute().await;
         while let Some(msg) = stream
             .try_next()
             .await
@@ -720,14 +709,11 @@ impl WifiIface {
         // is outstanding and we match the response by token.
         let dialog = 1;
         let frame = self.action_frame(build_neighbor_report_request(dialog));
-        let attrs = wl_nl80211::Nl80211Frame::new(self.core.if_index)
+        let attrs = wl_nl80211::Nl80211Frame::new(self.core.nl.if_index)
             .frame(frame)
             .frequency(self.link.bss_info.freq_mhz)
             .build();
-        if let Err(e) =
-            drain_request(self.core.conn_handle.frame(attrs).execute().await)
-                .await
-        {
+        if let Err(e) = self.core.nl.send_frame(attrs).await {
             log::debug!("802.11k neighbor report request failed: {e}");
             return;
         }
@@ -785,7 +771,7 @@ impl WifiIface {
         frame.extend_from_slice(&FRAME_TYPE_ACTION.to_le_bytes());
         frame.extend_from_slice(&[0, 0]); // duration
         frame.extend_from_slice(&self.link.bss_info.bssid); // DA = AP
-        frame.extend_from_slice(&self.core.mac); // SA
+        frame.extend_from_slice(&self.core.nl.mac); // SA
         frame.extend_from_slice(&self.link.bss_info.bssid); // BSSID
         frame.extend_from_slice(&[0, 0]); // sequence control
         frame.extend_from_slice(&body);
@@ -840,14 +826,11 @@ impl WifiIface {
             target_bssid,
         ));
 
-        let attrs = wl_nl80211::Nl80211Frame::new(self.core.if_index)
+        let attrs = wl_nl80211::Nl80211Frame::new(self.core.nl.if_index)
             .frame(frame)
             .frequency(self.link.bss_info.freq_mhz)
             .build();
-        if let Err(e) =
-            drain_request(self.core.conn_handle.frame(attrs).execute().await)
-                .await
-        {
+        if let Err(e) = self.core.nl.send_frame(attrs).await {
             log::warn!("send BTM Response failed: {e}");
         }
     }
@@ -922,12 +905,7 @@ impl WifiIface {
         // ping-pong through repeated full reconnections.
         self.roam.last_roam = Some(std::time::Instant::now());
         self.roam.roam_scan_full = false;
-        if let Err(e) = crate::nl80211::connect::disconnect(
-            &mut self.core.conn_handle,
-            self.core.if_index,
-        )
-        .await
-        {
+        if let Err(e) = self.core.nl.disconnect().await {
             log::debug!("disconnect for roam failed: {e}");
         }
         self.state = WifiState::Failed;
@@ -948,7 +926,7 @@ impl WifiIface {
                 crate::crypto::kdf::pmkid_sha1(
                     &pmk,
                     &target.bssid,
-                    &self.core.mac,
+                    &self.core.nl.mac,
                 ),
                 crate::crypto::handshake4::MicAlg::HmacSha1,
             ),
@@ -956,7 +934,7 @@ impl WifiIface {
                 crate::crypto::kdf::pmkid_sha256(
                     &pmk,
                     &target.bssid,
-                    &self.core.mac,
+                    &self.core.nl.mac,
                 ),
                 crate::crypto::handshake4::MicAlg::AesCmac,
             ),
@@ -1034,18 +1012,14 @@ impl WifiIface {
         );
         // FT authentication carries the MDIE + FTIE in NL80211_ATTR_IE;
         // NL80211_ATTR_AUTH_DATA is rejected for AUTHTYPE_FT.
-        let attrs = Nl80211Authenticate::new(self.core.if_index)
+        let attrs = Nl80211Authenticate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(target.bssid)
             .frequency(target.freq_mhz)
             .auth_type(Nl80211AuthType::Ft)
             .ie(ft_ies)
             .build();
-        if let Err(e) = drain_request(
-            self.core.conn_handle.authenticate(attrs).execute().await,
-        )
-        .await
-        {
+        if let Err(e) = self.core.nl.authenticate(attrs).await {
             // CMD_AUTHENTICATE disconnects the old AP even when it
             // fails, so the connection is gone either way; the retry
             // loop reconnects.
@@ -1182,13 +1156,13 @@ impl WifiIface {
             ));
         }
 
-        let pmk_r1 = derive_pmk_r1(&ft.pmk_r0, r1kh_id, self.core.mac);
+        let pmk_r1 = derive_pmk_r1(&ft.pmk_r0, r1kh_id, self.core.nl.mac);
         let ptk = derive_ft_ptk(
             &pmk_r1,
             &roam.snonce,
             &ftie.anonce,
             roam.target.bssid,
-            self.core.mac,
+            self.core.nl.mac,
         );
         log::debug!(
             "FT roam: PMK-R1/PTK derived for {:02x?}",
@@ -1259,7 +1233,7 @@ impl WifiIface {
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
         let ftie = elements::ftie_reassoc_request(
             &kck,
-            self.core.mac,
+            self.core.nl.mac,
             target.bssid,
             anonce,
             snonce,
@@ -1285,7 +1259,7 @@ impl WifiIface {
             }
             _ => target.ap_mfp_capable().then_some(Nl80211UseMfp::Required),
         };
-        let mut builder = Nl80211Associate::new(self.core.if_index)
+        let mut builder = Nl80211Associate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(target.bssid)
             .prev_bssid(self.link.bss_info.bssid)
@@ -1298,14 +1272,7 @@ impl WifiIface {
         }
 
         log::info!("FT roam: sending REASSOCIATE to {:02x?}", target.bssid);
-        drain_request(
-            self.core
-                .conn_handle
-                .associate(builder.build())
-                .execute()
-                .await,
-        )
-        .await
+        self.core.nl.associate(builder.build()).await
     }
 
     /// FT roam step 3: the target AP accepted the reassociation. Validate
@@ -1428,7 +1395,7 @@ impl WifiIface {
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
         let expected_mic = crate::crypto::ft::ft_mic(
             &kck,
-            self.core.mac,
+            self.core.nl.mac,
             target.bssid,
             6,
             &mic_data,
@@ -1447,36 +1414,30 @@ impl WifiIface {
         if let Some(ref gtk) = ftie.gtk {
             let key = elements::unwrap_ft_key(&kek, gtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_gtk(
-                self.core.if_index,
+                self.core.nl.if_index,
                 key,
                 gtk.key_index,
             )
             .seq(gtk.rsc.clone())
             .build();
-            drain_request(self.core.conn_handle.new_key(attrs).execute().await)
-                .await
-                .map_err(|e| {
-                    WifiError::new(
-                        ErrorKind::Roaming,
-                        format!("FT GTK install failed: {e}"),
-                    )
-                })?;
+            self.core.nl.new_key(attrs).await.map_err(|e| {
+                WifiError::new(
+                    ErrorKind::Roaming,
+                    format!("FT GTK install failed: {e}"),
+                )
+            })?;
             log::info!("FT roam: GTK[{}] installed", gtk.key_index);
         }
         if let Some(ref igtk) = ftie.igtk {
             let key = elements::unwrap_ft_key(&kek, igtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_igtk(
-                self.core.if_index,
+                self.core.nl.if_index,
                 key,
                 igtk.key_index,
                 igtk.rsc.clone(),
             )
             .build();
-            if let Err(e) = drain_request(
-                self.core.conn_handle.new_key(attrs).execute().await,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.new_key(attrs).await {
                 log::warn!("FT roam: IGTK install failed: {e}");
             } else {
                 log::info!("FT roam: IGTK[{}] installed", igtk.key_index);
@@ -1485,17 +1446,13 @@ impl WifiIface {
         if let Some(ref bigtk) = ftie.bigtk {
             let key = elements::unwrap_ft_key(&kek, bigtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_bigtk(
-                self.core.if_index,
+                self.core.nl.if_index,
                 key,
                 bigtk.key_index,
                 bigtk.rsc.clone(),
             )
             .build();
-            if let Err(e) = drain_request(
-                self.core.conn_handle.new_key(attrs).execute().await,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.new_key(attrs).await {
                 log::warn!("FT roam: BIGTK install failed: {e}");
             } else {
                 log::info!("FT roam: BIGTK[{}] installed", bigtk.key_index);
@@ -1546,20 +1503,18 @@ impl WifiIface {
     ) -> Result<(), WifiError> {
         use crate::crypto::ft::{FT_KCK_LEN, FT_KEK_LEN, FT_TK_LEN};
         let tk = ptk[FT_KCK_LEN + FT_KEK_LEN..][..FT_TK_LEN].to_vec();
-        let attrs = wl_nl80211::Nl80211Key::new(self.core.if_index)
+        let attrs = wl_nl80211::Nl80211Key::new(self.core.nl.if_index)
             .mac(target.bssid)
             .key_data(tk)
             .key_index(0)
             .key_type(wl_nl80211::Nl80211KeyType::Pairwise)
             .build();
-        drain_request(self.core.conn_handle.new_key(attrs).execute().await)
-            .await
-            .map_err(|e| {
-                WifiError::new(
-                    ErrorKind::Roaming,
-                    format!("FT PTK install failed: {e}"),
-                )
-            })?;
+        self.core.nl.new_key(attrs).await.map_err(|e| {
+            WifiError::new(
+                ErrorKind::Roaming,
+                format!("FT PTK install failed: {e}"),
+            )
+        })?;
         log::info!("FT roam: PTK installed");
         Ok(())
     }

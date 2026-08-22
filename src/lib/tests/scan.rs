@@ -5,7 +5,7 @@
 use wl_nl80211::Nl80211BssInfo;
 
 use crate::{
-    nl80211::scan::extract_signal_dbm,
+    nl80211::extract_signal_dbm,
     scan::{SecurityType, detect_security},
 };
 

@@ -109,9 +109,8 @@ fn test_peer_notification_acknowledged() {
 #[test]
 fn test_peer_nak_unsupported_method() {
     let mut peer = EapPeer::new("user".to_string());
-    peer.set_supported_types(vec![TYPE_TLS]);
-    // No method installed: EAP-TLS is answered with a Nak offering
-    // the supported types.
+    // No method installed and no supported types configured: EAP-TLS is
+    // answered with a Nak listing nothing.
     let request = EapPacket::build(CODE_REQUEST, 3, Some(TYPE_TLS), b"");
     let action = peer.handle_packet(&EapPacket::parse(&request).unwrap());
     let EapAction::Respond(response) = action.unwrap() else {
@@ -119,7 +118,7 @@ fn test_peer_nak_unsupported_method() {
     };
     let parsed = EapPacket::parse(&response).unwrap();
     assert_eq!(parsed.type_, Some(TYPE_NAK));
-    assert_eq!(parsed.body, vec![TYPE_TLS]);
+    assert!(parsed.body.is_empty());
 }
 
 /// A minimal EAP-TLS stand-in for state machine tests; the real

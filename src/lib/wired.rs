@@ -32,6 +32,7 @@ const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
 
 /// Connection state of a wired 802.1X port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WiredState {
     /// Socket ready; EAPOL-Start not sent yet.
     Init,
@@ -44,6 +45,7 @@ pub enum WiredState {
 }
 
 /// A wired 802.1X supplicant for one Ethernet interface.
+#[non_exhaustive]
 pub struct WiredClient {
     fd: OwnedFd,
     async_fd: AsyncFd<OwnedFd>,

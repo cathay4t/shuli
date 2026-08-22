@@ -717,6 +717,7 @@ pub fn ftie_reassoc_request(
 /// A group key delivered in an FTIE subelement (GTK / IGTK / BIGTK),
 /// still AES-Key-Wrapped with the KEK.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FtKeySubelem {
     pub key_index: u8,
     /// Receive sequence counter: RSC (8) for the GTK, IPN/BIPN (6) for
@@ -727,6 +728,7 @@ pub struct FtKeySubelem {
 
 /// Parsed Fast BSS Transition element.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FtIe {
     pub mic_control: [u8; 2],
     pub mic: [u8; 16],

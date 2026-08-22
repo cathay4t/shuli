@@ -1,19 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use futures::StreamExt;
+use wl_nl80211::{Ieee80211ReasonCode, Nl80211Command, Nl80211WowlanWakeup};
+
+use super::{
+    AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, ErrorKind, IfaceCore,
+    Link, MAX_SCHED_SCAN_SSIDS, NetworkConfig, Nl80211Attr, Nl80211Disconnect,
+    Nl80211Event, Nl80211EventReceiver, Nl80211SchedScanMatch,
+    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
+    Nl80211Wowlan, Nl80211WowlanTriggersSupport, PmksaCache, RETRY_AUTH_SEC,
+    RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC, ROAM_SIGNAL_CHECK_SECS,
+    RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
+    SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
+    SCHED_SCAN_WATCHDOG_SECS, ScanEngine, ShuliNl80211Connection, WifiConfig,
+    WifiError, WifiIface, WifiState, WiphyCaps, WowlanState, drain_request,
+    format_ssids, is_eopnotsupp, next_sched_scan_ssids, wiphy_sched_scan_caps,
+    wiphy_wowlan_support,
+};
+use crate::{BssInfo, ETH_ALEN};
 
 impl WifiIface {
     /// Validate the configuration and prepare one interface state machine.
     /// The nl80211 connection is shared with every other interface in the
     /// parent [`WifiClient`].
     pub(crate) async fn init(
-        handle: Nl80211Handle,
-        mut conn_handle: Nl80211ConnectionHandle,
+        mut nl: ShuliNl80211Connection,
         event_receiver: Nl80211EventReceiver,
         config: WifiConfig,
     ) -> Result<Self, WifiError> {
-        let (if_index, mac, wiphy_idx) =
-            get_if_index_and_mac(&handle, &config.iface_name).await?;
+        let if_index = nl.if_index;
+        let mac = nl.mac;
+        let wiphy_idx = nl.wiphy_index;
 
         log::info!(
             "interface {} if_index={}, mac={mac:02x?}, wiphy={wiphy_idx}",
@@ -26,7 +43,7 @@ impl WifiIface {
         // host sleeps. The caps bound each PNO chunk, which shuli
         // rotates through like wpa_supplicant.
         let (sched_scan_supported, max_sched_scan_ssids, max_match_sets) =
-            match wiphy_sched_scan_caps(&handle, wiphy_idx).await {
+            match wiphy_sched_scan_caps(&nl.handle, wiphy_idx).await {
                 Ok(caps) => {
                     if caps.supported {
                         log::info!(
@@ -54,30 +71,21 @@ impl WifiIface {
         // entry); when the kernel advertises no cap, fall back to
         // wildcard-only scans so a request can never be rejected for
         // asking the driver to probe too many SSIDs.
-        let max_scan_ssids =
-            match wiphy_max_scan_ssids(&handle, wiphy_idx).await {
-                Ok(n) if n > 0 => n as usize,
-                Ok(_) => {
-                    log::debug!(
-                        "wiphy {wiphy_idx} advertises no per-scan SSID cap; \
-                         using wildcard-only scans"
-                    );
-                    1
-                }
-                Err(e) => {
-                    log::debug!(
-                        "could not query max scan SSIDs: {e}; using \
-                         wildcard-only scans"
-                    );
-                    1
-                }
-            };
+        let max_scan_ssids = if nl.wiphy_max_scan_count > 0 {
+            nl.wiphy_max_scan_count as usize
+        } else {
+            log::debug!(
+                "wiphy {wiphy_idx} advertises no per-scan SSID cap; using \
+                 wildcard-only scans"
+            );
+            1
+        };
 
         // detect WoWLAN trigger support once, so arming a
         // `wowlan: true` network is a no-op (and clearly logged) on
         // drivers without it.
         let wowlan_supported_triggers =
-            match wiphy_wowlan_support(&handle, wiphy_idx).await {
+            match wiphy_wowlan_support(&nl.handle, wiphy_idx).await {
                 Ok(triggers) if !triggers.is_empty() => {
                     log::info!(
                         "wiphy {wiphy_idx} supports WoWLAN: {triggers:?}"
@@ -104,9 +112,7 @@ impl WifiIface {
         if !wowlan_supported_triggers.is_empty() {
             let attrs =
                 Nl80211Wowlan::new(if_index).triggers(Vec::new()).build();
-            match drain_request(conn_handle.set_wowlan(attrs).execute().await)
-                .await
-            {
+            match nl.set_wowlan(attrs).await {
                 Ok(()) => log::info!(
                     "cleared stale WoWLAN triggers from a previous run"
                 ),
@@ -124,11 +130,8 @@ impl WifiIface {
         })?;
 
         let core = IfaceCore {
-            handle,
-            conn_handle,
+            nl,
             event_receiver,
-            if_index,
-            mac,
             config,
         };
         let caps = WiphyCaps {
@@ -721,7 +724,7 @@ impl WifiIface {
         };
 
         let mut attrs = vec![
-            Nl80211Attr::IfIndex(self.core.if_index),
+            Nl80211Attr::IfIndex(self.core.nl.if_index),
             // Active probe for this chunk's hidden SSIDs plus the
             // wildcard entry for visible networks...
             Nl80211Attr::ScanSsids(ssids.clone()),
@@ -741,20 +744,7 @@ impl WifiIface {
         // Drive the request manually so a permanent "not supported"
         // (-EOPNOTSUPP) can be told apart from transient failures; the
         // errno is lost once the error is converted into `WifiError`.
-        let mut stream = self
-            .core
-            .handle
-            .scan()
-            .schedule_start(attrs)
-            .execute()
-            .await;
-        let result = loop {
-            match stream.try_next().await {
-                Ok(Some(_)) => {}
-                Ok(None) => break Ok(()),
-                Err(e) => break Err(e),
-            }
-        };
+        let result = self.core.nl.start_sched_scan(attrs).await;
         match result {
             Ok(()) => {
                 self.scan.sched_scan_active = true;
@@ -817,16 +807,7 @@ impl WifiIface {
         }
         self.scan.sched_scan_active = false;
         self.scan.sched_scan_stop_pending = true;
-        match drain_request(
-            self.core
-                .handle
-                .scan()
-                .schedule_stop_all(self.core.if_index)
-                .execute()
-                .await,
-        )
-        .await
-        {
+        match self.core.nl.stop_sched_scan().await {
             Ok(()) => {
                 log::info!("scheduled scan stopped");
                 Ok(())
@@ -934,12 +915,7 @@ impl WifiIface {
             if self.wowlan.armed {
                 self.disarm_wowlan().await?;
             }
-            if let Err(e) = connect::disconnect(
-                &mut self.core.conn_handle,
-                self.core.if_index,
-            )
-            .await
-            {
+            if let Err(e) = self.core.nl.disconnect().await {
                 log::debug!("disconnect on network update: {e}");
             }
         } else {
@@ -993,14 +969,10 @@ impl WifiIface {
             log::debug!("WoWLAN unsupported; not arming triggers");
             return Ok(false);
         }
-        let attrs = Nl80211Wowlan::new(self.core.if_index)
+        let attrs = Nl80211Wowlan::new(self.core.nl.if_index)
             .triggers(triggers)
             .build();
-        match drain_request(
-            self.core.conn_handle.set_wowlan(attrs).execute().await,
-        )
-        .await
-        {
+        match self.core.nl.set_wowlan(attrs).await {
             Ok(()) => {
                 self.wowlan.armed = true;
                 log::info!(
@@ -1022,14 +994,10 @@ impl WifiIface {
         if !self.wowlan.armed {
             return Ok(());
         }
-        let attrs = Nl80211Wowlan::new(self.core.if_index)
+        let attrs = Nl80211Wowlan::new(self.core.nl.if_index)
             .triggers(Vec::new())
             .build();
-        match drain_request(
-            self.core.conn_handle.set_wowlan(attrs).execute().await,
-        )
-        .await
-        {
+        match self.core.nl.set_wowlan(attrs).await {
             Ok(()) => {
                 self.wowlan.armed = false;
                 log::info!("WoWLAN triggers cleared");
@@ -1053,10 +1021,7 @@ impl WifiIface {
         {
             log::debug!("disarm WoWLAN on shutdown failed: {e}");
         }
-        if let Err(e) =
-            connect::disconnect(&mut self.core.conn_handle, self.core.if_index)
-                .await
-        {
+        if let Err(e) = self.core.nl.disconnect().await {
             log::debug!("disconnect on shutdown: {e}");
         }
     }
@@ -1064,9 +1029,9 @@ impl WifiIface {
 
 impl Drop for WifiIface {
     fn drop(&mut self) {
-        let mut conn_handle = self.core.conn_handle.clone();
-        let handle = self.core.handle.clone();
-        let if_index = self.core.if_index;
+        let mut conn_handle = self.core.nl.conn_handle.clone();
+        let handle = self.core.nl.handle.clone();
+        let if_index = self.core.nl.if_index;
         let sched_scan_active = self.scan.sched_scan_active;
         let wowlan_armed = self.wowlan.armed;
         // Best-effort: run the cleanup on a dedicated thread with its own
@@ -1104,8 +1069,15 @@ impl Drop for WifiIface {
                         )
                         .await;
                     }
-                    let _ =
-                        connect::disconnect(&mut conn_handle, if_index).await;
+                    let _ = drain_request(
+                        conn_handle
+                            .disconnect(
+                                Nl80211Disconnect::new(if_index).build(),
+                            )
+                            .execute()
+                            .await,
+                    )
+                    .await;
                 });
             }
         });
@@ -1207,18 +1179,4 @@ pub(crate) fn fmt_transition_disable(bitmap: u8) -> String {
     } else {
         flags.join(", ")
     }
-}
-
-pub(crate) async fn send_ctrl_port_frame(
-    conn_handle: &mut Nl80211ConnectionHandle,
-    if_index: u32,
-    bssid: [u8; 6],
-    frame: &[u8],
-) -> Result<(), WifiError> {
-    let attrs = Nl80211ControlPortFrame::new(if_index)
-        .mac(bssid)
-        .frame(frame.to_vec())
-        .control_port_ethertype(netlink_packet_core::EthernetProtocol::Pae)
-        .build();
-    drain_request(conn_handle.control_port_frame(attrs).execute().await).await
 }

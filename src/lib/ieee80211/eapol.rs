@@ -72,6 +72,7 @@ pub fn parse_eapol_eap_frame(pdu: &[u8]) -> Option<&[u8]> {
 
 /// EAPOL-Key frame parsed fields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EapolKeyFrame {
     pub key_info: u16,
     pub replay_counter: u64,

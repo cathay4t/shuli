@@ -32,6 +32,7 @@ pub const BTM_STATUS_REJECT_UNSPECIFIED: u8 = 1;
 /// One BSS Transition Management candidate: the fields of its Neighbor
 /// Report element body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BtmCandidate {
     pub bssid: [u8; ETH_ALEN],
     pub bssid_info: u32,
@@ -45,6 +46,7 @@ pub struct BtmCandidate {
 
 /// A parsed BSS Transition Management Request.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BtmRequest {
     pub dialog_token: u8,
     pub preferred_candidates: bool,

@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use wl_nl80211::Nl80211WowlanTriggersSupport;
+
+use super::{
+    AuthMethod, EapPeer, FourWayState, Nl80211EventReceiver, OweAuth,
+    PmksaCache, PmksaEntry, SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_WATCHDOG_SECS,
+};
+use crate::{
+    BssInfo, ETH_ALEN, NetworkConfig, ShuliNl80211Connection, WifiConfig,
+    WifiError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum WifiState {
     /// Initial state; the next `process()` call triggers a scan.
     #[default]
@@ -28,11 +38,8 @@ pub enum WifiState {
 }
 
 pub(crate) struct IfaceCore {
-    pub(crate) handle: Nl80211Handle,
-    pub(crate) conn_handle: Nl80211ConnectionHandle,
+    pub(crate) nl: ShuliNl80211Connection,
     pub(crate) event_receiver: Nl80211EventReceiver,
-    pub(crate) if_index: u32,
-    pub(crate) mac: [u8; ETH_ALEN],
     pub(crate) config: WifiConfig,
 }
 
@@ -284,7 +291,7 @@ pub(crate) struct WifiIface {
     /// skip the full authentication.
     pub(crate) pmksa_cache: PmksaCache,
     /// The most recent connection/auth error attached to a state
-    /// change, surfaced once to the caller by `run_multi()` (e.g. a
+    /// change, surfaced once to the caller by `run()` (e.g. a
     /// wrong-password rejection). Cleared when reported.
     pub(crate) last_error: Option<WifiError>,
 }

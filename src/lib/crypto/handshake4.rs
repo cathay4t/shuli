@@ -35,6 +35,7 @@ pub(crate) enum MicAlg {
 
 /// 4-Way Handshake state (supplicant side).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FourWayState {
     pmk: [u8; 32],
     mac_sta: [u8; 6],

@@ -372,16 +372,13 @@ impl WifiIface {
                 self.link.bss_info.security
             );
             let attrs =
-                wl_nl80211::Nl80211Authenticate::new(self.core.if_index)
+                wl_nl80211::Nl80211Authenticate::new(self.core.nl.if_index)
                     .ssid(&self.link.network.ssid)
                     .mac(self.link.bss_info.bssid)
                     .frequency(self.link.bss_info.freq_mhz)
                     .auth_type(wl_nl80211::Nl80211AuthType::OpenSystem)
                     .build();
-            return crate::client::drain_request(
-                self.core.conn_handle.authenticate(attrs).execute().await,
-            )
-            .await;
+            return self.core.nl.authenticate(attrs).await;
         }
 
         let password =
@@ -404,7 +401,7 @@ impl WifiIface {
         self.auth.method = Some(AuthMethod::new_sae(
             password,
             &self.link.network.ssid,
-            self.core.mac,
+            self.core.nl.mac,
             self.link.bss_info.bssid,
             self.link.network.sae_pwe.starts_h2e(ap_supports_h2e)
                 || self.link.network.sae_password_id.is_some(),
@@ -414,7 +411,7 @@ impl WifiIface {
         )?);
 
         let auth_data = self.auth.method.as_mut().unwrap().initial_frame()?;
-        let attrs = wl_nl80211::Nl80211Authenticate::new(self.core.if_index)
+        let attrs = wl_nl80211::Nl80211Authenticate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(self.link.bss_info.bssid)
             .frequency(self.link.bss_info.freq_mhz)
@@ -422,10 +419,7 @@ impl WifiIface {
             // NL80211_ATTR_AUTH_DATA: SAE commit (trans||status||body)
             .auth_data(auth_data.clone())
             .build();
-        crate::client::drain_request(
-            self.core.conn_handle.authenticate(attrs).execute().await,
-        )
-        .await?;
+        self.core.nl.authenticate(attrs).await?;
         // remember the commit so a lost frame is answered with a
         // retransmission (SAE Sync) instead of a full rescan cycle.
         self.auth.sae_commit_sent = true;

@@ -9,11 +9,11 @@ use futures::StreamExt;
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, WifiClient, WifiError, WifiIface,
-    client::{get_if_index_and_mac, wiphy_max_scan_ssids},
-    nl80211::scan::{
+    ETH_ALEN, ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiClient,
+    WifiError, WifiIface,
+    nl80211::{
         extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
-        extract_ssid_from_ies, get_scan_results, trigger_scan,
+        extract_ssid_from_ies,
     },
 };
 
@@ -31,6 +31,7 @@ const SCAN_COMPLETE_TIMEOUT_SECS: u64 = 15;
 
 /// Security type detected from the BSS's RSNE in scan results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SecurityType {
     /// No RSNE — open / no encryption.
     #[default]
@@ -89,6 +90,7 @@ impl SecurityType {
 
 /// Mobility Domain element contents (802.11-2020 §9.4.2.47).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MdieInfo {
     pub mdid: [u8; 2],
     pub ft_capab: u8,
@@ -96,6 +98,7 @@ pub struct MdieInfo {
 
 /// The best BSS candidate for the configured SSID.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BssInfo {
     pub bssid: [u8; ETH_ALEN],
     pub freq_mhz: u32,
@@ -293,13 +296,10 @@ impl WifiIface {
             }
             (Some(_), false) => unreachable!("non-roam scans never restrict"),
         }
-        trigger_scan(
-            &self.core.handle,
-            self.core.if_index,
-            Some(&ssids),
-            freqs.as_deref(),
-        )
-        .await
+        self.core
+            .nl
+            .trigger_scan(Some(&ssids), freqs.as_deref())
+            .await
     }
 
     // Wait for the kernel's `NL80211_CMD_NEW_SCAN_RESULTS` multicast event
@@ -544,8 +544,7 @@ impl WifiIface {
     /// Dump the scan results and record every BSS whose SSID matches a
     /// configured network in `last_scan_candidates`.
     async fn collect_scan_candidates(&mut self) -> Result<(), WifiError> {
-        let bss_list =
-            get_scan_results(&self.core.handle, self.core.if_index).await?;
+        let bss_list = self.core.nl.get_scan_results().await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
         let mut candidates: Vec<(BssInfo, NetworkConfig)> = Vec::new();
@@ -838,31 +837,23 @@ impl WifiClient {
         iface_name: &str,
         hidden_ssids: Vec<String>,
     ) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
-        let (conn, handle, _) = wl_nl80211::new_connection()
-            .map_err(|e| WifiError::new(ErrorKind::Nl80211, e.to_string()))?;
-        tokio::spawn(conn);
+        let mut nl_conn = ShuliNl80211Connection::new(iface_name).await?;
 
-        let (if_index, _, wiphy_idx) =
-            get_if_index_and_mac(&handle, iface_name).await?;
-        let max_ssids =
-            wiphy_max_scan_ssids(&handle, wiphy_idx).await? as usize;
+        let max_ssids = nl_conn
+            .wiphy_max_scan_count
+            .clamp(1, MAX_SCAN_SSIDS as u8) as usize;
 
-        if max_ssids.clamp(1, MAX_SCAN_SSIDS) == 1 {
+        if max_ssids == 1 {
             // One-SSID drivers cannot carry wildcard and specific SSIDs in
             // the same request: probe the wildcard once for visible networks,
             // then each hidden SSID by itself.
-            trigger_scan(&handle, if_index, Some(&[String::new()]), None)
-                .await?;
+            nl_conn.trigger_scan(Some(&[String::new()]), None).await?;
             tokio::time::sleep(std::time::Duration::from_secs(SCAN_SLEEP_SECS))
                 .await;
             for hidden in &hidden_ssids {
-                trigger_scan(
-                    &handle,
-                    if_index,
-                    Some(std::slice::from_ref(hidden)),
-                    None,
-                )
-                .await?;
+                nl_conn
+                    .trigger_scan(Some(std::slice::from_ref(hidden)), None)
+                    .await?;
                 tokio::time::sleep(std::time::Duration::from_secs(
                     SCAN_SLEEP_SECS,
                 ))
@@ -883,7 +874,7 @@ impl WifiClient {
                     &mut wildcard_next,
                     max_ssids,
                 );
-                trigger_scan(&handle, if_index, Some(&ssids), None).await?;
+                nl_conn.trigger_scan(Some(&ssids), None).await?;
                 tokio::time::sleep(std::time::Duration::from_secs(
                     SCAN_SLEEP_SECS,
                 ))
@@ -898,7 +889,7 @@ impl WifiClient {
             }
         }
 
-        let bss_list = get_scan_results(&handle, if_index).await?;
+        let bss_list = nl_conn.get_scan_results().await?;
         let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
         for bss in &bss_list {
             let Some(bssid) = extract_bssid(bss) else {

@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use std::collections::HashMap;
 
-pub struct WifiRunResult {
+use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
+use netlink_packet_core::NetlinkPayload;
+use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use wl_nl80211::{Nl80211Attr, Nl80211Message, Nl80211MulticastGroup};
+
+use super::{Nl80211EventMsg, Nl80211EventSender, WifiIface};
+use crate::{
+    ETH_ALEN, ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiConfig,
+    WifiError, WifiState,
+};
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct WifiIfaceState {
     pub iface_name: String,
     pub state: WifiState,
-    pub error: Option<WifiError>,
 }
 
 /// A single WiFi client managing one or more wifi-phy interfaces.
@@ -14,17 +26,13 @@ pub struct WifiRunResult {
 /// subscription. The event dispatcher routes each kernel event to the
 /// interface it belongs to, so concurrent interfaces do not see each
 /// other's scan/auth/disconnect/CQM events.
+#[non_exhaustive]
 pub struct WifiClient {
-    ifaces: HashMap<String, WifiIface>,
+    pub(crate) ifaces: HashMap<String, WifiIface>,
     dispatcher_shutdown_tx: UnboundedSender<()>,
 }
 
 impl WifiClient {
-    /// Create a client managing the single wifi-phy in `config`.
-    pub async fn init(config: WifiConfig) -> Result<Self, WifiError> {
-        Self::init_multi(vec![config]).await
-    }
-
     /// Create one client managing every wifi-phy in `configs`.
     ///
     /// All interfaces share one nl80211 socket and one multicast event
@@ -65,11 +73,13 @@ impl WifiClient {
             HashMap::new();
         for config in configs {
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
-            let conn_handle = handle.connection();
-            let iface =
-                WifiIface::init(handle.clone(), conn_handle, event_rx, config)
-                    .await?;
-            iface_tx_by_if_index.insert(iface.core.if_index, event_tx);
+            let nl = ShuliNl80211Connection::from_handle(
+                handle.clone(),
+                &config.iface_name,
+            )
+            .await?;
+            let iface = WifiIface::init(nl, event_rx, config).await?;
+            iface_tx_by_if_index.insert(iface.core.nl.if_index, event_tx);
             ifaces.insert(iface.core.config.iface_name.clone(), iface);
         }
 
@@ -88,117 +98,57 @@ impl WifiClient {
     }
 
     /// Drive every managed interface until one of them reports a state
-    /// change, then return that change.
-    pub async fn run_multi(&mut self) -> Result<WifiRunResult, WifiError> {
+    /// change or an interface error, then return that result.
+    pub async fn run(&mut self) -> Result<WifiIfaceState, WifiError> {
         if self.ifaces.is_empty() {
             return Err(WifiError::new(
                 ErrorKind::Config,
                 "WifiClient has no interfaces",
             ));
         }
-        let mut futures: Vec<
-            std::pin::Pin<
-                Box<dyn futures::Future<Output = WifiRunResult> + Send + '_>,
+        type IfaceRunFuture<'a> = std::pin::Pin<
+            Box<
+                dyn futures::Future<Output = Result<WifiIfaceState, WifiError>>
+                    + Send
+                    + 'a,
             >,
-        > = Vec::new();
+        >;
+        let mut futures: Vec<IfaceRunFuture<'_>> = Vec::new();
         for (iface_name, iface) in &mut self.ifaces {
             let iface_name = iface_name.clone();
             futures.push(Box::pin(async move {
-                let (state, error) = match iface.run().await {
-                    Ok(state) => (state, iface.last_error.take()),
+                match iface.run().await {
+                    Ok(state) => {
+                        if let Some(e) = iface.last_error.take() {
+                            return Err(e.with_iface_name(iface_name));
+                        }
+                        Ok(WifiIfaceState { iface_name, state })
+                    }
                     Err(e) => {
                         iface.last_error = None;
-                        (iface.state, Some(e))
+                        Err(e.with_iface_name(iface_name))
                     }
-                };
-                WifiRunResult {
-                    iface_name,
-                    state,
-                    error,
                 }
             }));
         }
         let (result, _index, _remaining) =
             futures::future::select_all(futures).await;
-        Ok(result)
+        result
     }
 
-    /// Convenience for a single-interface client: see
-    /// [`WifiClient::run_multi`] when managing more than one interface.
-    ///
-    /// Authentication failures such as a wrong password are returned as
-    /// `Err(WifiError)` with `ErrorKind::WrongPassword`; the client
-    /// still retries on the next call.
-    pub async fn run(&mut self) -> Result<WifiState, WifiError> {
-        if self.ifaces.len() != 1 {
-            return Err(WifiError::new(
-                ErrorKind::Config,
-                "WifiClient::run() requires exactly one interface; use \
-                 run_multi() for multiple interfaces",
-            ));
-        }
-        let result = self.run_multi().await?;
-        match result.error {
-            Some(e) => Err(e),
-            None => Ok(result.state),
-        }
-    }
-
-    pub fn current_ssid(&self) -> &str {
-        self.ifaces
-            .values()
-            .next()
-            .map(|iface| iface.current_ssid())
-            .unwrap_or("")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn iface(&self) -> Option<&WifiIface> {
-        self.ifaces.values().next()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn iface_mut(&mut self) -> Option<&mut WifiIface> {
-        self.ifaces.values_mut().next()
-    }
-
-    pub fn current_ssid_of(&self, iface_name: &str) -> Option<&str> {
+    pub fn current_ssid(&self, iface_name: &str) -> Option<&str> {
         self.ifaces
             .get(iface_name)
             .map(|iface| iface.current_ssid())
     }
 
-    pub fn current_bssid(&self) -> [u8; ETH_ALEN] {
-        self.ifaces
-            .values()
-            .next()
-            .map(|iface| iface.current_bssid())
-            .unwrap_or([0; ETH_ALEN])
-    }
-
-    pub fn current_bssid_of(&self, iface_name: &str) -> Option<[u8; ETH_ALEN]> {
+    pub fn current_bssid(&self, iface_name: &str) -> Option<[u8; ETH_ALEN]> {
         self.ifaces
             .get(iface_name)
             .map(|iface| iface.current_bssid())
     }
 
-    /// Convenience for a single-interface client.
     pub async fn update_networks(
-        &mut self,
-        networks: Vec<NetworkConfig>,
-    ) -> Result<(), WifiError> {
-        if self.ifaces.len() != 1 {
-            return Err(WifiError::new(
-                ErrorKind::Config,
-                "WifiClient::update_networks() requires exactly one \
-                 interface; use update_networks_of() for multiple",
-            ));
-        }
-        let iface = self.ifaces.values_mut().next().expect("len checked");
-        iface.update_networks(networks).await
-    }
-
-    pub async fn update_networks_of(
         &mut self,
         iface_name: &str,
         networks: Vec<NetworkConfig>,
@@ -212,35 +162,14 @@ impl WifiClient {
         iface.update_networks(networks).await
     }
 
-    pub fn wowlan_supported(&self) -> bool {
-        self.ifaces
-            .values()
-            .next()
-            .map(WifiIface::wowlan_supported)
-            .unwrap_or(false)
-    }
-
-    pub fn wowlan_supported_of(&self, iface_name: &str) -> bool {
+    pub fn wowlan_supported(&self, iface_name: &str) -> bool {
         self.ifaces
             .get(iface_name)
             .map(WifiIface::wowlan_supported)
             .unwrap_or(false)
     }
 
-    /// Convenience for a single-interface client.
-    pub async fn arm_wowlan(&mut self) -> Result<bool, WifiError> {
-        if self.ifaces.len() != 1 {
-            return Err(WifiError::new(
-                ErrorKind::Config,
-                "WifiClient::arm_wowlan() requires exactly one interface; use \
-                 arm_wowlan_of() for multiple",
-            ));
-        }
-        let iface = self.ifaces.values_mut().next().expect("len checked");
-        iface.arm_wowlan().await
-    }
-
-    pub async fn arm_wowlan_of(
+    pub async fn arm_wowlan(
         &mut self,
         iface_name: &str,
     ) -> Result<bool, WifiError> {
@@ -251,19 +180,6 @@ impl WifiClient {
             )
         })?;
         iface.arm_wowlan().await
-    }
-
-    /// Convenience for a single-interface client.
-    pub async fn disarm_wowlan(&mut self) -> Result<(), WifiError> {
-        if self.ifaces.len() != 1 {
-            return Err(WifiError::new(
-                ErrorKind::Config,
-                "WifiClient::disarm_wowlan() requires exactly one interface; \
-                 use disarm_wowlan_of() for multiple",
-            ));
-        }
-        let iface = self.ifaces.values_mut().next().expect("len checked");
-        iface.disarm_wowlan().await
     }
 
     pub async fn disarm_wowlan_of(
@@ -296,7 +212,7 @@ impl Drop for WifiClient {
 }
 
 fn run_event_dispatcher(
-    mut event_receiver: futures::channel::mpsc::UnboundedReceiver<(
+    mut event_receiver: UnboundedReceiver<(
         Nl80211EventMsg,
         netlink_sys::SocketAddr,
     )>,

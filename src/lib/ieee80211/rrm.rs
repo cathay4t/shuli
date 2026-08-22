@@ -25,6 +25,7 @@ const IE_ID_NEIGHBOR_REPORT: u8 = 52;
 /// subelements. This is the format hostapd and iwd use (the minimum
 /// element payload is 13 octets).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NeighborReportEntry {
     pub bssid: [u8; ETH_ALEN],
     pub bssid_info: u32,
@@ -35,6 +36,7 @@ pub struct NeighborReportEntry {
 
 /// A parsed Neighbor Report Response.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NeighborReportResponse {
     pub dialog_token: u8,
     pub entries: Vec<NeighborReportEntry>,
