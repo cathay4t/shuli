@@ -262,6 +262,20 @@ impl FourWayState {
         self.replay_counter.to_be_bytes()
     }
 
+    /// Overwrite the EAPOL replay counter with the value reported by the
+    /// driver after it completed a GTK rekey while the host was suspended
+    /// (`NL80211_CMD_SET_REKEY_OFFLOAD` MLME event).
+    pub(crate) fn update_replay_counter(&mut self, replay_ctr: [u8; 8]) {
+        self.replay_counter = u64::from_be_bytes(replay_ctr);
+    }
+
+    /// Install a pre-computed PTK. Used after an FT roam, where the PTK
+    /// comes from the FT protocol instead of a 4-way Message 1/3 exchange;
+    /// the group key handshake still needs the KCK/KEK from it.
+    pub(crate) fn set_ptk(&mut self, ptk: [u8; PTK_LEN]) {
+        self.ptk = Some(ptk);
+    }
+
     pub fn tk(&self) -> Option<[u8; TK_LEN]> {
         self.ptk.map(|p| {
             let mut k = [0u8; TK_LEN];

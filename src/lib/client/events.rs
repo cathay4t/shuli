@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use wl_nl80211::{
-    Nl80211AuthType, Nl80211Command, Nl80211UseMfp, Nl80211WowlanWakeup,
+    Ieee80211AkmSuite, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
+    Nl80211WowlanWakeup,
 };
 
 use super::{
@@ -13,9 +14,44 @@ use super::{
     fmt_transition_disable, is_fatal_disconnect_reason, owe,
     wowlan_wakeup_requires_reconnect,
 };
-use crate::crypto::handshake4::FourWayState;
+use crate::{crypto::handshake4::FourWayState, nl80211::ClientEvent};
 
 impl WifiIface {
+    pub(crate) async fn handle_client_event(&mut self, event: ClientEvent) {
+        match event {
+            ClientEvent::Nl80211(event) => self.handle_event(event).await,
+            ClientEvent::RekeyOffload { bssid, replay_ctr } => {
+                self.handle_rekey_offload_event(bssid, replay_ctr).await
+            }
+        }
+    }
+
+    /// The driver completed a GTK rekey (typically while the host was
+    /// suspended) and reports the replay counter it used. Keep the
+    /// userspace 4-way state in sync so the next rekey is not rejected as
+    /// a replay.
+    pub(crate) async fn handle_rekey_offload_event(
+        &mut self,
+        bssid: [u8; crate::ETH_ALEN],
+        replay_ctr: [u8; 8],
+    ) {
+        if bssid != self.link.bss_info.bssid {
+            log::debug!(
+                "rekey offload event for BSSID {:02x?} != connected {:02x?}; \
+                 ignored",
+                bssid,
+                self.link.bss_info.bssid
+            );
+            return;
+        }
+        let Some(fw) = self.link.fourway.as_mut() else {
+            log::debug!("rekey offload event without 4-way state; ignored");
+            return;
+        };
+        fw.update_replay_counter(replay_ctr);
+        log::info!("driver GTK rekey: replay counter updated");
+    }
+
     pub(crate) async fn handle_event(&mut self, event: Nl80211Event) {
         match event {
             Nl80211Event::Frame { frame } => {
@@ -850,6 +886,35 @@ impl WifiIface {
         self.send_sae_commit(&auth_data).await;
     }
 
+    /// Hand the current KEK/KCK/replay counter to the driver/firmware via
+    /// `NL80211_CMD_SET_REKEY_OFFLOAD`. Returns `true` when the driver
+    /// accepted the offload, `false` when it is unsupported (e.g.
+    /// mac80211_hwsim) or no 4-way state exists yet.
+    pub(crate) async fn try_offload_rekey(&mut self) -> bool {
+        let Some(fw) = self.link.fourway.as_ref() else {
+            return false;
+        };
+        let (Some(kck), Some(kek)) = (fw.kck(), fw.kek()) else {
+            return false;
+        };
+        let attrs = Nl80211RekeyOffload::new(self.core.nl.if_index)
+            .kek(kek.to_vec())
+            .kck(kck.to_vec())
+            .replay_ctr(fw.replay_counter_bytes())
+            .akm(rekey_akm(self.link.bss_info.security))
+            .build();
+        match self.core.nl.set_rekey_offload(attrs).await {
+            Ok(()) => {
+                log::info!("GTK rekey offloaded to driver");
+                true
+            }
+            Err(e) => {
+                log::debug!("rekey offload not available: {e}");
+                false
+            }
+        }
+    }
+
     /// Handle an EAPOL-Key frame (4-way handshake / group rekey).
     pub(crate) async fn handle_control_port_frame(&mut self, frame: &[u8]) {
         // 802.1X EAP frames (EAPOL type 0) arrive on the
@@ -1336,30 +1401,7 @@ impl WifiIface {
             // Try to offload GTK rekey to the driver/firmware.
             // Falls back to userspace rekey when unsupported
             // (e.g. mac80211_hwsim returns -EOPNOTSUPP).
-            let offloaded = if let (Some(kck), Some(kek), Some(fw)) = (
-                self.link.fourway.as_ref().and_then(|f| f.kck()),
-                self.link.fourway.as_ref().and_then(|f| f.kek()),
-                &self.link.fourway,
-            ) {
-                let rc = fw.replay_counter_bytes();
-                let attrs = Nl80211RekeyOffload::new(self.core.nl.if_index)
-                    .kek(kek.to_vec())
-                    .kck(kck.to_vec())
-                    .replay_ctr(rc)
-                    .build();
-                match self.core.nl.set_rekey_offload(attrs).await {
-                    Ok(()) => {
-                        log::info!("GTK rekey offloaded to driver");
-                        true
-                    }
-                    Err(e) => {
-                        log::debug!("rekey offload not available: {e}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
+            let offloaded = self.try_offload_rekey().await;
 
             if offloaded {
                 log::info!("keys installed - connection established");
@@ -1439,6 +1481,12 @@ impl WifiIface {
                     log::info!("GTK[{gtk_idx}] rekeyed");
                 }
             }
+
+            // The replay counter advanced with this rekey; hand the new
+            // counter back to the driver so a later suspend starts from
+            // the current value (wpa_supplicant refreshes offload after
+            // every group rekey too).
+            self.try_offload_rekey().await;
         } else {
             log::debug!("unhandled EAPOL-Key frame type");
         }
@@ -1530,5 +1578,62 @@ impl WifiIface {
             return false;
         }
         true
+    }
+}
+
+/// The AKM suite used for the current security type, reported with
+/// `NL80211_CMD_SET_REKEY_OFFLOAD`. The driver/firmware uses it to select
+/// the correct group-key-handshake MIC algorithm while the host is
+/// suspended.
+fn rekey_akm(security: SecurityType) -> Ieee80211AkmSuite {
+    match security {
+        SecurityType::Wpa2Psk => Ieee80211AkmSuite::Psk,
+        SecurityType::Wpa2PskSha256 => Ieee80211AkmSuite::PskSha256,
+        SecurityType::Wpa2Ent => Ieee80211AkmSuite::Ieee8021x,
+        SecurityType::Wpa2EntSha256 => Ieee80211AkmSuite::Ieee8021xSha256,
+        SecurityType::Owe => Ieee80211AkmSuite::Owe,
+        SecurityType::Sae => Ieee80211AkmSuite::Sae,
+        SecurityType::SaeExtKey => Ieee80211AkmSuite::SaeGroupDependentHash,
+        SecurityType::FtPsk => Ieee80211AkmSuite::FtPsk,
+        SecurityType::FtSae => Ieee80211AkmSuite::FtSae,
+        SecurityType::FtSaeExtKey => Ieee80211AkmSuite::FtSaeGroupDependentHash,
+        // Never reached: open/unsupported BSSes have no 4-way handshake.
+        SecurityType::Open | SecurityType::Unsupported => {
+            Ieee80211AkmSuite::Sae
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rekey_offload_akm_matches_security() {
+        assert_eq!(rekey_akm(SecurityType::Wpa2Psk), Ieee80211AkmSuite::Psk);
+        assert_eq!(
+            rekey_akm(SecurityType::Wpa2PskSha256),
+            Ieee80211AkmSuite::PskSha256
+        );
+        assert_eq!(
+            rekey_akm(SecurityType::Wpa2Ent),
+            Ieee80211AkmSuite::Ieee8021x
+        );
+        assert_eq!(
+            rekey_akm(SecurityType::Wpa2EntSha256),
+            Ieee80211AkmSuite::Ieee8021xSha256
+        );
+        assert_eq!(rekey_akm(SecurityType::Owe), Ieee80211AkmSuite::Owe);
+        assert_eq!(rekey_akm(SecurityType::Sae), Ieee80211AkmSuite::Sae);
+        assert_eq!(
+            rekey_akm(SecurityType::SaeExtKey),
+            Ieee80211AkmSuite::SaeGroupDependentHash
+        );
+        assert_eq!(rekey_akm(SecurityType::FtPsk), Ieee80211AkmSuite::FtPsk);
+        assert_eq!(rekey_akm(SecurityType::FtSae), Ieee80211AkmSuite::FtSae);
+        assert_eq!(
+            rekey_akm(SecurityType::FtSaeExtKey),
+            Ieee80211AkmSuite::FtSaeGroupDependentHash
+        );
     }
 }

@@ -23,6 +23,11 @@
    `ErrorKind::WrongPassword` on `WifiClient::run()` /
    `WifiRunResult::error` instead of only entering the generic
    `FailedAuthentication` retry state.
+ - `SET_REKEY_OFFLOAD` now carries the negotiated AKM instead of always
+   reporting SAE.
+ - Refresh driver rekey offload after userspace group rekeys and after
+   FT roam, and apply the replay counter reported by the driver after a
+   firmware GTK rekey.
 
 ## [0.2.0] - 2026-08-16
 ### Breaking changes

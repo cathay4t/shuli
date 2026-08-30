@@ -26,8 +26,12 @@ use wl_nl80211::{
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface, WifiState,
     config::SaePwe,
-    crypto::ft::{
-        FT_PTK_LEN, PmkR0, PmkR1, derive_ft_ptk, derive_pmk_r0, derive_pmk_r1,
+    crypto::{
+        ft::{
+            FT_PTK_LEN, PmkR0, PmkR1, derive_ft_ptk, derive_pmk_r0,
+            derive_pmk_r1,
+        },
+        handshake4::FourWayState,
     },
     ieee80211::{
         elements,
@@ -41,6 +45,7 @@ use crate::{
             build_btm_response, parse_btm_request,
         },
     },
+    nl80211::{ClientEvent, parse_client_event},
     scan::{BssInfo, SecurityType},
 };
 
@@ -735,15 +740,27 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
-                    if let Some(wl_nl80211::Nl80211Event::Frame { frame }) =
-                        wl_nl80211::Nl80211Event::parse(raw_msg)
-                        && frame.len() > 25
-                        && frame[24] == RRM_ACTION_CATEGORY
-                        && frame[25] == NEIGHBOR_REPORT_RESPONSE_ACTION
-                    {
-                        self.handle_rrm_frame(&frame).await;
-                        if self.roam.pending_nr_dialog.is_none() {
-                            return;
+                    if let Some(event) = parse_client_event(raw_msg) {
+                        match event {
+                            ClientEvent::Nl80211(
+                                wl_nl80211::Nl80211Event::Frame { frame },
+                            ) if frame.len() > 25
+                                && frame[24] == RRM_ACTION_CATEGORY
+                                && frame[25]
+                                    == NEIGHBOR_REPORT_RESPONSE_ACTION =>
+                            {
+                                self.handle_rrm_frame(&frame).await;
+                                if self.roam.pending_nr_dialog.is_none() {
+                                    return;
+                                }
+                            }
+                            ClientEvent::Nl80211(_) => {}
+                            ClientEvent::RekeyOffload { bssid, replay_ctr } => {
+                                self.handle_rekey_offload_event(
+                                    bssid, replay_ctr,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1469,6 +1486,48 @@ impl WifiIface {
         if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_FTIE) {
             assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
         }
+        self.link.bss_info = target.clone();
+
+        // Rebuild the 4-way state for the target BSS: FT roams skip the
+        // 4-way handshake, but group rekeys still need the new PTK's
+        // KCK/KEK and a replay counter (wpa_supplicant clears its replay
+        // counter on every association, including FT reassociation).
+        let mut rsne = match target.security {
+            SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                Some(pmk_r1.name),
+                target.group_mgmt_cipher,
+            ),
+            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_ie_cipher(
+                Some(pmk_r1.name),
+                target.group_mgmt_cipher,
+            ),
+            _ => elements::ft_psk_ie_cipher(
+                Some(pmk_r1.name),
+                target.group_mgmt_cipher,
+            ),
+        };
+        rsne.extend_from_slice(&assoc_resp_ft_ies);
+        if self.link.network.ocv {
+            elements::rsne_set_ocvc(&mut rsne, true);
+        }
+        if self.link.network.ext_key_id {
+            elements::rsne_set_ext_key_id(&mut rsne, true);
+        }
+        let mut fw = FourWayState::new_ft(
+            pmk_r1.clone(),
+            self.core.nl.mac,
+            target.bssid,
+            rsne,
+            target.ap_rsne.clone(),
+            target.ap_rsnxe.clone(),
+        );
+        if !self.enable_ocv(&mut fw) {
+            log::warn!("FT roam: could not enable OCV on the rekey state");
+        }
+        fw.set_ext_key_id(self.ext_key_id_enabled());
+        fw.set_ptk(ptk);
+        self.link.fourway = Some(fw);
+
         self.link.ft = Some(FtContext {
             mdid: ft_mdid,
             ft_capab,
@@ -1477,14 +1536,17 @@ impl WifiIface {
             pmk_r1,
             assoc_resp_ft_ies,
         });
-        self.link.bss_info = target.clone();
         self.roam.ft_roam = None;
         self.roam.last_roam = Some(std::time::Instant::now());
         self.roam.roam_scan_full = false;
-        self.link.fourway = None;
         self.auth.method = None;
         self.scan.scan_retry_interval = crate::client::RETRY_BACKOFF_INIT_SEC;
-        self.state = WifiState::ConnectedWithoutOffloadRekey;
+        let offloaded = self.try_offload_rekey().await;
+        self.state = if offloaded {
+            WifiState::ConnectedWithOffloadRekey
+        } else {
+            WifiState::ConnectedWithoutOffloadRekey
+        };
         log::info!(
             "FT roam complete: connected to {:02x?} (freq {} MHz)",
             target.bssid,

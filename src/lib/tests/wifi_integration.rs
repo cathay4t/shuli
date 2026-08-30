@@ -684,9 +684,8 @@ async fn wifi_client_scan_free_reconnect_using_exported_hints() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init(vec![config.clone()])
-        .await
-        .expect("init");
+    let mut client =
+        WifiClient::init(vec![config.clone()]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,

@@ -13,8 +13,8 @@ use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiClient,
     WifiError, WifiIface,
     nl80211::{
-        extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
-        extract_ssid_from_ies,
+        ClientEvent, extract_bssid, extract_freq, extract_ies,
+        extract_signal_dbm, extract_ssid_from_ies, parse_client_event,
     },
 };
 
@@ -369,11 +369,11 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
-                    if let Some(event) =
-                        wl_nl80211::Nl80211Event::parse(raw_msg)
-                    {
+                    if let Some(event) = parse_client_event(raw_msg) {
                         match event {
-                            Nl80211Event::NewScanResults => {
+                            ClientEvent::Nl80211(
+                                Nl80211Event::NewScanResults,
+                            ) => {
                                 if self.roam.roam_scan {
                                     log::trace!("scan finished");
                                 } else {
@@ -381,9 +381,7 @@ impl WifiIface {
                                 }
                                 return;
                             }
-                            other => {
-                                self.handle_event(other).await;
-                            }
+                            other => self.handle_client_event(other).await,
                         }
                     }
                 }

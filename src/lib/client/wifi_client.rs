@@ -37,9 +37,7 @@ impl WifiClient {
     ///
     /// All interfaces share one nl80211 socket and one multicast event
     /// subscription. Run one `WifiClient` per network namespace.
-    pub async fn init(
-        configs: Vec<WifiConfig>,
-    ) -> Result<Self, WifiError> {
+    pub async fn init(configs: Vec<WifiConfig>) -> Result<Self, WifiError> {
         if configs.is_empty() {
             return Err(WifiError::new(
                 ErrorKind::InvalidConfig,

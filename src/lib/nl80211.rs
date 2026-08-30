@@ -1,15 +1,142 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use futures::{TryStream, TryStreamExt};
-use netlink_packet_core::{EthernetProtocol, Parseable};
+use netlink_packet_core::{
+    EthernetProtocol, NetlinkMessage, NetlinkPayload, Parseable,
+};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
     Ieee80211Element, Ieee80211Elements, Nl80211Attr, Nl80211BssInfo,
-    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Error,
-    Nl80211Handle, Nl80211Message,
+    Nl80211Command, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
+    Nl80211Error, Nl80211Event, Nl80211Handle, Nl80211Message,
+    Nl80211RekeyData,
 };
 
 use crate::{ETH_ALEN, ErrorKind, WifiError};
+
+/// A nl80211 event decoded for shuli. The upstream event parser does not
+/// model `NL80211_CMD_SET_REKEY_OFFLOAD` notifications (the driver reports
+/// the replay counter it used for a GTK rekey while the host was
+/// suspended), so shuli decodes that one event itself and forwards every
+/// other event unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientEvent {
+    /// A regular event from [`Nl80211Event::parse`].
+    Nl80211(Nl80211Event),
+    /// `NL80211_CMD_SET_REKEY_OFFLOAD` notification: the driver completed a
+    /// GTK rekey and reports the new replay counter.
+    RekeyOffload {
+        bssid: [u8; ETH_ALEN],
+        replay_ctr: [u8; 8],
+    },
+}
+
+/// Parse a raw multicast nl80211 message into a [`ClientEvent`].
+///
+/// The rekey-offload notification is checked first because
+/// [`Nl80211Event::parse`] would otherwise report it as `Unknown` and the
+/// replay counter would be lost.
+pub(crate) fn parse_client_event(
+    msg: NetlinkMessage<genetlink::message::RawGenlMessage>,
+) -> Option<ClientEvent> {
+    let (header, payload) = msg.into_parts();
+    if let Some((bssid, replay_ctr)) = parse_rekey_offload_event(&payload) {
+        return Some(ClientEvent::RekeyOffload { bssid, replay_ctr });
+    }
+    Nl80211Event::parse(NetlinkMessage::new(header, payload))
+        .map(ClientEvent::Nl80211)
+}
+
+fn parse_rekey_offload_event(
+    payload: &NetlinkPayload<genetlink::message::RawGenlMessage>,
+) -> Option<([u8; ETH_ALEN], [u8; 8])> {
+    let NetlinkPayload::InnerMessage(raw_genlmsg) = payload else {
+        return None;
+    };
+    let Ok(genl_msg) = raw_genlmsg.parse_into_genlmsg::<Nl80211Message>()
+    else {
+        return None;
+    };
+    let nl_msg = genl_msg.payload;
+    if nl_msg.cmd != Nl80211Command::SetRekeyOffload {
+        return None;
+    }
+
+    let bssid = nl_msg.attributes.iter().find_map(|attr| match attr {
+        Nl80211Attr::Mac(mac) => Some(*mac),
+        _ => None,
+    })?;
+    let replay_ctr = nl_msg.attributes.iter().find_map(|attr| match attr {
+        Nl80211Attr::RekeyData(nlas) => nlas.iter().find_map(|nla| match nla {
+            Nl80211RekeyData::ReplayCtr(ctr) => ctr.as_slice().try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    })?;
+    Some((bssid, replay_ctr))
+}
+
+#[cfg(test)]
+mod tests {
+    use genetlink::message::RawGenlMessage;
+    use netlink_packet_core::{NetlinkHeader, NetlinkMessage, NetlinkPayload};
+    use netlink_packet_generic::GenlMessage;
+    use wl_nl80211::{
+        Nl80211Attr, Nl80211Command, Nl80211Event, Nl80211Message,
+        Nl80211RekeyData,
+    };
+
+    use super::{ClientEvent, parse_client_event};
+
+    fn wrap(msg: Nl80211Message) -> NetlinkMessage<RawGenlMessage> {
+        let raw = RawGenlMessage::from_genlmsg(GenlMessage::from_payload(msg));
+        NetlinkMessage::new(
+            NetlinkHeader::default(),
+            NetlinkPayload::InnerMessage(raw),
+        )
+    }
+
+    #[test]
+    fn parse_rekey_offload_notification() {
+        let bssid = [0x02; 6];
+        let replay_ctr = [1, 2, 3, 4, 5, 6, 7, 8];
+        let msg = Nl80211Message {
+            cmd: Nl80211Command::SetRekeyOffload,
+            attributes: vec![
+                Nl80211Attr::IfIndex(7),
+                Nl80211Attr::Mac(bssid),
+                Nl80211Attr::RekeyData(vec![Nl80211RekeyData::ReplayCtr(
+                    replay_ctr.to_vec(),
+                )]),
+            ],
+        };
+
+        match parse_client_event(wrap(msg)) {
+            Some(ClientEvent::RekeyOffload {
+                bssid: got_bssid,
+                replay_ctr: got_replay_ctr,
+            }) => {
+                assert_eq!(got_bssid, bssid);
+                assert_eq!(got_replay_ctr, replay_ctr);
+            }
+            other => panic!("expected RekeyOffload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rekey_offload_without_payload_falls_back_to_unknown() {
+        let msg = Nl80211Message {
+            cmd: Nl80211Command::SetRekeyOffload,
+            attributes: vec![Nl80211Attr::IfIndex(7)],
+        };
+        assert!(matches!(
+            parse_client_event(wrap(msg)),
+            Some(ClientEvent::Nl80211(Nl80211Event::Unknown {
+                cmd: Nl80211Command::SetRekeyOffload,
+            }))
+        ));
+    }
+}
 
 /// Drain a nl80211 request stream until the kernel ACK/response is
 /// consumed, converting errors into [`WifiError`].

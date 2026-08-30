@@ -5,6 +5,7 @@ use aws_lc_rs::key_wrap::{self, KeyWrap};
 use crate::{
     ErrorKind, WifiError,
     crypto::{
+        ft::PmkR1,
         handshake4::{
             FourWayState, KEK_LEN, KeyDataKdes, MicAlg, aes_cmac,
             aes_key_unwrap, parse_gtk_kde, parse_key_data_kdes,
@@ -235,6 +236,77 @@ fn test_group_rekey() {
     assert!(m2.has_mic() && m2.is_secure() && !m2.is_pairwise());
     let m2_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2)).unwrap();
     assert_eq!(m2.key_mic, m2_mic);
+}
+
+#[test]
+fn test_update_replay_counter_from_driver() {
+    let pmk = [0x11u8; 32];
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+    state.anonce = Some([0x05u8; 32]);
+    state.ptk = Some(state.derive_ptk());
+
+    let counter = [0, 0, 0, 0, 0, 0, 0x12, 0x34];
+    state.update_replay_counter(counter);
+    assert_eq!(state.replay_counter_bytes(), counter);
+}
+
+#[test]
+fn test_ft_state_with_precomputed_ptk_processes_group_rekey() {
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_ft(
+        PmkR1 {
+            key: [0x11u8; 32],
+            name: [0x22u8; 16],
+        },
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+    state.set_ptk([0x33u8; 48]);
+    let kck = state.kck().unwrap();
+    let kek = state.kek().unwrap();
+
+    let new_gtk = [0x99u8; 16];
+    let mut kde = vec![
+        0xDD,
+        (6 + new_gtk.len()) as u8,
+        0x00,
+        0x0F,
+        0xAC,
+        0x01,
+        0x02,
+        0x00,
+    ];
+    kde.extend_from_slice(&new_gtk);
+    let wrapped = aes_key_wrap(&kek, &kde).unwrap();
+    let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000;
+    let mut g1 = eapol::build_eapol_key_pdu(
+        key_info, 16, 7, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
+        &[0u8; 16], &wrapped,
+    );
+    let g1_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&g1)).unwrap();
+    eapol::set_mic(&mut g1, &g1_mic);
+
+    let parsed = eapol::parse_eapol_key_frame(&g1).unwrap();
+    let msg2 = state.process_group_rekey(&parsed).unwrap();
+
+    assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
+    assert_eq!(state.gtk_index(), 2);
+    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    assert!(m2.has_mic() && m2.is_secure() && !m2.is_pairwise());
 }
 
 // --- tests ---

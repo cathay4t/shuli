@@ -17,7 +17,10 @@ use super::{
     format_ssids, is_eopnotsupp, next_sched_scan_ssids, wiphy_sched_scan_caps,
     wiphy_wowlan_support,
 };
-use crate::{BssInfo, ETH_ALEN};
+use crate::{
+    BssInfo, ETH_ALEN,
+    nl80211::{ClientEvent, parse_client_event},
+};
 
 impl WifiIface {
     /// Pick the first configured network whose hints are complete
@@ -375,18 +378,20 @@ impl WifiIface {
                 .await;
                 match timed {
                     Ok(Some(raw_msg)) => {
-                        if let Some(event) =
-                            wl_nl80211::Nl80211Event::parse(raw_msg)
-                        {
+                        if let Some(event) = parse_client_event(raw_msg) {
                             match event {
-                                Nl80211Event::Unknown {
-                                    cmd: Nl80211Command::SchedScanResults,
-                                } => {
+                                ClientEvent::Nl80211(
+                                    Nl80211Event::Unknown {
+                                        cmd: Nl80211Command::SchedScanResults,
+                                    },
+                                ) => {
                                     self.handle_sched_scan_results().await?;
                                 }
-                                Nl80211Event::Unknown {
-                                    cmd: Nl80211Command::SchedScanStopped,
-                                } => {
+                                ClientEvent::Nl80211(
+                                    Nl80211Event::Unknown {
+                                        cmd: Nl80211Command::SchedScanStopped,
+                                    },
+                                ) => {
                                     if self.scan.sched_scan_stop_pending {
                                         // Echo of our own stop request
                                         // (rotation or watchdog fallback);
@@ -418,7 +423,7 @@ impl WifiIface {
                                         }
                                     }
                                 }
-                                other => self.handle_event(other).await,
+                                other => self.handle_client_event(other).await,
                             }
                         }
                     }
@@ -484,10 +489,8 @@ impl WifiIface {
                     .await;
                     match timed {
                         Ok(Some(raw_msg)) => {
-                            if let Some(event) =
-                                wl_nl80211::Nl80211Event::parse(raw_msg)
-                            {
-                                self.handle_event(event).await;
+                            if let Some(event) = parse_client_event(raw_msg) {
+                                self.handle_client_event(event).await;
                             }
                             break;
                         }
@@ -594,10 +597,8 @@ impl WifiIface {
                 };
                 match next {
                     Ok(Some(raw_msg)) => {
-                        if let Some(event) =
-                            wl_nl80211::Nl80211Event::parse(raw_msg)
-                        {
-                            self.handle_event(event).await;
+                        if let Some(event) = parse_client_event(raw_msg) {
+                            self.handle_client_event(event).await;
                         }
                     }
                     Ok(None) => {
@@ -651,10 +652,8 @@ impl WifiIface {
                     .await
                     {
                         Ok(Some(raw_msg)) => {
-                            if let Some(event) =
-                                wl_nl80211::Nl80211Event::parse(raw_msg)
-                            {
-                                self.handle_event(event).await;
+                            if let Some(event) = parse_client_event(raw_msg) {
+                                self.handle_client_event(event).await;
                             }
                             if !matches!(
                                 self.state,
