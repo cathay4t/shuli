@@ -178,6 +178,14 @@ async fn main() -> Result<(), shuli::WifiError> {
 interface changed. Use `update_networks_of()`, `current_ssid_of()` and
 `current_bssid_of()` when more than one interface is managed.
 
+## Known Limitation
+
+We deliberately skip the features due to extensive development cost and lacking
+of user request:
+
+- SAE/WPA3 on `FullMAC/NL80211_CMD_CONNECT` via external auth
+- FT roaming on `FullMAC/NL80211_CMD_CONNECT`
+
 ## Contact
 
  * Crate github issue
