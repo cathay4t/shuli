@@ -28,8 +28,10 @@ pub enum WifiState {
     /// Ready for communication, but shuli must stay running to follow up
     /// group rekeys.
     ConnectedWithoutOffloadRekey,
-    /// Ready for communication; rekey is offloaded to kernel firmware/driver
-    /// and shuli can be terminated.
+    /// Ready for communication; the GTK rekey material has been handed to
+    /// the driver/firmware. Shuli must still keep running: group rekeys may
+    /// continue to arrive in userspace, and roaming/disconnect events still
+    /// need follow-up.
     ConnectedWithOffloadRekey,
     /// Connection failed; retried after a short delay.
     Failed,

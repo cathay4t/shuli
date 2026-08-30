@@ -185,6 +185,7 @@ lacking of user request:
 
 - SAE/WPA3 on `FullMAC/NL80211_CMD_CONNECT` via external auth
 - FT roaming on `FullMAC/NL80211_CMD_CONNECT`
+- SAE-PK
 
 ## Contact
 
