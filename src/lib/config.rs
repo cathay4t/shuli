@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::scan::SecurityType;
+use wl_nl80211::Ieee80211CipherSuite;
+
+use crate::scan::{BssInfo, MdieInfo, SecurityType};
 
 /// Default roam threshold: matches iwd's `RoamThreshold` (-70 dBm).
 pub const DEFAULT_ROAM_THRESHOLD_DBM: i32 = -70;
@@ -51,6 +53,108 @@ impl SaePwe {
     }
 }
 
+/// Optional user-provided hints that let shuli find a network faster.
+///
+/// Hints are guesses, not hard constraints: shuli tries them first and
+/// falls back to the normal scan flow when they miss.
+///
+/// When every scan-free field is set (`bssid`, `frequency_mhz`,
+/// `security`, `ap_rsne`, `ap_rsnxe` and `group_mgmt_cipher`), shuli
+/// skips the scan and authenticates directly. When any of them is
+/// `None`, the set fields are used as a best-effort quick scan and the
+/// old scan flow is the fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NetworkConfigHints {
+    /// Frequencies (MHz) where the API user expects this network's APs.
+    /// The first host scan is restricted to these channels; if no
+    /// configured SSID is found, shuli falls back to a full scan.
+    pub frequencies_mhz: Vec<u32>,
+    /// BSSID of the AP this hint refers to. Required for the scan-free
+    /// path.
+    pub bssid: Option<[u8; 6]>,
+    /// Frequency (MHz) of `bssid`. Required for the scan-free path.
+    pub frequency_mhz: Option<u32>,
+    /// Security mode detected on the AP. Required for the scan-free
+    /// path.
+    pub security: Option<SecurityType>,
+    /// The AP's RSNE as a full element (ID 48 + length + body), empty
+    /// for open networks. Required for the scan-free path.
+    pub ap_rsne: Option<Vec<u8>>,
+    /// The AP's RSNXE as a full element (ID 244 + length + body),
+    /// `Some(vec![])` when the AP advertises none. Required for the
+    /// scan-free path.
+    pub ap_rsnxe: Option<Vec<u8>>,
+    /// Negotiated group management (BIP) cipher. Required for the
+    /// scan-free path.
+    pub group_mgmt_cipher: Option<Ieee80211CipherSuite>,
+    /// Mobility Domain ID of an FT-capable AP. Optional; both `mdid`
+    /// and `ft_capab` must be set to restore the MDIE.
+    pub mdid: Option<[u8; 2]>,
+    /// FT capability octet of the AP's MDIE. Optional; both `mdid` and
+    /// `ft_capab` must be set to restore the MDIE.
+    pub ft_capab: Option<u8>,
+    /// Whether the AP advertises BSS Transition Management (802.11v).
+    /// Optional; defaults to `false`.
+    pub btm_support: Option<bool>,
+    /// Whether the AP advertises Neighbor Report (802.11k). Optional;
+    /// defaults to `false`.
+    pub rm_neighbor_report: Option<bool>,
+}
+
+impl NetworkConfigHints {
+    /// Create an empty hint set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the frequency hint list.
+    pub fn with_frequencies_mhz(mut self, frequencies_mhz: Vec<u32>) -> Self {
+        self.frequencies_mhz = frequencies_mhz;
+        self
+    }
+
+    /// Rebuild the BSS information required by the scan-free path.
+    ///
+    /// Returns `None` when any scan-free property is missing or the
+    /// security type is unsupported; the caller should then fall back
+    /// to a normal scan.
+    pub(crate) fn bss_info(&self) -> Option<BssInfo> {
+        let bssid = self.bssid?;
+        if bssid == [0; 6] {
+            return None;
+        }
+        let freq_mhz = self.frequency_mhz?;
+        if freq_mhz == 0 {
+            return None;
+        }
+        let security = self.security?;
+        if security == SecurityType::Unsupported {
+            return None;
+        }
+        Some(BssInfo {
+            bssid,
+            freq_mhz,
+            // The scan-free path has no signal measurement, and the
+            // auth path never reads this field; 0 is only a placeholder.
+            signal_dbm: 0,
+            security,
+            ap_rsne: self.ap_rsne.clone()?,
+            ap_rsnxe: self.ap_rsnxe.clone()?,
+            group_mgmt_cipher: self.group_mgmt_cipher?,
+            mdie: match (self.mdid, self.ft_capab) {
+                (Some(mdid), Some(ft_capab)) => {
+                    Some(MdieInfo { mdid, ft_capab })
+                }
+                _ => None,
+            },
+            hidden: false,
+            btm_support: self.btm_support.unwrap_or(false),
+            rm_neighbor_report: self.rm_neighbor_report.unwrap_or(false),
+        })
+    }
+}
+
 /// WiFi connection configuration for [`WifiClient`](crate::WifiClient).
 ///
 /// Create one `WifiConfig` per wifi-phy interface and pass all of them
@@ -90,6 +194,11 @@ pub struct WifiConfig {
 pub struct NetworkConfig {
     pub ssid: String,
     pub password: Option<String>,
+    /// Optional hints that speed up the initial connection attempt.
+    /// Complete hints enable a scan-free connect; partial hints (e.g.
+    /// frequencies) enable a best-effort quick scan with the normal
+    /// scan flow as fallback.
+    pub hints: NetworkConfigHints,
     /// When `false`, no signal-triggered roam scans are started while
     /// connected to this SSID. Defaults to `true`.
     pub roaming: bool,
@@ -143,6 +252,7 @@ impl NetworkConfig {
         Self {
             ssid: ssid.to_string(),
             password: None,
+            hints: NetworkConfigHints::default(),
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
             switch_ssid_lower_than_dbm: DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
@@ -158,6 +268,15 @@ impl NetworkConfig {
 
     pub fn set_password(&mut self, password: &str) -> &mut Self {
         self.password = Some(password.to_string());
+        self
+    }
+
+    /// Attach user-provided hints (e.g. last-known BSS information or
+    /// just frequencies) used to speed up the first connection attempt.
+    /// Complete hints enable the scan-free path; partial hints enable a
+    /// best-effort quick scan with the normal scan flow as fallback.
+    pub fn set_hints(&mut self, hints: NetworkConfigHints) -> &mut Self {
+        self.hints = hints;
         self
     }
 

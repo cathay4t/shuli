@@ -1,0 +1,2 @@
+- Use NL80211_CMD_SET_REKEY_OFFLOAD to support WoWLAN/suspend
+- SAE-PK: wait someone requests it or we can test our implementation

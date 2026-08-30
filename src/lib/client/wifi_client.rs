@@ -9,8 +9,8 @@ use wl_nl80211::{Nl80211Attr, Nl80211Message, Nl80211MulticastGroup};
 
 use super::{Nl80211EventMsg, Nl80211EventSender, WifiIface};
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiConfig,
-    WifiError, WifiState,
+    ETH_ALEN, ErrorKind, NetworkConfig, NetworkConfigHints,
+    ShuliNl80211Connection, WifiConfig, WifiError, WifiState,
 };
 
 #[derive(Debug)]
@@ -146,6 +146,32 @@ impl WifiClient {
         self.ifaces
             .get(iface_name)
             .map(|iface| iface.current_bssid())
+    }
+
+    /// Export hints for the BSS the interface is currently working
+    /// toward (or connected to), so the caller can feed them back into
+    /// a future [`NetworkConfig`] to enable the scan-free path.
+    ///
+    /// Returns `None` when no BSS has been selected yet.
+    pub fn export_hints(&self, iface_name: &str) -> Option<NetworkConfigHints> {
+        let iface = self.ifaces.get(iface_name)?;
+        let bss = &iface.link.bss_info;
+        if bss.bssid == [0; ETH_ALEN] || bss.freq_mhz == 0 {
+            return None;
+        }
+        Some(NetworkConfigHints {
+            frequencies_mhz: vec![bss.freq_mhz],
+            bssid: Some(bss.bssid),
+            frequency_mhz: Some(bss.freq_mhz),
+            security: Some(bss.security),
+            ap_rsne: Some(bss.ap_rsne.clone()),
+            ap_rsnxe: Some(bss.ap_rsnxe.clone()),
+            group_mgmt_cipher: Some(bss.group_mgmt_cipher),
+            mdid: bss.mdie.map(|mdie| mdie.mdid),
+            ft_capab: bss.mdie.map(|mdie| mdie.ft_capab),
+            btm_support: Some(bss.btm_support),
+            rm_neighbor_report: Some(bss.rm_neighbor_report),
+        })
     }
 
     pub async fn update_networks(

@@ -108,6 +108,11 @@ pub(crate) struct ScanEngine {
     /// `prev_scan_wildcard`); true when the next round should be the
     /// wildcard probe.
     pub(crate) scan_wildcard_next: bool,
+    /// Whether the next connection attempt may use the configured
+    /// network hints: a complete hint set is tried scan-free, otherwise
+    /// the first host scan is restricted to hinted frequencies. Cleared
+    /// once either path has been tried.
+    pub(crate) hint_scan: bool,
 }
 
 /// State that lives with the current target/association: the selected
@@ -237,6 +242,7 @@ impl ScanEngine {
         self.sched_scan_first = true;
         self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
         self.sched_scan_timeout_secs = SCHED_SCAN_WATCHDOG_SECS;
+        self.hint_scan = true;
     }
 }
 

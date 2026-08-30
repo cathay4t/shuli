@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{EapConfig, NetworkConfig, WifiConfig};
+use crate::{
+    Ieee80211CipherSuite, SecurityType,
+    config::{EapConfig, NetworkConfig, NetworkConfigHints, WifiConfig},
+};
 
 #[test]
 fn wifi_config_requires_networks() {
@@ -77,6 +80,56 @@ fn hidden_defaults_to_false_and_can_be_set() {
     assert!(network.hidden);
     network.set_hidden(false);
     assert!(!network.hidden);
+}
+
+#[test]
+fn network_hints_default_to_empty_and_can_be_set() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(
+        network.hints.frequencies_mhz.is_empty(),
+        "frequency hints must be opt-in"
+    );
+
+    network.set_hints(
+        NetworkConfigHints::new().with_frequencies_mhz(vec![5180, 5765]),
+    );
+    assert_eq!(network.hints.frequencies_mhz, vec![5180, 5765]);
+}
+
+#[test]
+fn scan_free_hints_require_complete_bss_info() {
+    let mut hints = NetworkConfigHints::default();
+    assert!(
+        hints.bss_info().is_none(),
+        "empty hints must not enable scan-free"
+    );
+
+    hints.frequencies_mhz = vec![5765];
+    hints.bssid = Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]);
+    hints.frequency_mhz = Some(5765);
+    hints.security = Some(SecurityType::Wpa2Psk);
+    hints.ap_rsne = Some(vec![0x30, 0x02, 0x01, 0x00]);
+    hints.ap_rsnxe = Some(Vec::new());
+    hints.group_mgmt_cipher = Some(Ieee80211CipherSuite::BipCmac128);
+    hints.btm_support = Some(true);
+    hints.rm_neighbor_report = Some(false);
+
+    let bss = hints.bss_info().expect("complete hints build BssInfo");
+    assert_eq!(bss.bssid, [0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]);
+    assert_eq!(bss.freq_mhz, 5765);
+    assert_eq!(bss.security, SecurityType::Wpa2Psk);
+    assert_eq!(bss.ap_rsne, vec![0x30, 0x02, 0x01, 0x00]);
+    assert!(bss.btm_support);
+    assert!(!bss.rm_neighbor_report);
+
+    // Dropping any scan-free property disables the direct path.
+    hints.ap_rsnxe = None;
+    assert!(hints.bss_info().is_none());
+
+    // An unsupported security guess must never be used directly.
+    hints.ap_rsnxe = Some(Vec::new());
+    hints.security = Some(SecurityType::Unsupported);
+    assert!(hints.bss_info().is_none());
 }
 
 #[test]

@@ -20,6 +20,15 @@ use super::{
 use crate::{BssInfo, ETH_ALEN};
 
 impl WifiIface {
+    /// Pick the first configured network whose hints are complete
+    /// enough for a scan-free connection attempt.
+    fn scan_free_target(&self) -> Option<(NetworkConfig, BssInfo)> {
+        self.core.config.networks.iter().find_map(|network| {
+            let bss_info = network.hints.bss_info()?;
+            Some((network.clone(), bss_info))
+        })
+    }
+
     /// Validate the configuration and prepare one interface state machine.
     /// The nl80211 connection is shared with every other interface in the
     /// parent [`WifiClient`].
@@ -153,6 +162,7 @@ impl WifiIface {
             sched_scan_first: true,
             scan_ssid_cursor: 0,
             scan_wildcard_next: true,
+            hint_scan: true,
         };
         let link = Link {
             network,
@@ -243,8 +253,25 @@ impl WifiIface {
         }
         match self.state {
             WifiState::Init => {
-                self.send_out_scan_request().await?;
-                self.state = WifiState::Scanning;
+                if self.scan.hint_scan
+                    && let Some((network, bss_info)) = self.scan_free_target()
+                {
+                    self.scan.hint_scan = false;
+                    self.link.network = network;
+                    self.link.bss_info = bss_info;
+                    log::info!(
+                        "scan-free connect: ssid={}, bssid={:02x?}, freq={} \
+                         MHz",
+                        self.link.network.ssid,
+                        self.link.bss_info.bssid,
+                        self.link.bss_info.freq_mhz
+                    );
+                    self.send_out_auth_request().await?;
+                    self.state = WifiState::Authenticating;
+                } else {
+                    self.send_out_scan_request().await?;
+                    self.state = WifiState::Scanning;
+                }
             }
             WifiState::Scanning => {
                 self.wait_scan_finish().await;
@@ -282,6 +309,19 @@ impl WifiIface {
                     return Ok(());
                 }
                 if let Err(e) = self.process_scan_results().await {
+                    // A hinted-frequency scan missed: retry once with a
+                    // full scan before handing the periodic search over
+                    // to PNO / host-side backoff.
+                    if e.kind == ErrorKind::SsidNotFound && self.scan.hint_scan
+                    {
+                        self.scan.hint_scan = false;
+                        log::debug!(
+                            "no configured SSID found on hinted frequencies; \
+                             falling back to full scan"
+                        );
+                        self.send_out_scan_request().await?;
+                        return Ok(());
+                    }
                     // SSID not found: hand the periodic scanning over to
                     // the firmware (PNO) when supported, otherwise fall
                     // back to host-side scans with exponential backoff.

@@ -9,6 +9,11 @@
  * One `WifiClient` per network namespace: all interfaces share one
    nl80211 socket and one event dispatcher that routes multicast events
    by `IFINDEX`.
+ * Add `NetworkConfig::hints` so API users can pass last-known BSS
+   information for a scan-free connect, or partial hints (frequencies)
+   for a best-effort quick scan with the normal scan flow as fallback.
+   `WifiClient::export_hints()` exports the current BSS as hints for
+   the next run.
 
 ### Bug fixes
  - Report wrong-password authentication failures as

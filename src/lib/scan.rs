@@ -238,6 +238,20 @@ impl PartialOrd for BssInfo {
     }
 }
 
+/// Union of the frequency hints configured for every network, sorted
+/// and de-duplicated. Zero is dropped because it means "unknown" in
+/// shuli's BSS bookkeeping.
+fn configured_hint_frequencies(networks: &[NetworkConfig]) -> Vec<u32> {
+    let mut freqs: Vec<u32> = networks
+        .iter()
+        .flat_map(|network| network.hints.frequencies_mhz.iter().copied())
+        .filter(|freq| *freq != 0)
+        .collect();
+    freqs.sort_unstable();
+    freqs.dedup();
+    freqs
+}
+
 impl WifiIface {
     pub(crate) async fn send_out_scan_request(
         &mut self,
@@ -261,16 +275,31 @@ impl WifiIface {
         // Roam scans start as *quick* scans restricted to frequencies
         // where the ESS has already been seen (last scan results + BTM
         // neighbor-report entries); only the full-scan fallback sweeps
-        // every channel. Non-roam scans always sweep everything.
-        let freqs = if self.roam.roam_scan && !self.roam.roam_scan_full {
-            let freqs: Vec<u32> = self
-                .roam
-                .roam_freqs
-                .iter()
-                .copied()
-                .filter(|freq| *freq != 0)
-                .collect();
-            if freqs.is_empty() { None } else { Some(freqs) }
+        // every channel. A non-roam scan tries the configured network
+        // hints first (e.g. last-known frequencies) and falls back to a
+        // full scan when the hinted channels miss.
+        let freqs = if self.roam.roam_scan {
+            if !self.roam.roam_scan_full {
+                let freqs: Vec<u32> = self
+                    .roam
+                    .roam_freqs
+                    .iter()
+                    .copied()
+                    .filter(|freq| *freq != 0)
+                    .collect();
+                if freqs.is_empty() { None } else { Some(freqs) }
+            } else {
+                None
+            }
+        } else if self.scan.hint_scan {
+            let freqs = configured_hint_frequencies(&self.core.config.networks);
+            if freqs.is_empty() {
+                // No usable hints: do not enter the hinted-scan state.
+                self.scan.hint_scan = false;
+                None
+            } else {
+                Some(freqs)
+            }
         } else {
             None
         };
@@ -291,10 +320,18 @@ impl WifiIface {
                     format_ssids(&ssids)
                 )
             }
+            (Some(freqs), false) => log::info!(
+                "scanning for SSIDs [{}] on hinted frequencies [{}]",
+                format_ssids(&ssids),
+                freqs
+                    .iter()
+                    .map(|freq| freq.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             (None, false) => {
                 log::info!("scanning for SSIDs [{}]", format_ssids(&ssids))
             }
-            (Some(_), false) => unreachable!("non-roam scans never restrict"),
         }
         self.core
             .nl
@@ -1017,7 +1054,8 @@ pub(crate) fn format_ssids(ssids: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCAN_SSIDS, next_scan_ssids};
+    use super::{MAX_SCAN_SSIDS, configured_hint_frequencies, next_scan_ssids};
+    use crate::NetworkConfig;
 
     fn ssids(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -1101,5 +1139,19 @@ mod tests {
         assert_eq!(round[0], "S00");
         assert_eq!(round[14], "S14");
         assert_eq!(cursor, 15);
+    }
+
+    #[test]
+    fn hint_frequencies_are_union_sorted_deduped_and_drop_zero() {
+        let mut a = NetworkConfig::new("A");
+        a.hints.frequencies_mhz = vec![5765, 5180, 0, 5765];
+        let mut b = NetworkConfig::new("B");
+        b.hints.frequencies_mhz = vec![2412];
+        let c = NetworkConfig::new("C");
+
+        assert_eq!(
+            configured_hint_frequencies(&[a, b, c]),
+            vec![2412, 5180, 5765]
+        );
     }
 }
