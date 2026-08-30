@@ -96,23 +96,28 @@ fn network_hints_default_to_empty_and_can_be_set() {
     assert_eq!(network.hints.frequencies_mhz, vec![5180, 5765]);
 }
 
+fn complete_hints() -> NetworkConfigHints {
+    NetworkConfigHints {
+        frequencies_mhz: vec![5765],
+        bssid: Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]),
+        frequency_mhz: Some(5765),
+        security: Some(SecurityType::Wpa2Psk),
+        ap_rsne: Some(vec![0x30, 0x02, 0x01, 0x00]),
+        ap_rsnxe: Some(Vec::new()),
+        group_mgmt_cipher: Some(Ieee80211CipherSuite::BipCmac128),
+        btm_support: Some(true),
+        rm_neighbor_report: Some(false),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn scan_free_hints_require_complete_bss_info() {
-    let mut hints = NetworkConfigHints::default();
+    let mut hints = complete_hints();
     assert!(
-        hints.bss_info().is_none(),
-        "empty hints must not enable scan-free"
+        hints.bss_info().is_some(),
+        "complete hints must enable scan-free"
     );
-
-    hints.frequencies_mhz = vec![5765];
-    hints.bssid = Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]);
-    hints.frequency_mhz = Some(5765);
-    hints.security = Some(SecurityType::Wpa2Psk);
-    hints.ap_rsne = Some(vec![0x30, 0x02, 0x01, 0x00]);
-    hints.ap_rsnxe = Some(Vec::new());
-    hints.group_mgmt_cipher = Some(Ieee80211CipherSuite::BipCmac128);
-    hints.btm_support = Some(true);
-    hints.rm_neighbor_report = Some(false);
 
     let bss = hints.bss_info().expect("complete hints build BssInfo");
     assert_eq!(bss.bssid, [0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]);
@@ -130,6 +135,30 @@ fn scan_free_hints_require_complete_bss_info() {
     hints.ap_rsnxe = Some(Vec::new());
     hints.security = Some(SecurityType::Unsupported);
     assert!(hints.bss_info().is_none());
+}
+
+#[test]
+fn network_hints_serde_roundtrip() {
+    let hints = complete_hints();
+    let json = serde_json::to_string(&hints).expect("serialize hints");
+    let decoded: NetworkConfigHints =
+        serde_json::from_str(&json).expect("deserialize hints");
+    assert_eq!(decoded, hints);
+    assert!(
+        json.contains("\"group-mgmt-cipher\":"),
+        "cipher must use a stable kebab-case key: {json}"
+    );
+}
+
+#[test]
+fn security_type_serde_uses_stable_names() {
+    let json = serde_json::to_string(&SecurityType::Wpa2PskSha256)
+        .expect("serialize security type");
+    assert_eq!(json, "\"wpa2-psk-sha256\"");
+
+    let decoded: SecurityType =
+        serde_json::from_str("\"wpa2-psk-sha256\"").expect("parse security");
+    assert_eq!(decoded, SecurityType::Wpa2PskSha256);
 }
 
 #[test]

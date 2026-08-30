@@ -14,6 +14,9 @@
    for a best-effort quick scan with the normal scan flow as fallback.
    `WifiClient::export_hints()` exports the current BSS as hints for
    the next run.
+ * `NetworkConfigHints` and `SecurityType` now implement serde
+   `Serialize`/`Deserialize` so hints can be persisted to a file and
+   loaded back after reboot.
 
 ### Bug fixes
  - Report wrong-password authentication failures as

@@ -668,6 +668,57 @@ async fn wifi_client_open_connect() {
     client.shutdown().await;
 }
 
+#[tokio::test]
+async fn wifi_client_scan_free_reconnect_using_exported_hints() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_scan_free_reconnect_using_exported_hints: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init_multi(vec![config.clone()])
+        .await
+        .expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+
+    let hints = client
+        .export_hints(TEST_NIC)
+        .expect("hints after first connect");
+    client.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Feed the exported hints back in: the new client must skip the
+    // scan and start authenticating immediately.
+    config.networks[0].set_hints(hints);
+    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let first = client.run().await.expect("first scan-free run");
+    assert_eq!(
+        first.state,
+        WifiState::Authenticating,
+        "complete hints must enable the scan-free path"
+    );
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
 /// mac80211_hwsim has no WoWLAN support, so arming (with
 /// `wowlan: true` configured) must degrade gracefully (report
 /// unsupported, keep connecting) instead of failing. WoWLAN is opt-in

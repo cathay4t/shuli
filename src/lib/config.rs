@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use serde::{Deserialize, Serialize};
 use wl_nl80211::Ieee80211CipherSuite;
 
 use crate::scan::{BssInfo, MdieInfo, SecurityType};
@@ -63,7 +64,8 @@ impl SaePwe {
 /// skips the scan and authenticates directly. When any of them is
 /// `None`, the set fields are used as a best-effort quick scan and the
 /// old scan flow is the fallback.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct NetworkConfigHints {
     /// Frequencies (MHz) where the API user expects this network's APs.
@@ -87,6 +89,7 @@ pub struct NetworkConfigHints {
     pub ap_rsnxe: Option<Vec<u8>>,
     /// Negotiated group management (BIP) cipher. Required for the
     /// scan-free path.
+    #[serde(with = "group_mgmt_cipher_serde")]
     pub group_mgmt_cipher: Option<Ieee80211CipherSuite>,
     /// Mobility Domain ID of an FT-capable AP. Optional; both `mdid`
     /// and `ft_capab` must be set to restore the MDIE.
@@ -152,6 +155,37 @@ impl NetworkConfigHints {
             btm_support: self.btm_support.unwrap_or(false),
             rm_neighbor_report: self.rm_neighbor_report.unwrap_or(false),
         })
+    }
+}
+
+/// Serialize [`Ieee80211CipherSuite`] as its numeric OUI value so hint
+/// files stay self-contained without depending on wl-nl80211's serde
+/// support.
+mod group_mgmt_cipher_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use wl_nl80211::Ieee80211CipherSuite;
+
+    pub fn serialize<S>(
+        cipher: &Option<Ieee80211CipherSuite>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match cipher {
+            Some(cipher) => serializer.serialize_some(&u32::from(*cipher)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<Ieee80211CipherSuite>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<u32>::deserialize(deserializer)?;
+        Ok(value.map(Ieee80211CipherSuite::from))
     }
 }
 

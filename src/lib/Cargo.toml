@@ -32,6 +32,7 @@ getrandom.workspace = true
 aws-lc-rs.workspace = true
 libc.workspace = true
 rustls.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

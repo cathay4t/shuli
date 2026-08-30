@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
@@ -30,7 +31,10 @@ const MAX_SCAN_SSIDS: usize = 16;
 const SCAN_COMPLETE_TIMEOUT_SECS: u64 = 15;
 
 /// Security type detected from the BSS's RSNE in scan results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum SecurityType {
     /// No RSNE — open / no encryption.
