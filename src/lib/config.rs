@@ -192,7 +192,7 @@ mod group_mgmt_cipher_serde {
 /// WiFi connection configuration for [`WifiClient`](crate::WifiClient).
 ///
 /// Create one `WifiConfig` per wifi-phy interface and pass all of them
-/// to [`WifiClient::init_multi`](crate::WifiClient::init_multi) so a
+/// to [`WifiClient::init`](crate::WifiClient::init) so a
 /// single client manages every interface in the network namespace.
 ///
 /// No serde — the daemon layer deserializes its own `ShuliConfig` and

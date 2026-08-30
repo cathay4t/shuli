@@ -129,7 +129,7 @@ async fn main() -> Result<(), shuli::WifiError> {
         .add_network("Office-WIFI", Some("office-secret"))
         .add_network("Guest-Open", None);
 
-    let mut client = WifiClient::init(config).await?;
+    let mut client = WifiClient::init(vec![config]).await?;
 
     // Drive the connection: scan -> authenticate -> 4-way handshake.
     // Failed states retry on the next call; errors are logged and retried.
@@ -159,7 +159,7 @@ async fn main() -> Result<(), shuli::WifiError> {
     let mut wlan1 = WifiConfig::new("wlan1");
     wlan1.add_network("Office", Some("office-secret"));
 
-    let mut client = WifiClient::init_multi(vec![wlan0, wlan1]).await?;
+    let mut client = WifiClient::init(vec![wlan0, wlan1]).await?;
 
     loop {
         // Returns the first interface that changed state.

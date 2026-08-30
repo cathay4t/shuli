@@ -2,7 +2,7 @@
 ## [Unreleased]
 ### Breaking changes
  * `WifiClient` now manages all wifi-phy interfaces in one object; use
-   `WifiClient::init_multi()` and the `WifiRunResult`-returning
+   `WifiClient::init()` and the `WifiRunResult`-returning
    `run_multi()` when managing multiple interfaces.
 
 ### New features

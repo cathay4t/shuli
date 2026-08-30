@@ -74,7 +74,7 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
             config::ShuliConfig::wifi_config_for_entries(iface_name, entries)
         })
         .collect();
-    let client = shuli::WifiClient::init_multi(wifi_configs).await?;
+    let client = shuli::WifiClient::init(wifi_configs).await?;
 
     // A watch channel broadcasts shutdown.
     // `tasks` is polled in the select so the daemon also exits when

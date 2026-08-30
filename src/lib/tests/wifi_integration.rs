@@ -658,7 +658,7 @@ async fn wifi_client_open_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-NOPASS", None);
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -684,7 +684,7 @@ async fn wifi_client_scan_free_reconnect_using_exported_hints() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config.clone()])
+    let mut client = WifiClient::init(vec![config.clone()])
         .await
         .expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
@@ -703,7 +703,7 @@ async fn wifi_client_scan_free_reconnect_using_exported_hints() {
     // Feed the exported hints back in: the new client must skip the
     // scan and start authenticating immediately.
     config.networks[0].set_hints(hints);
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let first = client.run().await.expect("first scan-free run");
     assert_eq!(
         first.state,
@@ -740,7 +740,7 @@ async fn wifi_client_wowlan_unsupported_graceful() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-NOPASS", None);
     config.networks[0].wowlan = true;
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     assert!(
         !client.wowlan_supported(TEST_NIC),
         "mac80211_hwsim must not advertise WoWLAN triggers"
@@ -776,7 +776,7 @@ async fn wifi_client_sae_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -806,7 +806,7 @@ async fn wifi_client_wrong_sae_password_raises_error() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("wrong-password"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let err = run_until_connected(&mut client, 20)
         .await
         .expect_err("wrong SAE password must raise an error");
@@ -838,7 +838,7 @@ async fn wifi_client_sae_anti_clogging() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -877,7 +877,7 @@ async fn wifi_client_sae_hnp_fallback() {
     // ever needing the reactive restart.
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -901,7 +901,7 @@ async fn wifi_client_sae_hnp_fallback() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
     config.networks[0].sae_pwe = crate::SaePwe::H2E;
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await;
     assert!(
         state.is_err(),
@@ -931,7 +931,7 @@ async fn wifi_client_sae_password_identifier() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PWID", Some("12345678"));
     config.networks[0].set_sae_password_id(Some("corp-id"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -960,7 +960,7 @@ async fn wifi_client_sae_bip_gmac256() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-BIP", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1046,7 +1046,7 @@ async fn wifi_client_sae_transition_disable() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-TD", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1075,7 +1075,7 @@ async fn wifi_client_sae_ext_key_id() {
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-EKID", Some("12345678"));
     config.networks[0].ext_key_id = true;
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1107,7 +1107,7 @@ async fn wifi_client_multi_network_connect() {
     config
         .add_network("Ghost-Network", Some("wrong-password"))
         .add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
 
     // First cycle: scan triggered. The empty result then hands the
     // periodic scanning to the firmware when PNO is available, or arms
@@ -1182,7 +1182,7 @@ async fn wifi_client_sae_pmf_sa_query() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1258,7 +1258,7 @@ async fn wifi_client_wpa2_psk_pmf_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1289,7 +1289,7 @@ async fn wifi_client_wpa2_psk_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1350,7 +1350,7 @@ async fn wifi_client_wrong_wpa2_password_raises_error() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("wrong-password"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let err = run_until_connected(&mut client, 20)
         .await
         .expect_err("wrong WPA2-PSK password must raise an error");
@@ -1382,7 +1382,7 @@ async fn wifi_client_wpa2_psk_sha256_connect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK-SHA256", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1464,7 +1464,7 @@ async fn wifi_client_wpa2_eap_connect() {
         client_key: Some(format!("{cert_dir}/client.key").into()),
         server_name: Some("eap-tls.test".to_string()),
     });
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1554,7 +1554,7 @@ async fn wifi_client_wpa3_eap_connect() {
         client_key: Some("/tmp/shuli_rs_test_certs/client.key".into()),
         server_name: Some("eap-tls.test".to_string()),
     });
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1698,7 +1698,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1798,7 +1798,7 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-PSK", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -1995,7 +1995,7 @@ async fn ft_sae_btm_roam_with(sae_pwe: u8, test_name: &str) {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2165,7 +2165,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
 
     let mut config = WifiConfig::new(TEST_NIC);
     config.add_network("Test-WIFI-FT", Some("12345678"));
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2289,7 +2289,7 @@ async fn wifi_client_ft_psk_signal_roam() {
     // hwsim reports a fixed (weak) signal; any threshold above it starts
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2443,7 +2443,7 @@ async fn wifi_client_roam_scan_stays_connected() {
     // hwsim reports a fixed (weak) signal; any threshold above it starts
     // the roam engine.
     config.networks[0].roaming_threshold = -10;
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2773,7 +2773,7 @@ async fn wifi_client_cross_ssid_critical_switch() {
         network.roaming_threshold = -40;
         network.switch_ssid_lower_than_dbm = -45;
     }
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
@@ -2864,7 +2864,7 @@ async fn wifi_client_cross_ssid_critical_switch_rejects_open_downgrade() {
         network.roaming_threshold = -40;
         network.switch_ssid_lower_than_dbm = -45;
     }
-    let mut client = WifiClient::init_multi(vec![config]).await.expect("init");
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
     assert!(matches!(
         state,
