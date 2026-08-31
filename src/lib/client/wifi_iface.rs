@@ -141,11 +141,23 @@ impl WifiIface {
             )
         })?;
 
-        let core = IfaceCore {
+        let mut core = IfaceCore {
             nl,
             event_receiver,
             config,
         };
+
+        // A previous daemon (or one killed without a clean shutdown) may
+        // have left the device associated. cfg80211 keeps its connection
+        // state until userspace sends CMD_DISCONNECT, and rejects a fresh
+        // CMD_AUTHENTICATE with -EALREADY while that state remains. Clear
+        // it before the first scan so the client cannot spin in a
+        // scan -> authenticate -> EALREADY retry loop. Best-effort: a
+        // clean interface returns -ENOTCONN here.
+        if let Err(e) = core.nl.disconnect().await {
+            log::debug!("clear stale connection state failed: {e}");
+        }
+
         let caps = WiphyCaps {
             sched_scan_supported,
             max_sched_scan_ssids,

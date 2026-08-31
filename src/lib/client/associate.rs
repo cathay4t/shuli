@@ -95,11 +95,12 @@ impl WifiIface {
         if let Some(mfp) = mfp {
             builder = builder.use_mfp(mfp);
         }
-        // Encrypted networks carry EAPOL over nl80211 and tie the
-        // connection's lifetime to this socket; open networks don't.
+        // Tie every association to this socket so the kernel tears it down
+        // if shuli dies without a clean shutdown. Encrypted networks
+        // additionally carry EAPOL over nl80211.
+        builder = builder.socket_owner(true);
         if self.link.bss_info.security != SecurityType::Open {
-            builder =
-                builder.control_port_over_nl80211(true).socket_owner(true);
+            builder = builder.control_port_over_nl80211(true);
         }
         let attrs = builder.build();
         self.core.nl.associate(attrs).await

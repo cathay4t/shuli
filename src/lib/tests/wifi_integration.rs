@@ -668,6 +668,44 @@ async fn wifi_client_open_connect() {
     client.shutdown().await;
 }
 
+/// regression: a previous daemon that died without a clean shutdown can
+/// leave the radio associated. A fresh `WifiClient` must clear that stale
+/// kernel state at init; otherwise the first `AUTHENTICATE` fails with
+/// -EALREADY and the client loops scan -> auth -> EALREADY forever.
+#[tokio::test]
+async fn wifi_client_init_clears_stale_connection() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_init_clears_stale_connection: test binary \
+             not running as root (`.cargo/config.toml` runs tests via `sudo`, \
+             so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    // Simulate a previous daemon that was killed without a clean shutdown:
+    // `iw connect` leaves an ordinary (non-socket-owned) open association.
+    sh_ok(&format!("iw dev {TEST_NIC} connect Test-WIFI-NOPASS 2412"));
+    sh_ok(&format!(
+        "for i in $(seq 1 25); do iw dev {TEST_NIC} link | grep -q \
+         '^Connected' && exit 0; sleep 0.2; done; exit 1"
+    ));
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn wifi_client_scan_free_reconnect_using_exported_hints() {
     init_logger();
