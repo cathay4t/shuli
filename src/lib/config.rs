@@ -202,9 +202,10 @@ mod group_mgmt_cipher_serde {
 pub struct WifiConfig {
     pub iface_name: String,
     /// Networks to scan for and connect to. A single scan schedule
-    /// probes for all of them; the strongest matching BSS wins and its
-    /// network's passphrase is used for authentication. Roaming is
-    /// configured per network (see [`NetworkConfig::roaming`]).
+    /// probes for all of them; when no network is marked `prefered`, the
+    /// strongest matching BSS wins and its network's passphrase is used
+    /// for authentication. Roaming is configured per network (see
+    /// [`NetworkConfig::roaming`]).
     pub networks: Vec<NetworkConfig>,
 }
 
@@ -233,6 +234,16 @@ pub struct NetworkConfig {
     /// frequencies) enable a best-effort quick scan with the normal
     /// scan flow as fallback.
     pub hints: NetworkConfigHints,
+    /// When `true`, this SSID is selected ahead of raw signal strength:
+    /// as long as any BSS advertising it appears in the scan results,
+    /// the strongest BSS of this SSID wins over a stronger BSS of a
+    /// non-preferred configured SSID. A preferred SSID is ignored when
+    /// its signal is below
+    /// [`DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`]: a link that weak does not
+    /// deserve preference over a stronger configured SSID. When no
+    /// qualifying preferred SSID is found, the strongest BSS among all
+    /// configured networks is chosen. Defaults to `false`.
+    pub prefered: bool,
     /// When `false`, no signal-triggered roam scans are started while
     /// connected to this SSID. Defaults to `true`.
     pub roaming: bool,
@@ -287,6 +298,7 @@ impl NetworkConfig {
             ssid: ssid.to_string(),
             password: None,
             hints: NetworkConfigHints::default(),
+            prefered: false,
             roaming: true,
             roaming_threshold: DEFAULT_ROAM_THRESHOLD_DBM,
             switch_ssid_lower_than_dbm: DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
@@ -311,6 +323,15 @@ impl NetworkConfig {
     /// best-effort quick scan with the normal scan flow as fallback.
     pub fn set_hints(&mut self, hints: NetworkConfigHints) -> &mut Self {
         self.hints = hints;
+        self
+    }
+
+    /// Mark this SSID as preferred for scan-result selection. When it is
+    /// found with a signal at or above
+    /// [`DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`], it is chosen before the
+    /// strongest BSS of another configured SSID.
+    pub fn set_prefered(&mut self, prefered: bool) -> &mut Self {
+        self.prefered = prefered;
         self
     }
 

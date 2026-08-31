@@ -83,6 +83,19 @@ fn hidden_defaults_to_false_and_can_be_set() {
 }
 
 #[test]
+fn prefered_defaults_to_false_and_can_be_set() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(
+        !network.prefered,
+        "all SSIDs are equal until one is marked preferred"
+    );
+    network.set_prefered(true);
+    assert!(network.prefered);
+    network.set_prefered(false);
+    assert!(!network.prefered);
+}
+
+#[test]
 fn network_hints_default_to_empty_and_can_be_set() {
     let mut network = NetworkConfig::new("Home-WIFI");
     assert!(

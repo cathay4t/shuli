@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Scan flow: trigger a scan, wait for results, then pick the strongest BSS
-//! matching the configured SSID.
+//! matching the configured SSIDs. When a network is marked `prefered`, its
+//! strongest BSS wins over a stronger BSS of a non-preferred SSID whenever
+//! the preferred SSID is found.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
 
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, ShuliNl80211Connection, WifiClient,
-    WifiError, WifiIface,
+    DEFAULT_SWITCH_SSID_LOWER_THAN_DBM, ETH_ALEN, ErrorKind, NetworkConfig,
+    ShuliNl80211Connection, WifiClient, WifiError, WifiIface,
     nl80211::{
         ClientEvent, extract_bssid, extract_freq, extract_ies,
         extract_signal_dbm, extract_ssid_from_ies, parse_client_event,
@@ -256,6 +258,29 @@ fn configured_hint_frequencies(networks: &[NetworkConfig]) -> Vec<u32> {
     freqs
 }
 
+/// Pick the BSS to connect to from the latest scan results.
+///
+/// A `prefered` SSID wins as long as it appears: the strongest BSS of a
+/// preferred network is selected before any stronger BSS of a
+/// non-preferred network. A preferred SSID whose signal is below
+/// `DEFAULT_SWITCH_SSID_LOWER_THAN_DBM` is ignored, so a weak preferred
+/// network never beats a stronger configured one. When no qualifying
+/// preferred SSID is found, the strongest BSS among all configured
+/// networks is selected.
+fn best_scan_candidate(
+    candidates: &[(BssInfo, NetworkConfig)],
+) -> Option<(BssInfo, NetworkConfig)> {
+    candidates
+        .iter()
+        .filter(|(bss, network)| {
+            network.prefered
+                && bss.signal_dbm >= DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .or_else(|| candidates.iter().max_by(|a, b| a.0.cmp(&b.0)))
+        .cloned()
+}
+
 impl WifiIface {
     pub(crate) async fn send_out_scan_request(
         &mut self,
@@ -405,7 +430,8 @@ impl WifiIface {
         self.collect_scan_candidates().await?;
 
         // A roam that fell back to full reconnection steers the retry
-        // loop to its target BSSID; otherwise the strongest BSS wins.
+        // loop to its target BSSID; otherwise a preferred SSID wins when
+        // found, and only then does raw signal strength decide.
         let hinted = self.roam.roam_target.take().and_then(|hint| {
             self.roam
                 .last_scan_candidates
@@ -413,13 +439,8 @@ impl WifiIface {
                 .find(|(bss, _)| bss.bssid == hint)
                 .cloned()
         });
-        let best = hinted.or_else(|| {
-            self.roam
-                .last_scan_candidates
-                .iter()
-                .max_by(|a, b| a.0.cmp(&b.0))
-                .cloned()
-        });
+        let best = hinted
+            .or_else(|| best_scan_candidate(&self.roam.last_scan_candidates));
         let Some((bss_info, network)) = best else {
             return Err(WifiError::new(
                 ErrorKind::SsidNotFound,
@@ -1056,7 +1077,10 @@ pub(crate) fn format_ssids(ssids: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCAN_SSIDS, configured_hint_frequencies, next_scan_ssids};
+    use super::{
+        BssInfo, MAX_SCAN_SSIDS, best_scan_candidate,
+        configured_hint_frequencies, next_scan_ssids,
+    };
     use crate::NetworkConfig;
 
     fn ssids(names: &[&str]) -> Vec<String> {
@@ -1155,5 +1179,117 @@ mod tests {
             configured_hint_frequencies(&[a, b, c]),
             vec![2412, 5180, 5765]
         );
+    }
+
+    fn candidate(
+        ssid: &str,
+        signal_dbm: i32,
+        bssid_last: u8,
+        prefered: bool,
+    ) -> (BssInfo, NetworkConfig) {
+        let mut network = NetworkConfig::new(ssid);
+        network.prefered = prefered;
+        (
+            BssInfo {
+                bssid: [0x02, 0x00, 0x00, 0x00, 0x01, bssid_last],
+                signal_dbm,
+                ..Default::default()
+            },
+            network,
+        )
+    }
+
+    #[test]
+    fn preferred_ssid_beats_stronger_non_preferred_signal() {
+        let candidates = vec![
+            candidate("Strong", -50, 1, false),
+            candidate("Preferred", -70, 2, true),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Preferred");
+        assert_eq!(bss.signal_dbm, -70);
+    }
+
+    #[test]
+    fn weak_preferred_ssid_is_ignored() {
+        let candidates = vec![
+            candidate("Strong", -50, 1, false),
+            candidate(
+                "Preferred",
+                crate::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM - 1,
+                2,
+                true,
+            ),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Strong");
+        assert_eq!(bss.signal_dbm, -50);
+    }
+
+    #[test]
+    fn preferred_ssid_at_critical_threshold_still_wins() {
+        let candidates = vec![
+            candidate("Strong", -50, 1, false),
+            candidate(
+                "Preferred",
+                crate::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
+                2,
+                true,
+            ),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Preferred");
+        assert_eq!(bss.signal_dbm, -80);
+    }
+
+    #[test]
+    fn strongest_bss_wins_when_no_preferred_ssid_is_found() {
+        let candidates = vec![
+            candidate("Weak", -80, 1, false),
+            candidate("Strong", -40, 2, false),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Strong");
+        assert_eq!(bss.signal_dbm, -40);
+    }
+
+    #[test]
+    fn weak_preferred_ssid_does_not_block_stronger_preferred_ssid() {
+        let candidates = vec![
+            candidate(
+                "Preferred-Weak",
+                crate::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM - 5,
+                1,
+                true,
+            ),
+            candidate("Preferred-Strong", -75, 2, true),
+            candidate("Non-Preferred", -40, 3, false),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Preferred-Strong");
+        assert_eq!(bss.signal_dbm, -75);
+    }
+
+    #[test]
+    fn strongest_bss_of_preferred_ssids_wins() {
+        let candidates = vec![
+            candidate("Preferred-A", -70, 1, true),
+            candidate("Preferred-B", -60, 2, true),
+            candidate("Strong", -40, 3, false),
+        ];
+        let (bss, network) =
+            best_scan_candidate(&candidates).expect("candidate selected");
+        assert_eq!(network.ssid, "Preferred-B");
+        assert_eq!(bss.signal_dbm, -60);
+    }
+
+    #[test]
+    fn best_scan_candidate_returns_none_for_empty_results() {
+        assert!(best_scan_candidate(&[]).is_none());
     }
 }

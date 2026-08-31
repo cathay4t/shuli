@@ -47,6 +47,8 @@ wifis:
   - ssid: Test-WIFI
     password: "12345678"
     # hidden: true # AP hides its SSID; probe for it by name
+    # prefered: true # pick this SSID before stronger BSSes of other
+    #                # configured SSIDs while it is found
     # wowlan: true # arm WoWLAN triggers (disconnect, GTK rekey
     #              # failure) while connected; off by default
     dns:

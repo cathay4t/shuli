@@ -63,6 +63,12 @@ pub(crate) struct WifiEntry {
     /// (default) are found by the wildcard probe every scan carries.
     #[serde(default)]
     pub hidden: bool,
+    /// Preferred SSID for scan-result selection: when found with a signal
+    /// at or above `shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`, this
+    /// network is chosen before a stronger BSS of another configured
+    /// SSID. Defaults to `false`.
+    #[serde(default)]
+    pub prefered: bool,
     /// Signal-triggered roaming while connected to this SSID: `false`
     /// disables it (BTM / 802.11v Requests are still honoured).
     /// Defaults to `true`.
@@ -212,6 +218,7 @@ impl ShuliConfig {
                 network.set_password(password);
             }
             network.hidden = entry.hidden;
+            network.prefered = entry.prefered;
             network.roaming = entry.roaming;
             network.roaming_threshold = entry.roaming_threshold;
             network.switch_ssid_lower_than_dbm =
@@ -363,6 +370,27 @@ wifis:
         );
         let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(wifi.networks[0].hidden);
+    }
+
+    #[test]
+    fn prefered_defaults_to_false_and_maps_true() {
+        let config = parse(MINIMAL_YAML);
+        assert!(!config.wifis[0].prefered);
+
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(!wifi.networks[0].prefered);
+
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    prefered: true
+",
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert!(wifi.networks[0].prefered);
     }
 
     #[test]

@@ -6,6 +6,10 @@
    `run_multi()` when managing multiple interfaces.
 
 ### New features
+ - Add per-network `prefered` flag: a preferred SSID found in scan
+   results wins over stronger BSSes of other configured SSIDs; it is
+   ignored when its signal is below
+   `DEFAULT_SWITCH_SSID_LOWER_THAN_DBM` (-80 dBm).
  * One `WifiClient` per network namespace: all interfaces share one
    nl80211 socket and one event dispatcher that routes multicast events
    by `IFINDEX`.

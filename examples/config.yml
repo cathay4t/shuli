@@ -24,6 +24,8 @@ wifis:
     # ext_key_id: true # extended key id (driver must support it)
     # roaming: true
     # roaming_threshold: -70
+    # prefered: true # choose this SSID over stronger APs of other
+    #                # configured SSIDs while its signal is usable
     # wowlan: true # arm WoWLAN (disconnect + GTK rekey failure) while
     #              # connected; off by default
     # eap: # WPA2-Enterprise / 802.1X (EAP-TLS)

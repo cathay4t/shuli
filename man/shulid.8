@@ -38,6 +38,7 @@ wifis:
     interface: any
     roaming: true
     roaming_threshold: -70
+    prefered: true
     sae_pwe: auto
     wowlan: true
     dns:
@@ -61,6 +62,13 @@ Omit for open networks.
 \fBtrue\fR when the AP does not broadcast its SSID and only answers
 probe requests that carry the network name; shuli then probes for this
 SSID by name (default \fBfalse\fR).
+.TP
+.B prefered
+Preferred SSID for scan-result selection: when this network is found
+with a signal at or above \fB-80\fR dBm (the critical switch level),
+it is chosen before a stronger BSS of another configured SSID. When
+several SSIDs are preferred, the strongest one wins. Default
+\fBfalse\fR.
 .TP
 .B interface
 Interface to bind to; \fBany\fR (or omitted) picks the first

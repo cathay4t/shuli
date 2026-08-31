@@ -447,6 +447,7 @@ mod tests {
             ssid: ssid.to_string(),
             password: None,
             hidden: false,
+            prefered: false,
             roaming: true,
             roaming_threshold: shuli::DEFAULT_ROAM_THRESHOLD_DBM,
             switch_ssid_lower_than_dbm:
