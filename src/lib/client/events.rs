@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use wl_nl80211::{
-    Ieee80211AkmSuite, Ieee80211AuthFrameSae, Ieee80211EapolEapFrame,
-    Ieee80211EapolKeyFrame, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
-    Nl80211WowlanWakeup,
+    Ieee80211ActionFrame, Ieee80211AkmSuite, Ieee80211AuthFrame,
+    Ieee80211EapolEapFrame, Ieee80211EapolKeyFrame, Ieee80211Frame,
+    Nl80211AuthType, Nl80211Command, Nl80211UseMfp, Nl80211WowlanWakeup,
 };
 
 use super::{
@@ -55,21 +55,25 @@ impl WifiIface {
 
     pub(crate) async fn handle_event(&mut self, event: Nl80211Event) {
         match event {
-            Nl80211Event::Frame { frame } => {
-                // Registered management frames reach us here: SAE auth
-                // frames during authentication, and WNM action frames
-                // (BTM Requests) while connected.
-                if frame.len() > 24
-                    && frame[24] == crate::ieee80211::wnm::WNM_ACTION_CATEGORY
-                {
+            Nl80211Event::Frame(Ieee80211Frame::Auth(auth)) => {
+                self.handle_auth_frame(&auth).await;
+            }
+            Nl80211Event::Frame(Ieee80211Frame::Action(action)) => match action
+            {
+                Ieee80211ActionFrame::BtmRequest(frame) => {
                     self.handle_wnm_frame(&frame).await;
-                } else if frame.len() > 24
-                    && frame[24] == crate::ieee80211::rrm::RRM_ACTION_CATEGORY
-                {
-                    self.handle_rrm_frame(&frame).await;
-                } else {
-                    self.handle_auth_frame(&frame).await;
                 }
+                Ieee80211ActionFrame::NeighborReportResponse(frame) => {
+                    self.handle_rrm_frame(&frame).await;
+                }
+                other => log::debug!(
+                    "unhandled Action frame: category={} action={}",
+                    other.category(),
+                    other.action()
+                ),
+            },
+            Nl80211Event::Frame(Ieee80211Frame::Other { raw, .. }) => {
+                log::debug!("unhandled management frame: {} bytes", raw.len());
             }
 
             Nl80211Event::Authenticated { status, frame } => {
@@ -279,7 +283,12 @@ impl WifiIface {
                 } else if let Some(frame) = frame {
                     // SAE: the auth frame carries the AP's commit
                     // (transaction 1) or confirm (transaction 2).
-                    self.handle_auth_frame(&frame).await;
+                    match Ieee80211AuthFrame::parse(&frame) {
+                        Ok(auth) => self.handle_auth_frame(&auth).await,
+                        Err(e) => log::debug!(
+                            "malformed auth frame in AUTHENTICATE event: {e}"
+                        ),
+                    }
                 } else if status != Ieee80211StatusCode::Success {
                     log::warn!("AUTHENTICATE failed: status={status}");
                     let err = if status == Ieee80211StatusCode::ChallengeFail {
@@ -668,13 +677,13 @@ impl WifiIface {
 
     /// Feed an 802.11 management frame (or the auth frame embedded in an
     /// AUTHENTICATE event) into the active auth method.
-    pub(crate) async fn handle_auth_frame(&mut self, frame: &[u8]) {
-        let sae = match Ieee80211AuthFrameSae::parse(frame) {
-            Ok(sae) => sae,
-            Err(e) => {
-                log::debug!("received mgmt frame: {} bytes ({e})", frame.len());
-                return;
-            }
+    pub(crate) async fn handle_auth_frame(
+        &mut self,
+        auth: &Ieee80211AuthFrame,
+    ) {
+        let Some(sae) = auth.sae() else {
+            log::debug!("received non-SAE auth frame");
+            return;
         };
         // Only frames from the AP we are authenticating with belong to
         // this exchange. On a shared medium (and in the wild: two STAs

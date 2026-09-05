@@ -18,7 +18,12 @@
 use aws_lc_rs::rand::SecureRandom;
 use futures::StreamExt;
 use wl_nl80211::{
-    Ieee80211AuthFrameFastBssTransition, Ieee80211StatusCode, Nl80211Associate,
+    Ieee80211ActionFrame, Ieee80211ActionFrameBtmRequest,
+    Ieee80211ActionFrameBtmResponse, Ieee80211ActionFrameNeighborReportRequest,
+    Ieee80211ActionFrameNeighborReportResponse,
+    Ieee80211AuthFrameFastBssTransition, Ieee80211BtmRequest,
+    Ieee80211BtmResponse, Ieee80211Frame, Ieee80211NeighborReportRequest,
+    Ieee80211NeighborReportResponse, Ieee80211StatusCode, Nl80211Associate,
     Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm, Nl80211CqmAttr,
     Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent, Nl80211UseMfp,
 };
@@ -33,25 +38,10 @@ use crate::{
         },
         handshake4::FourWayState,
     },
-    ieee80211::{
-        elements,
-        rrm::{
-            NEIGHBOR_REPORT_RESPONSE_ACTION, RRM_ACTION_CATEGORY,
-            build_neighbor_report_request, parse_neighbor_report_response,
-        },
-        wnm::{
-            BTM_REQUEST_ACTION, BTM_STATUS_ACCEPT,
-            BTM_STATUS_REJECT_UNSPECIFIED, BtmRequest, WNM_ACTION_CATEGORY,
-            build_btm_response, parse_btm_request,
-        },
-    },
+    ieee80211::elements,
     nl80211::{ClientEvent, parse_client_event},
     scan::{BssInfo, SecurityType},
 };
-
-/// IEEE 802.11 management frame type for Action frames:
-/// type 0 (management) | subtype 13 (action) << 4.
-const FRAME_TYPE_ACTION: u16 = 0x00d0;
 
 /// Pause signal-triggered roaming for this long after a completed roam.
 const ROAM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -131,18 +121,18 @@ impl WifiIface {
     pub(crate) async fn register_roam_frames(&mut self) {
         let attrs =
             wl_nl80211::Nl80211RegisterFrame::new(self.core.nl.if_index)
-                .frame_type(FRAME_TYPE_ACTION)
-                .frame_match(vec![WNM_ACTION_CATEGORY])
+                .frame_type(Ieee80211ActionFrame::FRAME_TYPE)
+                .frame_match(vec![Ieee80211BtmRequest::CATEGORY])
                 .build();
         if let Err(e) = self.core.nl.register_frame(attrs).await {
             log::debug!("register WNM action frames failed: {e}");
         }
         let attrs =
             wl_nl80211::Nl80211RegisterFrame::new(self.core.nl.if_index)
-                .frame_type(FRAME_TYPE_ACTION)
+                .frame_type(Ieee80211ActionFrame::FRAME_TYPE)
                 .frame_match(vec![
-                    RRM_ACTION_CATEGORY,
-                    NEIGHBOR_REPORT_RESPONSE_ACTION,
+                    Ieee80211NeighborReportRequest::CATEGORY,
+                    Ieee80211NeighborReportResponse::ACTION,
                 ])
                 .build();
         if let Err(e) = self.core.nl.register_frame(attrs).await {
@@ -554,15 +544,10 @@ impl WifiIface {
 
     /// Handle a received WNM action frame (registered via
     /// [`register_roam_frames`]).
-    pub(crate) async fn handle_wnm_frame(&mut self, frame: &[u8]) {
-        // 24-byte 802.11 header, then category / action / body.
-        if frame.len() < 27 || frame[24] != WNM_ACTION_CATEGORY {
-            return;
-        }
-        if frame[25] != BTM_REQUEST_ACTION {
-            log::debug!("WNM action {} ignored", frame[25]);
-            return;
-        }
+    pub(crate) async fn handle_wnm_frame(
+        &mut self,
+        frame: &Ieee80211ActionFrameBtmRequest,
+    ) {
         if !matches!(
             self.state,
             WifiState::ConnectedWithoutOffloadRekey
@@ -570,10 +555,7 @@ impl WifiIface {
         ) {
             return;
         }
-        let Some(btm) = parse_btm_request(&frame[26..]) else {
-            log::warn!("malformed BTM Request; ignored");
-            return;
-        };
+        let btm = &frame.request;
         log::info!(
             "BTM Request: dialog={} candidates={} preferred={}",
             btm.dialog_token,
@@ -606,12 +588,12 @@ impl WifiIface {
             }
         }
 
-        let target = self.pick_btm_target(&btm);
+        let target = self.pick_btm_target(btm);
         match target {
             Some(target) => {
                 self.send_btm_response(
                     btm.dialog_token,
-                    BTM_STATUS_ACCEPT,
+                    Ieee80211BtmResponse::STATUS_ACCEPT,
                     target.bssid,
                 )
                 .await;
@@ -621,7 +603,7 @@ impl WifiIface {
                 log::info!("no usable BTM candidate; rejecting");
                 self.send_btm_response(
                     btm.dialog_token,
-                    BTM_STATUS_REJECT_UNSPECIFIED,
+                    Ieee80211BtmResponse::STATUS_REJECT_UNSPECIFIED,
                     [0u8; ETH_ALEN],
                 )
                 .await;
@@ -633,27 +615,17 @@ impl WifiIface {
     /// [`register_roam_frames`]): the 802.11k Neighbor Report Response
     /// answers our outstanding request. Its entries widen the quick-scan
     /// frequency set with the channels the AP reports as ESS neighbors.
-    pub(crate) async fn handle_rrm_frame(&mut self, frame: &[u8]) {
-        // 24-byte 802.11 header, then category / action / body.
-        if frame.len() < 27 || frame[24] != RRM_ACTION_CATEGORY {
-            return;
-        }
-        if frame[25] != NEIGHBOR_REPORT_RESPONSE_ACTION {
-            log::debug!("RRM action {} ignored", frame[25]);
-            return;
-        }
+    pub(crate) async fn handle_rrm_frame(
+        &mut self,
+        frame: &Ieee80211ActionFrameNeighborReportResponse,
+    ) {
         let Some(dialog) = self.roam.pending_nr_dialog else {
             log::trace!(
                 "802.11k Neighbor Report Response without pending request"
             );
             return;
         };
-        let Some(response) = parse_neighbor_report_response(&frame[26..])
-        else {
-            log::warn!("malformed 802.11k Neighbor Report Response; ignored");
-            self.roam.pending_nr_dialog = None;
-            return;
-        };
+        let response = &frame.response;
         if response.dialog_token != dialog {
             log::debug!(
                 "802.11k response dialog {} != pending {}; ignored",
@@ -713,7 +685,14 @@ impl WifiIface {
         // iwd uses a constant non-zero dialog token: at most one request
         // is outstanding and we match the response by token.
         let dialog = 1;
-        let frame = self.action_frame(build_neighbor_report_request(dialog));
+        let action_frame: Ieee80211ActionFrame =
+            Ieee80211ActionFrameNeighborReportRequest::new(
+                self.core.nl.mac,
+                self.link.bss_info.bssid,
+                Ieee80211NeighborReportRequest::new(dialog),
+            )
+            .into();
+        let frame = action_frame.to_bytes();
         let attrs = wl_nl80211::Nl80211Frame::new(self.core.nl.if_index)
             .frame(frame)
             .frequency(self.link.bss_info.freq_mhz)
@@ -743,12 +722,14 @@ impl WifiIface {
                     if let Some(event) = parse_client_event(raw_msg) {
                         match event {
                             ClientEvent::Nl80211(
-                                wl_nl80211::Nl80211Event::Frame { frame },
-                            ) if frame.len() > 25
-                                && frame[24] == RRM_ACTION_CATEGORY
-                                && frame[25]
-                                    == NEIGHBOR_REPORT_RESPONSE_ACTION =>
-                            {
+                                wl_nl80211::Nl80211Event::Frame(
+                                    Ieee80211Frame::Action(
+                                        Ieee80211ActionFrame::NeighborReportResponse(
+                                            frame,
+                                        ),
+                                    ),
+                                ),
+                            ) => {
                                 self.handle_rrm_frame(&frame).await;
                                 if self.roam.pending_nr_dialog.is_none() {
                                     return;
@@ -781,24 +762,13 @@ impl WifiIface {
         );
     }
 
-    /// Build a complete Action frame (24-byte 802.11 header addressed to
-    /// the current AP, then the category/action/body payload).
-    fn action_frame(&self, body: Vec<u8>) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(24 + body.len());
-        frame.extend_from_slice(&FRAME_TYPE_ACTION.to_le_bytes());
-        frame.extend_from_slice(&[0, 0]); // duration
-        frame.extend_from_slice(&self.link.bss_info.bssid); // DA = AP
-        frame.extend_from_slice(&self.core.nl.mac); // SA
-        frame.extend_from_slice(&self.link.bss_info.bssid); // BSSID
-        frame.extend_from_slice(&[0, 0]); // sequence control
-        frame.extend_from_slice(&body);
-        frame
-    }
-
     /// Choose a roam target from a BTM candidate list: candidates are in
     /// preference order; each must match the last scan results and the
     /// network's security family, and differ from the current BSS.
-    fn pick_btm_target(&mut self, btm: &BtmRequest) -> Option<BssInfo> {
+    fn pick_btm_target(
+        &mut self,
+        btm: &Ieee80211BtmRequest,
+    ) -> Option<BssInfo> {
         for candidate in &btm.candidates {
             if candidate.bssid == self.link.bss_info.bssid {
                 continue;
@@ -837,11 +807,14 @@ impl WifiIface {
         status: u8,
         target_bssid: [u8; ETH_ALEN],
     ) {
-        let frame = self.action_frame(build_btm_response(
-            dialog_token,
-            status,
-            target_bssid,
-        ));
+        let action_frame: Ieee80211ActionFrame =
+            Ieee80211ActionFrameBtmResponse::new(
+                self.core.nl.mac,
+                self.link.bss_info.bssid,
+                Ieee80211BtmResponse::new(dialog_token, status, target_bssid),
+            )
+            .into();
+        let frame = action_frame.to_bytes();
 
         let attrs = wl_nl80211::Nl80211Frame::new(self.core.nl.if_index)
             .frame(frame)

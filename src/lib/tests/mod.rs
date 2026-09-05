@@ -11,7 +11,5 @@ mod eap;
 mod eap_tls;
 mod elements;
 mod pmksa;
-mod rrm;
 mod scan;
 mod wifi_integration;
-mod wnm;
