@@ -12,8 +12,9 @@
 //! MIC (RFC 8110 Table 2).
 
 use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
+use wl_nl80211::Ieee80211EapolKeyFrame;
 
-use crate::{ErrorKind, WifiError, crypto::kdf, ieee80211::eapol};
+use crate::{ErrorKind, WifiError, crypto::kdf};
 
 pub(crate) const KCK_LEN: usize = 16;
 pub(crate) const KEK_LEN: usize = 16;
@@ -304,7 +305,7 @@ impl FourWayState {
         &mut self,
         anonce: &[u8; 32],
         replay_counter: u64,
-        key_info: u16,
+        desc_version: u16,
     ) -> Result<Vec<u8>, WifiError> {
         aws_lc_rs::rand::SystemRandom::new()
             .fill(&mut self.snonce)
@@ -315,7 +316,7 @@ impl FourWayState {
         // 0 (AKM-defined) for SAE/OWE, 2 (HMAC-SHA1) for WPA2-PSK and
         // 3 (AES-128-CMAC) for FT-PSK (802.11-2020 §12.7.2); hostapd
         // rejects a Message 2 that uses another version.
-        self.desc_version = eapol::desc_version(key_info);
+        self.desc_version = desc_version;
         self.ptk = Some(self.derive_ptk());
 
         let kck = self.kck().unwrap();
@@ -329,14 +330,17 @@ impl FourWayState {
             key_data
                 .extend_from_slice(&crate::crypto::ocv::build_oci_kde(&oci));
         }
-        let mut msg2 = eapol::build_message_2(
+        let mut msg2 = Ieee80211EapolKeyFrame::build_message_2(
             &self.snonce,
             self.replay_counter,
             &key_data,
             self.desc_version,
         );
-        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
-        eapol::set_mic(&mut msg2, &mic);
+        let mic = self.compute_mic(
+            &kck,
+            &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2),
+        )?;
+        Ieee80211EapolKeyFrame::set_mic(&mut msg2, &mic);
 
         Ok(msg2)
     }
@@ -348,7 +352,7 @@ impl FourWayState {
     /// downgrade protection before returning).
     pub fn process_message_3(
         &mut self,
-        frame: &eapol::EapolKeyFrame,
+        frame: &Ieee80211EapolKeyFrame,
     ) -> Result<(Vec<u8>, KeyDataKdes), WifiError> {
         // 802.11-2020 §12.7.6.4: replay counter must be >= Message 1's.
         if frame.replay_counter < self.replay_counter {
@@ -367,8 +371,10 @@ impl FourWayState {
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
-        let expected =
-            self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
+        let expected = self.compute_mic(
+            &kck,
+            &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
+        )?;
         if expected != frame.key_mic {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
@@ -425,13 +431,16 @@ impl FourWayState {
         }
 
         // Build Message 4 (zeroed MIC) and compute its MIC.
-        let mut msg4 = eapol::build_message_4(
+        let mut msg4 = Ieee80211EapolKeyFrame::build_message_4(
             &self.snonce,
             self.replay_counter,
             self.desc_version,
         );
-        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg4))?;
-        eapol::set_mic(&mut msg4, &mic);
+        let mic = self.compute_mic(
+            &kck,
+            &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg4),
+        )?;
+        Ieee80211EapolKeyFrame::set_mic(&mut msg4, &mic);
 
         Ok((msg4, kdes))
     }
@@ -490,7 +499,7 @@ impl FourWayState {
     /// returns the Group Message 2 PDU to send back.
     pub fn process_group_rekey(
         &mut self,
-        frame: &eapol::EapolKeyFrame,
+        frame: &Ieee80211EapolKeyFrame,
     ) -> Result<Vec<u8>, WifiError> {
         // 802.11-2020 §12.7.7.1: replay counter must be strictly greater
         // than the last accepted value.
@@ -510,8 +519,10 @@ impl FourWayState {
         })?;
 
         // Verify MIC over the received PDU with the MIC field zeroed.
-        let expected =
-            self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&frame.raw))?;
+        let expected = self.compute_mic(
+            &kck,
+            &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
+        )?;
         if expected != frame.key_mic {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
@@ -549,13 +560,16 @@ impl FourWayState {
         self.gtk = Some(gtk);
 
         // Build Group Message 2 (zeroed MIC) and compute its MIC.
-        let mut msg2 = eapol::build_group_message_2(
+        let mut msg2 = Ieee80211EapolKeyFrame::build_group_message_2(
             self.replay_counter,
             &frame.key_rsc,
-            eapol::desc_version(frame.key_info),
+            frame.desc_version(),
         );
-        let mic = self.compute_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2))?;
-        eapol::set_mic(&mut msg2, &mic);
+        let mic = self.compute_mic(
+            &kck,
+            &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2),
+        )?;
+        Ieee80211EapolKeyFrame::set_mic(&mut msg2, &mic);
 
         Ok(msg2)
     }

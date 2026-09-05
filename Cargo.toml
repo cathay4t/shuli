@@ -11,7 +11,6 @@ edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 documentation = "https://github.com/cathay4t/shuli"
-homepage = "https://github.com/cathay4t/shuli"
 repository = "https://github.com/cathay4t/shuli"
 
 [workspace.dependencies]
@@ -27,7 +26,6 @@ netlink-packet-generic = "0.5"
 genetlink = "0.3"
 netlink-proto = "0.13"
 netlink-sys = "0.9"
-netlink-packet-route = "0.33"
 rtnetlink = "0.23"
 wl-nl80211 = { git = "https://github.com/rust-netlink/wl-nl80211.git" }
 mozim = { version = "0.3.2", default-features = false, features = ["netlink"] }

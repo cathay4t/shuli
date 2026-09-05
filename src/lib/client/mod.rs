@@ -30,7 +30,7 @@ use crate::{
         owe::{self, OweAuth},
     },
     eap::{EapAction, EapPacket, EapPeer},
-    ieee80211::{auth, eapol, elements},
+    ieee80211::elements,
     pmksa::{
         PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
         PmksaEntry, entry_with_fresh_lifetime,

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use wl_nl80211::{
-    Ieee80211AkmSuite, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
+    Ieee80211AkmSuite, Ieee80211AuthFrameSae, Ieee80211EapolEapFrame,
+    Ieee80211EapolKeyFrame, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
     Nl80211WowlanWakeup,
 };
 
@@ -10,7 +11,7 @@ use super::{
     Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, Nl80211Authenticate,
     Nl80211Event, Nl80211Key, Nl80211KeyDefaultType, Nl80211RekeyOffload,
     OweAuth, RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError,
-    WifiIface, WifiState, auth, eapol, elements, fatal_disconnect_error,
+    WifiIface, WifiState, elements, fatal_disconnect_error,
     fmt_transition_disable, is_fatal_disconnect_reason, owe,
     wowlan_wakeup_requires_reconnect,
 };
@@ -668,31 +669,34 @@ impl WifiIface {
     /// Feed an 802.11 management frame (or the auth frame embedded in an
     /// AUTHENTICATE event) into the active auth method.
     pub(crate) async fn handle_auth_frame(&mut self, frame: &[u8]) {
+        let sae = match Ieee80211AuthFrameSae::parse(frame) {
+            Ok(sae) => sae,
+            Err(e) => {
+                log::debug!("received mgmt frame: {} bytes ({e})", frame.len());
+                return;
+            }
+        };
         // Only frames from the AP we are authenticating with belong to
         // this exchange. On a shared medium (and in the wild: two STAs
         // of neighbouring APs hear each other) the SAE frames of a
         // parallel exchange would otherwise corrupt ours - e.g. the
         // peer's confirm fails its own send-confirm check and the
         // handshake aborts. wpa_supplicant filters the same way.
-        if frame.len() >= 16 && frame[10..16] != self.link.bss_info.bssid {
+        if sae.bssid != self.link.bss_info.bssid {
             log::debug!(
                 "ignoring auth frame from {:02x?} (expecting {:02x?})",
-                &frame[10..16],
+                sae.sa,
                 self.link.bss_info.bssid
             );
             return;
         }
-        let Some((auth_seq, status_code, payload)) =
-            auth::parse_sae_auth_frame(frame)
-        else {
-            log::debug!("received mgmt frame: {} bytes", frame.len());
-            return;
-        };
+        let auth_seq = sae.transaction;
+        let status_code = u16::from(sae.status_code);
         log::debug!("auth frame: seq={auth_seq}, status={status_code}");
 
         let action = match self.auth.method.as_mut() {
             Some(auth) => {
-                match auth.process_frame(auth_seq, status_code, &payload) {
+                match auth.process_frame(auth_seq, status_code, sae.body()) {
                     Ok(action) => action,
                     Err(e) => {
                         // SAE crypto failure (wrong password / confirm
@@ -926,19 +930,19 @@ impl WifiIface {
     pub(crate) async fn handle_control_port_frame(&mut self, frame: &[u8]) {
         // 802.1X EAP frames (EAPOL type 0) arrive on the
         // same control port as EAPOL-Key frames.
-        if let Some(eap_pdu) = eapol::parse_eapol_eap_frame(frame) {
-            self.handle_eap_frame(eap_pdu).await;
+        if let Some(eap) = Ieee80211EapolEapFrame::parse(frame) {
+            self.handle_eap_frame(&eap.payload).await;
             return;
         }
 
-        let Some(parsed) = eapol::parse_eapol_key_frame(frame) else {
+        let Some(parsed) = Ieee80211EapolKeyFrame::parse(frame) else {
             log::debug!("unparseable control port frame");
             return;
         };
 
         log::debug!(
             "EAPOL-Key: info={} replay={}",
-            eapol::fmt_key_info(parsed.key_info),
+            parsed.fmt_key_info(),
             parsed.replay_counter
         );
 
@@ -1187,7 +1191,7 @@ impl WifiIface {
                 match fw.process_message_1(
                     &parsed.key_nonce,
                     parsed.replay_counter,
-                    parsed.key_info,
+                    parsed.desc_version(),
                 ) {
                     Ok(msg2) => msg2,
                     Err(e) => {
@@ -1513,7 +1517,7 @@ impl WifiIface {
         };
         match peer.handle_packet(&packet) {
             Ok(EapAction::Respond(response)) => {
-                let frame = eapol::build_eapol_eap_frame(&response);
+                let frame = Ieee80211EapolEapFrame::build(&response);
                 if let Err(e) = self
                     .core
                     .nl

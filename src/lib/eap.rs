@@ -5,8 +5,8 @@
 //!
 //! Shared by WiFi 802.1X (EAP over the nl80211 control
 //! port) and wired 802.1X (EAPOL over Ethernet).  The EAPOL
-//! framing itself lives in [`crate::ieee80211::eapol`]; this module
-//! handles the EAP packet codec and the peer state machine.
+//! framing itself lives in [`wl_nl80211::Ieee80211EapolEapFrame`];
+//! this module handles the EAP packet codec and the peer state machine.
 
 use crate::{ErrorKind, WifiError};
 

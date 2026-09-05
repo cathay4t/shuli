@@ -18,9 +18,9 @@
 use aws_lc_rs::rand::SecureRandom;
 use futures::StreamExt;
 use wl_nl80211::{
-    Nl80211Associate, Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm,
-    Nl80211CqmAttr, Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent,
-    Nl80211UseMfp,
+    Ieee80211AuthFrameFastBssTransition, Ieee80211StatusCode, Nl80211Associate,
+    Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm, Nl80211CqmAttr,
+    Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent, Nl80211UseMfp,
 };
 
 use crate::{
@@ -1088,29 +1088,29 @@ impl WifiIface {
             WifiError::new(ErrorKind::Roaming, "no FT context")
         })?;
 
-        // 24-byte header, alg(2) seq(2) status(2), then IEs.
-        if frame.len() < 30 {
+        let auth =
+            Ieee80211AuthFrameFastBssTransition::parse(frame).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::Roaming,
+                    format!("malformed FT authentication frame: {e}"),
+                )
+            })?;
+        if auth.transaction != 2 {
             return Err(WifiError::new(
                 ErrorKind::Roaming,
-                "short FT authentication frame",
+                format!("unexpected FT auth frame seq={}", auth.transaction),
             ));
         }
-        let alg = u16::from_le_bytes([frame[24], frame[25]]);
-        let seq = u16::from_le_bytes([frame[26], frame[27]]);
-        let status = u16::from_le_bytes([frame[28], frame[29]]);
-        if alg != 2 || seq != 2 {
+        if auth.status_code != Ieee80211StatusCode::Success {
             return Err(WifiError::new(
                 ErrorKind::Roaming,
-                format!("unexpected FT auth frame alg={alg} seq={seq}"),
+                format!(
+                    "FT authentication rejected: status={}",
+                    u16::from(auth.status_code)
+                ),
             ));
         }
-        if status != 0 {
-            return Err(WifiError::new(
-                ErrorKind::Roaming,
-                format!("FT authentication rejected: status={status}"),
-            ));
-        }
-        let ies = &frame[30..];
+        let ies = auth.body();
 
         let mdie = elements::find_ie(ies, elements::IE_ID_MDIE)
             .and_then(elements::parse_mdie)

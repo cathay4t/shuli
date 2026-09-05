@@ -14,13 +14,13 @@ use std::{
 };
 
 use tokio::io::unix::AsyncFd;
+use wl_nl80211::Ieee80211EapolEapFrame;
 
 use crate::{
     ErrorKind, WifiError,
     config::EapConfig,
     eap::{EapAction, EapPacket, EapPeer},
     eap_tls::EapTlsMethod,
-    ieee80211::eapol::{build_eapol_eap_frame, parse_eapol_eap_frame},
 };
 
 /// PAE group address used for EAPOL on wired links (802.1X-2010).
@@ -138,11 +138,11 @@ impl WiredClient {
     /// Feed one received EAPOL frame into the EAP peer and send the
     /// response (if any).
     fn handle_eapol(&mut self, frame: &[u8]) -> Result<(), WifiError> {
-        let Some(eap_pdu) = parse_eapol_eap_frame(frame) else {
+        let Some(eap) = Ieee80211EapolEapFrame::parse(frame) else {
             log::debug!("ignoring non-EAP EAPOL frame ({} bytes)", frame.len());
             return Ok(());
         };
-        let Some(packet) = EapPacket::parse(eap_pdu) else {
+        let Some(packet) = EapPacket::parse(&eap.payload) else {
             log::warn!("unparseable EAP packet");
             return Ok(());
         };
@@ -152,7 +152,7 @@ impl WiredClient {
                     self.fd.as_raw_fd(),
                     self.if_index,
                     &self.mac,
-                    &build_eapol_eap_frame(&response),
+                    &Ieee80211EapolEapFrame::build(&response),
                 )?;
             }
             EapAction::Success => {

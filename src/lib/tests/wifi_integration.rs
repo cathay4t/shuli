@@ -32,6 +32,7 @@ use std::{
 
 use rustls::{ServerConfig, ServerConnection};
 use tokio::sync::Mutex;
+use wl_nl80211::{Ieee80211EapolEapFrame, Ieee80211EapolKeyFrame};
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
@@ -40,9 +41,6 @@ use crate::{
     eap_tls::{
         EAP_TLS_FLAG_START, build_tls_message, cert_from_pem, key_from_pem,
         parse_tls_message,
-    },
-    ieee80211::eapol::{
-        build_eapol_eap_frame, build_eapol_key_pdu, parse_eapol_eap_frame,
     },
     wired::{open_eapol_socket, recv_eapol_frame, send_eapol_frame},
 };
@@ -439,7 +437,7 @@ fn run_wired_authenticator() {
         fd.as_raw_fd(),
         if_index,
         &mac,
-        &build_eapol_eap_frame(&identity),
+        &Ieee80211EapolEapFrame::build(&identity),
     )
     .unwrap();
     // Read the client's EAP-Response/Identity before starting TLS.
@@ -457,7 +455,7 @@ fn run_wired_authenticator() {
         fd.as_raw_fd(),
         if_index,
         &mac,
-        &build_eapol_eap_frame(&start),
+        &Ieee80211EapolEapFrame::build(&start),
     )
     .unwrap();
 
@@ -466,9 +464,9 @@ fn run_wired_authenticator() {
     let mut tx = Vec::new();
     loop {
         let frame = recv_wired_auth(&fd);
-        let eap_pdu =
-            parse_eapol_eap_frame(&frame).expect("authenticator EAPOL");
-        let packet = EapPacket::parse(eap_pdu).expect("authenticator EAP");
+        let eap =
+            Ieee80211EapolEapFrame::parse(&frame).expect("authenticator EAPOL");
+        let packet = EapPacket::parse(&eap.payload).expect("authenticator EAP");
         assert_eq!(
             packet.type_,
             Some(TYPE_TLS),
@@ -496,7 +494,7 @@ fn run_wired_authenticator() {
                     fd.as_raw_fd(),
                     if_index,
                     &mac,
-                    &build_eapol_eap_frame(&msg),
+                    &Ieee80211EapolEapFrame::build(&msg),
                 )
                 .unwrap();
                 tx.clear();
@@ -508,7 +506,7 @@ fn run_wired_authenticator() {
                 fd.as_raw_fd(),
                 if_index,
                 &mac,
-                &build_eapol_eap_frame(&success),
+                &Ieee80211EapolEapFrame::build(&success),
             )
             .unwrap();
             return;
@@ -525,7 +523,7 @@ fn run_wired_authenticator() {
                 fd.as_raw_fd(),
                 if_index,
                 &mac,
-                &build_eapol_eap_frame(&msg),
+                &Ieee80211EapolEapFrame::build(&msg),
             )
             .unwrap();
             tx.clear();
@@ -2257,7 +2255,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
     // association response event, as seen against SweatHome5G. With no FT
     // context yet, it must be buffered - never answered with a Message 2
     // carrying the old PMKR1Name.
-    let msg1 = build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         0x0088, // ACK | Pairwise, KDV 0 (AKM-defined for FT-SAE)
         16,
         1,

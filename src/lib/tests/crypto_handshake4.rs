@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_lc_rs::key_wrap::{self, KeyWrap};
+use wl_nl80211::Ieee80211EapolKeyFrame;
 
 use crate::{
     ErrorKind, WifiError,
@@ -13,7 +14,6 @@ use crate::{
         kdf::hmac_sha256_mic,
         ocv::{build_oci_kde, parse_oci_kde},
     },
-    ieee80211::eapol,
 };
 
 fn aes_key_wrap(
@@ -79,7 +79,7 @@ fn test_psk_sha256_kdv3_handshake() {
     // Message 1 with Key Descriptor Version 3 (AES-128-CMAC), as sent
     // by a PSK-SHA256 AP.
     let msg1_key_info = 0x0080 | 0x0008 | 0x0003; // ack + pairwise + KDV 3
-    let msg1 = eapol::build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         msg1_key_info,
         16,
         1,
@@ -90,18 +90,20 @@ fn test_psk_sha256_kdv3_handshake() {
         &[0u8; 16],
         b"",
     );
-    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let parsed1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
     let msg2 = state
         .process_message_1(
             &parsed1.key_nonce,
             parsed1.replay_counter,
-            parsed1.key_info,
+            parsed1.desc_version(),
         )
         .unwrap();
-    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
-    assert_eq!(eapol::desc_version(m2.key_info), 3);
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
+    assert_eq!(m2.desc_version(), 3);
     let kck = state.kck().unwrap();
-    let m2_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2)).unwrap();
+    let m2_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2))
+            .unwrap();
     assert_eq!(m2.key_mic, m2_mic);
 
     // Message 3 with an encrypted GTK; MIC verified with AES-CMAC.
@@ -125,7 +127,7 @@ fn test_psk_sha256_kdv3_handshake() {
     let wrapped = aes_key_wrap(&kek, &padded).unwrap();
     let msg3_key_info =
         0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000 | 0x0003;
-    let mut msg3 = eapol::build_eapol_key_pdu(
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
         msg3_key_info,
         16,
         2,
@@ -136,14 +138,18 @@ fn test_psk_sha256_kdv3_handshake() {
         &[0u8; 16],
         &wrapped,
     );
-    let msg3_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
-    eapol::set_mic(&mut msg3, &msg3_mic);
-    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let msg3_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
     let (msg4, kdes) = state.process_message_3(&parsed3).unwrap();
     assert_eq!(kdes.gtk, Some((1, gtk.to_vec())));
-    let m4 = eapol::parse_eapol_key_frame(&msg4).unwrap();
-    assert_eq!(eapol::desc_version(m4.key_info), 3);
-    let m4_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg4)).unwrap();
+    let m4 = Ieee80211EapolKeyFrame::parse(&msg4).unwrap();
+    assert_eq!(m4.desc_version(), 3);
+    let m4_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg4))
+            .unwrap();
     assert_eq!(m4.key_mic, m4_mic);
 }
 
@@ -219,22 +225,26 @@ fn test_group_rekey() {
     kde.extend_from_slice(&new_gtk);
     let wrapped = aes_key_wrap(&kek, &kde).unwrap();
     let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000;
-    let mut g1 = eapol::build_eapol_key_pdu(
+    let mut g1 = Ieee80211EapolKeyFrame::build(
         key_info, 16, 5, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
         &[0u8; 16], &wrapped,
     );
-    let g1_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&g1)).unwrap();
-    eapol::set_mic(&mut g1, &g1_mic);
+    let g1_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&g1))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut g1, &g1_mic);
 
-    let parsed = eapol::parse_eapol_key_frame(&g1).unwrap();
+    let parsed = Ieee80211EapolKeyFrame::parse(&g1).unwrap();
     let msg2 = state.process_group_rekey(&parsed).unwrap();
 
     assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
     assert_eq!(state.gtk_index(), 2);
 
-    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
     assert!(m2.has_mic() && m2.is_secure() && !m2.is_pairwise());
-    let m2_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2)).unwrap();
+    let m2_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2))
+            .unwrap();
     assert_eq!(m2.key_mic, m2_mic);
 }
 
@@ -293,19 +303,21 @@ fn test_ft_state_with_precomputed_ptk_processes_group_rekey() {
     kde.extend_from_slice(&new_gtk);
     let wrapped = aes_key_wrap(&kek, &kde).unwrap();
     let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000;
-    let mut g1 = eapol::build_eapol_key_pdu(
+    let mut g1 = Ieee80211EapolKeyFrame::build(
         key_info, 16, 7, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
         &[0u8; 16], &wrapped,
     );
-    let g1_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&g1)).unwrap();
-    eapol::set_mic(&mut g1, &g1_mic);
+    let g1_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&g1))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut g1, &g1_mic);
 
-    let parsed = eapol::parse_eapol_key_frame(&g1).unwrap();
+    let parsed = Ieee80211EapolKeyFrame::parse(&g1).unwrap();
     let msg2 = state.process_group_rekey(&parsed).unwrap();
 
     assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
     assert_eq!(state.gtk_index(), 2);
-    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
     assert!(m2.has_mic() && m2.is_secure() && !m2.is_pairwise());
 }
 
@@ -384,7 +396,7 @@ fn run_msg1_msg3(
     state: &mut FourWayState,
     key_data_plain: &[u8],
 ) -> Result<(Vec<u8>, KeyDataKdes), WifiError> {
-    let msg1 = eapol::build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008, // ack + pairwise
         16,
         1,
@@ -395,11 +407,11 @@ fn run_msg1_msg3(
         &[0u8; 16],
         b"",
     );
-    let msg1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let msg1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
     state.process_message_1(
         &msg1.key_nonce,
         msg1.replay_counter,
-        msg1.key_info,
+        msg1.desc_version(),
     )?;
 
     let kck = state.kck().unwrap();
@@ -412,14 +424,16 @@ fn run_msg1_msg3(
     }
     let wrapped = aes_key_wrap(&kek, &padded)?;
     let key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
-    let mut msg3 = eapol::build_eapol_key_pdu(
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
         key_info, 16, 2, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
         &[0u8; 16], &wrapped,
     );
-    let msg3_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
-    eapol::set_mic(&mut msg3, &msg3_mic);
+    let msg3_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
 
-    let parsed = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let parsed = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
     state.process_message_3(&parsed)
 }
 
@@ -453,10 +467,12 @@ fn test_msg3_igtk_kde_and_rsne_check() {
         Some((5, ipn, igtk.to_vec()))
     );
     // Message 4: valid MIC, pairwise + secure.
-    let m4 = eapol::parse_eapol_key_frame(&msg4).unwrap();
+    let m4 = Ieee80211EapolKeyFrame::parse(&msg4).unwrap();
     assert!(m4.has_mic() && m4.is_secure() && m4.is_pairwise());
     let kck = state.kck().unwrap();
-    let m4_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg4)).unwrap();
+    let m4_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg4))
+            .unwrap();
     assert_eq!(m4.key_mic, m4_mic);
 }
 
@@ -529,11 +545,13 @@ fn test_ptk_rekey_fresh_snonce() {
     // Both Message 2 PDUs carry valid MICs and echo the AP's replay
     // counter.
     let kck = state.kck().unwrap();
-    let m2 = eapol::parse_eapol_key_frame(&msg2_2).unwrap();
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2_2).unwrap();
     assert_eq!(m2.replay_counter, 2);
-    let mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg2_2)).unwrap();
+    let mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2_2))
+            .unwrap();
     assert_eq!(m2.key_mic, mic);
-    let m2_1 = eapol::parse_eapol_key_frame(&msg2_1).unwrap();
+    let m2_1 = Ieee80211EapolKeyFrame::parse(&msg2_1).unwrap();
     assert_eq!(m2_1.replay_counter, 1);
 }
 
@@ -556,7 +574,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
     );
     state.set_ocv(true, [81, 1, 0], 2412);
 
-    let msg1 = eapol::build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008,
         16,
         1,
@@ -567,15 +585,15 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         &[0u8; 16],
         b"",
     );
-    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let parsed1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
     let msg2 = state
         .process_message_1(
             &parsed1.key_nonce,
             parsed1.replay_counter,
-            parsed1.key_info,
+            parsed1.desc_version(),
         )
         .unwrap();
-    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
     assert_eq!(
         parse_oci_kde(&m2.key_data),
         Some([81, 1, 0]),
@@ -591,7 +609,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
     }
     let wrapped = aes_key_wrap(&kek, &key_data).unwrap();
     let msg3_key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
-    let mut msg3 = eapol::build_eapol_key_pdu(
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
         msg3_key_info,
         16,
         2,
@@ -602,9 +620,11 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         &[0u8; 16],
         &wrapped,
     );
-    let msg3_mic = aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
-    eapol::set_mic(&mut msg3, &msg3_mic);
-    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let msg3_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
     state.process_message_3(&parsed3).unwrap();
 
     // Message 3 without an OCI KDE: rejected under OCV.
@@ -618,7 +638,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         vec![],
     );
     state2.set_ocv(true, [81, 1, 0], 2412);
-    let msg1 = eapol::build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008,
         16,
         1,
@@ -629,12 +649,12 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         &[0u8; 16],
         b"",
     );
-    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let parsed1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
     state2
         .process_message_1(
             &parsed1.key_nonce,
             parsed1.replay_counter,
-            parsed1.key_info,
+            parsed1.desc_version(),
         )
         .unwrap();
     let kck2 = state2.kck().unwrap();
@@ -644,7 +664,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         empty.push(0);
     }
     let wrapped = aes_key_wrap(&kek2, &empty).unwrap();
-    let mut msg3 = eapol::build_eapol_key_pdu(
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
         msg3_key_info,
         16,
         2,
@@ -655,9 +675,11 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         &[0u8; 16],
         &wrapped,
     );
-    let msg3_mic = aes_cmac(&kck2, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
-    eapol::set_mic(&mut msg3, &msg3_mic);
-    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let msg3_mic =
+        aes_cmac(&kck2, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
     let err = state2.process_message_3(&parsed3).unwrap_err();
     assert_eq!(err.kind, ErrorKind::HandshakeFailed);
     assert!(
@@ -687,7 +709,7 @@ fn test_extended_key_id_handshake() {
                 vec![],
             );
             state.set_ext_key_id(true);
-            let msg1 = eapol::build_eapol_key_pdu(
+            let msg1 = Ieee80211EapolKeyFrame::build(
                 0x0080 | 0x0008,
                 16,
                 1,
@@ -698,12 +720,12 @@ fn test_extended_key_id_handshake() {
                 &[0u8; 16],
                 b"",
             );
-            let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+            let parsed1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
             state
                 .process_message_1(
                     &parsed1.key_nonce,
                     parsed1.replay_counter,
-                    parsed1.key_info,
+                    parsed1.desc_version(),
                 )
                 .unwrap();
             let kck = state.kck().unwrap();
@@ -715,7 +737,7 @@ fn test_extended_key_id_handshake() {
             let wrapped = aes_key_wrap(&kek, &padded).unwrap();
             let msg3_key_info =
                 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
-            let mut msg3 = eapol::build_eapol_key_pdu(
+            let mut msg3 = Ieee80211EapolKeyFrame::build(
                 msg3_key_info,
                 16,
                 2,
@@ -726,10 +748,13 @@ fn test_extended_key_id_handshake() {
                 &[0u8; 16],
                 &wrapped,
             );
-            let msg3_mic =
-                aes_cmac(&kck, &eapol::pdu_with_zeroed_mic(&msg3)).unwrap();
-            eapol::set_mic(&mut msg3, &msg3_mic);
-            let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+            let msg3_mic = aes_cmac(
+                &kck,
+                &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3),
+            )
+            .unwrap();
+            Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
+            let parsed3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
             let (_, kdes) = state.process_message_3(&parsed3)?;
             Ok((state, kdes))
         };
@@ -769,7 +794,7 @@ fn test_sae_ext_key_handshake() {
         vec![],
     );
 
-    let msg1 = eapol::build_eapol_key_pdu(
+    let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008, // ack + pairwise, KDV 0 (AKM-defined)
         16,
         1,
@@ -780,18 +805,21 @@ fn test_sae_ext_key_handshake() {
         &[0u8; 16],
         b"",
     );
-    let parsed1 = eapol::parse_eapol_key_frame(&msg1).unwrap();
+    let parsed1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
     let msg2 = state
         .process_message_1(
             &parsed1.key_nonce,
             parsed1.replay_counter,
-            parsed1.key_info,
+            parsed1.desc_version(),
         )
         .unwrap();
-    let m2 = eapol::parse_eapol_key_frame(&msg2).unwrap();
-    assert_eq!(eapol::desc_version(m2.key_info), 0);
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
+    assert_eq!(m2.desc_version(), 0);
     let kck = state.kck().unwrap();
-    let mic = hmac_sha256_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg2));
+    let mic = hmac_sha256_mic(
+        &kck,
+        &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2),
+    );
     assert_eq!(m2.key_mic, mic);
 
     // Message 3 with HMAC-SHA256 MIC.
@@ -802,7 +830,7 @@ fn test_sae_ext_key_handshake() {
     let kek = state.kek().unwrap();
     let wrapped = aes_key_wrap(&kek, &empty).unwrap();
     let msg3_key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
-    let mut msg3 = eapol::build_eapol_key_pdu(
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
         msg3_key_info,
         16,
         2,
@@ -813,9 +841,12 @@ fn test_sae_ext_key_handshake() {
         &[0u8; 16],
         &wrapped,
     );
-    let msg3_mic = hmac_sha256_mic(&kck, &eapol::pdu_with_zeroed_mic(&msg3));
-    eapol::set_mic(&mut msg3, &msg3_mic);
-    let parsed3 = eapol::parse_eapol_key_frame(&msg3).unwrap();
+    let msg3_mic = hmac_sha256_mic(
+        &kck,
+        &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3),
+    );
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &msg3_mic);
+    let parsed3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
     state.process_message_3(&parsed3).unwrap();
 }
 
@@ -825,11 +856,11 @@ fn test_sae_ext_key_handshake() {
 #[test]
 fn test_request_bit_detection() {
     let key_info = 0x0800 | 0x0080; // request + ack
-    let pdu = eapol::build_eapol_key_pdu(
+    let pdu = Ieee80211EapolKeyFrame::build(
         key_info, 16, 1, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
         &[0u8; 16], b"",
     );
-    let parsed = eapol::parse_eapol_key_frame(&pdu).unwrap();
+    let parsed = Ieee80211EapolKeyFrame::parse(&pdu).unwrap();
     assert!(parsed.is_request());
-    assert!(eapol::fmt_key_info(parsed.key_info).contains("request"));
+    assert!(parsed.fmt_key_info().contains("request"));
 }
