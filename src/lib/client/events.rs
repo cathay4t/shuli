@@ -607,9 +607,10 @@ impl WifiIface {
     }
 
     /// the device woke the host while it was suspended. Clear the
-    /// per-suspend triggers, and when the wake means the connection is
-    /// no longer trustworthy (GTK rekey failure / disconnect) tear it
-    /// down so the retry loop rebuilds it.
+    /// per-suspend triggers; when the wake means the connection is no
+    /// longer trustworthy (GTK rekey failure / disconnect) tear it down
+    /// so the retry loop rebuilds it, otherwise re-arm the triggers so
+    /// the next suspend is covered.
     pub(crate) async fn handle_wowlan_wakeup(
         &mut self,
         reasons: Vec<Nl80211WowlanWakeup>,
@@ -622,7 +623,8 @@ impl WifiIface {
 
         // Triggers stay armed while connected; clear them after a wake
         // so they cannot fire again before the next connection (which
-        // re-arms when `wowlan: true`).
+        // re-arms when `wowlan: true`) or the next suspend on a wake
+        // that kept the connection.
         if self.wowlan.armed
             && let Err(e) = self.disarm_wowlan().await
         {
@@ -646,6 +648,11 @@ impl WifiIface {
                 log::debug!("disconnect cleanup after WoWLAN wake failed: {e}");
             }
             self.state = WifiState::Failed;
+        } else {
+            // The wake (magic packet, packet pattern, rfkill, ...) kept
+            // the association valid: re-arm the triggers so the next
+            // suspend is covered again.
+            self.arm_wowlan_if_enabled().await;
         }
     }
 
@@ -1418,7 +1425,8 @@ impl WifiIface {
             // connection lands and leave them armed. The kernel only
             // uses them while the host is suspended; the wake handler
             // clears them after a WoWLAN wake and this arms again on
-            // the next reconnect.
+            // the next reconnect (or immediately when the wake kept the
+            // connection).
             self.arm_wowlan_if_enabled().await;
         } else if parsed.has_mic()
             && parsed.is_secure()
