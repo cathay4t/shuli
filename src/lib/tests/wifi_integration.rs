@@ -621,6 +621,30 @@ async fn run_until_connected(
     ))
 }
 
+/// Drive the client until the first host scan is reported as in flight.
+///
+/// A freshly provisioned hwsim radio can transiently reject the first scan
+/// with `-EBUSY` (e.g. a scan still draining from the previous radio).
+/// That environment-level failure is retried; failures after this point
+/// (the scenario under test) are not retried.
+async fn run_until_scan_started(
+    client: &mut WifiClient,
+    max_retries: u32,
+) -> WifiState {
+    for _ in 0..max_retries {
+        match client.run().await {
+            Ok(iface_state) if iface_state.state == WifiState::Scanning => {
+                return iface_state.state;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("first scan failed, retrying: {e}");
+            }
+        }
+    }
+    panic!("client did not enter Scanning state");
+}
+
 /// Pump events until the socket goes quiet: the kernel delivers a few
 /// trailing events (TX status reports etc.) after a connection settles;
 /// this drains them before a test injects new input.
@@ -658,6 +682,60 @@ async fn wifi_client_open_connect() {
     config.add_network("Test-WIFI-NOPASS", None);
     let mut client = WifiClient::init(vec![config]).await.expect("init");
     let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// regression: calling `update_networks()` (e.g. a forced boot re-apply)
+/// while a host scan is in flight used to reset the state machine to
+/// `Init` immediately. The next `run()` then started a second scan while
+/// the kernel was still busy with the first one, failed with
+/// `Device or resource busy`, and lost the connection attempt to the
+/// 10-second backoff. The update must drain the in-flight scan first.
+#[tokio::test]
+async fn wifi_client_update_networks_during_scan_does_not_race_next_scan() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_update_networks_during_scan_does_not_race_\
+             next_scan: test binary not running as root (`.cargo/config.toml` \
+             runs tests via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    let mut client =
+        WifiClient::init(vec![config.clone()]).await.expect("init");
+
+    let state = run_until_scan_started(&mut client, 3).await;
+    assert_eq!(
+        state,
+        WifiState::Scanning,
+        "client should be scanning when update_networks() is called"
+    );
+
+    // Mirror the forced re-apply used by nipart at boot: clear the list
+    // and then restore it while the first scan is still in flight.
+    client
+        .update_networks(TEST_NIC, Vec::new())
+        .await
+        .expect("clear networks during scan");
+    client
+        .update_networks(TEST_NIC, config.networks.clone())
+        .await
+        .expect("restore networks during scan");
+
+    let state = run_until_connected(&mut client, 20)
+        .await
+        .expect("connect after update");
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey

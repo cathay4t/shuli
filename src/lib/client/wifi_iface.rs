@@ -918,6 +918,10 @@ impl WifiIface {
     ///
     /// * An unchanged list is a no-op: idempotent re-apply keeps the current
     ///   connection.
+    /// * If a host scan is already in flight when the list changes, the update
+    ///   first waits for the kernel's scan-completion event. Resetting to
+    ///   `Init` while the kernel scan is still running would make the next
+    ///   `run()` trigger a second scan and fail with `-EBUSY`.
     /// * If the currently connected network is dropped from the list (or the
     ///   list becomes empty), the client disconnects cleanly, stops any
     ///   scheduled scan and resets to `Init` so the next `run()` starts a fresh
@@ -933,6 +937,10 @@ impl WifiIface {
         if networks == self.core.config.networks {
             log::debug!("network list unchanged");
             return Ok(());
+        }
+
+        if self.state == WifiState::Scanning {
+            self.wait_scan_finish().await;
         }
 
         let old_ssid = self.link.network.ssid.clone();
