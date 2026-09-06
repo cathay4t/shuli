@@ -131,9 +131,9 @@ mod tests {
         };
         assert!(matches!(
             parse_client_event(wrap(msg)),
-            Some(ClientEvent::Nl80211(Nl80211Event::Unknown {
-                cmd: Nl80211Command::SetRekeyOffload,
-            }))
+            Some(ClientEvent::Nl80211(Nl80211Event::Unknown(
+                Nl80211Command::SetRekeyOffload,
+            )))
         ));
     }
 }

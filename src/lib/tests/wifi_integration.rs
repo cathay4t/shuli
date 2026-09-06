@@ -2349,9 +2349,9 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         .values_mut()
         .next()
         .unwrap()
-        .handle_event(wl_nl80211::Nl80211Event::ControlPortFrame {
-            frame: msg1,
-        })
+        .handle_event(wl_nl80211::Nl80211Event::ControlPortFrame(
+            wl_nl80211::Ieee80211EapolFrame::parse(&msg1),
+        ))
         .await;
 
     assert!(

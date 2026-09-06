@@ -494,16 +494,16 @@ impl WifiIface {
                         if let Some(event) = parse_client_event(raw_msg) {
                             match event {
                                 ClientEvent::Nl80211(
-                                    Nl80211Event::Unknown {
-                                        cmd: Nl80211Command::SchedScanResults,
-                                    },
+                                    Nl80211Event::Unknown(
+                                        Nl80211Command::SchedScanResults,
+                                    ),
                                 ) => {
                                     self.handle_sched_scan_results().await?;
                                 }
                                 ClientEvent::Nl80211(
-                                    Nl80211Event::Unknown {
-                                        cmd: Nl80211Command::SchedScanStopped,
-                                    },
+                                    Nl80211Event::Unknown(
+                                        Nl80211Command::SchedScanStopped,
+                                    ),
                                 ) => {
                                     if self.scan.sched_scan_stop_pending {
                                         // Echo of our own stop request

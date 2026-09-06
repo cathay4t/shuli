@@ -2,8 +2,9 @@
 
 use wl_nl80211::{
     Ieee80211ActionFrame, Ieee80211AkmSuite, Ieee80211AuthFrame,
-    Ieee80211EapolEapFrame, Ieee80211EapolKeyFrame, Ieee80211Frame,
-    Nl80211AuthType, Nl80211Command, Nl80211UseMfp, Nl80211WowlanWakeup,
+    Ieee80211EapolEapFrame, Ieee80211EapolFrame, Ieee80211EapolKeyFrame,
+    Ieee80211Frame, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
+    Nl80211WowlanWakeup,
 };
 
 use super::{
@@ -72,16 +73,23 @@ impl WifiIface {
                     other.action()
                 ),
             },
-            Nl80211Event::Frame(Ieee80211Frame::Other { raw, .. }) => {
-                log::debug!("unhandled management frame: {} bytes", raw.len());
+            Nl80211Event::Frame(Ieee80211Frame::Other(frame)) => {
+                log::debug!(
+                    "unhandled management frame: {} bytes",
+                    frame.raw.len()
+                );
             }
 
-            Nl80211Event::Authenticated { status, frame } => {
+            Nl80211Event::Authenticated(event) => {
+                let status = event.status;
+                let frame = event.frame;
                 if self.roam.ft_roam.is_some() {
                     // FT roam: the target AP's FT Authentication response
                     // (transaction 2).
+                    let auth_bytes =
+                        frame.as_ref().map(Ieee80211AuthFrame::to_bytes);
                     self.handle_ft_auth_response(
-                        frame.as_deref().unwrap_or(&[]),
+                        auth_bytes.as_deref().unwrap_or(&[]),
                     )
                     .await;
                 } else if self.link.pmksa_in_use.is_some() {
@@ -280,15 +288,11 @@ impl WifiIface {
                         );
                         self.state = WifiState::Failed;
                     }
-                } else if let Some(frame) = frame {
+                } else if let Some(auth) = frame {
                     // SAE: the auth frame carries the AP's commit
-                    // (transaction 1) or confirm (transaction 2).
-                    match Ieee80211AuthFrame::parse(&frame) {
-                        Ok(auth) => self.handle_auth_frame(&auth).await,
-                        Err(e) => log::debug!(
-                            "malformed auth frame in AUTHENTICATE event: {e}"
-                        ),
-                    }
+                    // (transaction 1) or confirm (transaction 2),
+                    // already parsed by wl-nl80211.
+                    self.handle_auth_frame(&auth).await;
                 } else if status != Ieee80211StatusCode::Success {
                     log::warn!("AUTHENTICATE failed: status={status}");
                     let err = if status == Ieee80211StatusCode::ChallengeFail {
@@ -310,7 +314,9 @@ impl WifiIface {
                 }
             }
 
-            Nl80211Event::Associated { status, ies } => {
+            Nl80211Event::Associated(event) => {
+                let status = event.status;
+                let ies = event.ies;
                 if self.roam.ft_roam.is_some() {
                     // FT roam: (Re)Association Response from the target
                     // AP - validate the FTIE MIC and install the keys.
@@ -403,7 +409,7 @@ impl WifiIface {
                 }
             }
 
-            Nl80211Event::ConnectResult { status } => {
+            Nl80211Event::ConnectResult(status) => {
                 if status == Ieee80211StatusCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
@@ -414,9 +420,17 @@ impl WifiIface {
                 }
             }
 
-            Nl80211Event::ControlPortFrame { frame } => {
-                self.handle_control_port_frame(&frame).await;
-            }
+            Nl80211Event::ControlPortFrame(frame) => match frame {
+                Ieee80211EapolFrame::Eap(eap) => {
+                    self.handle_eap_frame(&eap.payload).await;
+                }
+                Ieee80211EapolFrame::Key(key) => {
+                    self.handle_control_port_frame(&key.raw).await;
+                }
+                _ => {
+                    log::debug!("unparseable control port frame");
+                }
+            },
 
             Nl80211Event::PortAuthorized => {
                 log::info!("PORT_AUTHORIZED - connection ready");
@@ -425,7 +439,7 @@ impl WifiIface {
                 self.arm_wowlan_if_enabled().await;
             }
 
-            Nl80211Event::WowlanWakeup { reasons } => {
+            Nl80211Event::WowlanWakeup(reasons) => {
                 self.handle_wowlan_wakeup(reasons).await;
             }
 
@@ -433,7 +447,7 @@ impl WifiIface {
                 self.handle_cqm_rssi(cqm).await;
             }
 
-            Nl80211Event::Disconnect { reason } => {
+            Nl80211Event::Disconnect(reason) => {
                 // During an FT roam this is the expected side effect of
                 // CMD_AUTHENTICATE disconnecting the old AP - the roam
                 // continues; acting on it would tear the roam down.
@@ -470,8 +484,8 @@ impl WifiIface {
             // wl-nl80211. The reason tells a fatal credential problem
             // (retry with the long authentication backoff) apart from a
             // transient disconnect (short backoff).
-            Nl80211Event::Deauthenticated { reason }
-            | Nl80211Event::Disassociated { reason } => {
+            Nl80211Event::Deauthenticated(reason)
+            | Nl80211Event::Disassociated(reason) => {
                 self.handle_ap_disconnect(Some(reason)).await;
             }
 
@@ -485,7 +499,7 @@ impl WifiIface {
             Nl80211Event::ExternalAuth => {
                 log::debug!("EXTERNAL_AUTH event (unsupported in this mode)");
             }
-            Nl80211Event::Unknown { cmd } => {
+            Nl80211Event::Unknown(cmd) => {
                 if cmd == Nl80211Command::SchedScanStopped
                     && self.scan.sched_scan_stop_pending
                 {
