@@ -270,14 +270,55 @@ fn configured_hint_frequencies(networks: &[NetworkConfig]) -> Vec<u32> {
 fn best_scan_candidate(
     candidates: &[(BssInfo, NetworkConfig)],
 ) -> Option<(BssInfo, NetworkConfig)> {
+    best_scan_candidate_filtered(candidates, |_| true)
+}
+
+/// [`best_scan_candidate`] with an `include` predicate applied before the
+/// strongest-BSS ordering. Used to skip BSSIDs on the temporary ignore
+/// list (wpa_supplicant's `bssid_ignore` ordering rule) while keeping the
+/// preferred-SSID logic intact.
+fn best_scan_candidate_filtered(
+    candidates: &[(BssInfo, NetworkConfig)],
+    include: impl Fn(&BssInfo) -> bool,
+) -> Option<(BssInfo, NetworkConfig)> {
     candidates
         .iter()
         .filter(|(bss, network)| {
-            network.prefered
+            include(bss)
+                && network.prefered
                 && bss.signal_dbm >= DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
         })
         .max_by(|a, b| a.0.cmp(&b.0))
-        .or_else(|| candidates.iter().max_by(|a, b| a.0.cmp(&b.0)))
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|(bss, _)| include(bss))
+                .max_by(|a, b| a.0.cmp(&b.0))
+        })
+        .cloned()
+}
+
+/// Best untried BSS of the same ESS after a connection attempt to
+/// `failed_bssid` failed. Only BSSes carrying the same SSID and the same
+/// security family as the failed attempt qualify, and ignored BSSIDs are
+/// skipped so every other AP is tried before one that just rejected us
+/// (wpa_supplicant's fast-associate behavior).
+pub(crate) fn best_retry_candidate(
+    candidates: &[(BssInfo, NetworkConfig)],
+    failed_bssid: [u8; ETH_ALEN],
+    ssid: &str,
+    security_base: SecurityType,
+    is_ignored: impl Fn(&[u8; ETH_ALEN]) -> bool,
+) -> Option<(BssInfo, NetworkConfig)> {
+    candidates
+        .iter()
+        .filter(|(bss, network)| {
+            bss.bssid != failed_bssid
+                && network.ssid == ssid
+                && bss.security.base() == security_base
+                && !is_ignored(&bss.bssid)
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
         .cloned()
 }
 
@@ -440,6 +481,12 @@ impl WifiIface {
                 .cloned()
         });
         let best = hinted
+            .or_else(|| {
+                best_scan_candidate_filtered(
+                    &self.roam.last_scan_candidates,
+                    |bss| !self.bssid_ignore.is_ignored(&bss.bssid),
+                )
+            })
             .or_else(|| best_scan_candidate(&self.roam.last_scan_candidates));
         let Some((bss_info, network)) = best else {
             return Err(WifiError::new(
@@ -1078,8 +1125,8 @@ pub(crate) fn format_ssids(ssids: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BssInfo, MAX_SCAN_SSIDS, best_scan_candidate,
-        configured_hint_frequencies, next_scan_ssids,
+        BssInfo, MAX_SCAN_SSIDS, SecurityType, best_retry_candidate,
+        best_scan_candidate, configured_hint_frequencies, next_scan_ssids,
     };
     use crate::NetworkConfig;
 
@@ -1291,5 +1338,86 @@ mod tests {
     #[test]
     fn best_scan_candidate_returns_none_for_empty_results() {
         assert!(best_scan_candidate(&[]).is_none());
+    }
+
+    #[test]
+    fn retry_candidate_skips_failed_bssid() {
+        let candidates = vec![
+            candidate("Same", -40, 1, false),
+            candidate("Same", -50, 2, false),
+            candidate("Same", -60, 3, false),
+        ];
+        let failed = candidates[0].0.bssid;
+        let (bss, network) = best_retry_candidate(
+            &candidates,
+            failed,
+            "Same",
+            SecurityType::Open,
+            |_| false,
+        )
+        .expect("alternative selected");
+        assert_eq!(network.ssid, "Same");
+        assert_eq!(bss.signal_dbm, -50);
+    }
+
+    #[test]
+    fn retry_candidate_skips_other_ignored_bsses() {
+        let candidates = vec![
+            candidate("Same", -40, 1, false),
+            candidate("Same", -50, 2, false),
+            candidate("Same", -60, 3, false),
+        ];
+        let failed = candidates[0].0.bssid;
+        let ignored_second = candidates[1].0.bssid;
+        let (bss, _) = best_retry_candidate(
+            &candidates,
+            failed,
+            "Same",
+            SecurityType::Open,
+            |bssid| *bssid == ignored_second,
+        )
+        .expect("alternative selected");
+        assert_eq!(bss.signal_dbm, -60);
+    }
+
+    #[test]
+    fn retry_candidate_requires_same_ssid_and_security() {
+        let mut candidates = vec![
+            candidate("Same", -50, 1, false),
+            candidate("Other", -40, 2, false),
+            candidate("Same", -55, 3, true),
+        ];
+        let mut strong_wpa2 = candidate("Same", -45, 4, false);
+        strong_wpa2.0.security = SecurityType::Wpa2Psk;
+        candidates.push(strong_wpa2);
+
+        let failed = candidates[0].0.bssid;
+        let (bss, network) = best_retry_candidate(
+            &candidates,
+            failed,
+            "Same",
+            SecurityType::Open,
+            |_| false,
+        )
+        .expect("open alternative selected");
+        assert_eq!(network.ssid, "Same");
+        assert_eq!(bss.signal_dbm, -55);
+        assert_eq!(bss.security, SecurityType::Open);
+    }
+
+    #[test]
+    fn retry_candidate_returns_none_when_all_bsses_tried() {
+        let candidates = vec![candidate("Same", -40, 1, false)];
+        let failed = candidates[0].0.bssid;
+        assert!(
+            best_retry_candidate(
+                &candidates,
+                failed,
+                "Same",
+                SecurityType::Open,
+                |_| false,
+            )
+            .is_none()
+        );
     }
 }

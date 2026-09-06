@@ -4,18 +4,18 @@ use futures::StreamExt;
 use wl_nl80211::{Ieee80211ReasonCode, Nl80211Command, Nl80211WowlanWakeup};
 
 use super::{
-    AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, ErrorKind, IfaceCore,
-    Link, MAX_SCHED_SCAN_SSIDS, NetworkConfig, Nl80211Attr, Nl80211Disconnect,
-    Nl80211Event, Nl80211EventReceiver, Nl80211SchedScanMatch,
-    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
-    Nl80211Wowlan, Nl80211WowlanTriggersSupport, PmksaCache, RETRY_AUTH_SEC,
-    RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC, ROAM_SIGNAL_CHECK_SECS,
-    RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
-    SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
+    AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, BssidIgnoreList,
+    ErrorKind, IfaceCore, Link, MAX_SCHED_SCAN_SSIDS, NetworkConfig,
+    Nl80211Attr, Nl80211Disconnect, Nl80211Event, Nl80211EventReceiver,
+    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
+    Nl80211SchedScanPlanAttr, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
+    PmksaCache, RETRY_AUTH_SEC, RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC,
+    ROAM_SIGNAL_CHECK_SECS, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS,
+    SAE_SYNC_MAX, SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
     SCHED_SCAN_WATCHDOG_SECS, ScanEngine, ShuliNl80211Connection, WifiConfig,
-    WifiError, WifiIface, WifiState, WiphyCaps, WowlanState, drain_request,
-    format_ssids, is_eopnotsupp, next_sched_scan_ssids, wiphy_sched_scan_caps,
-    wiphy_wowlan_support,
+    WifiError, WifiIface, WifiState, WiphyCaps, WowlanState,
+    best_retry_candidate, drain_request, format_ssids, is_eopnotsupp,
+    next_sched_scan_ssids, wiphy_sched_scan_caps, wiphy_wowlan_support,
 };
 use crate::{
     BssInfo, ETH_ALEN,
@@ -197,6 +197,7 @@ impl WifiIface {
             roam: RoamEngine::default(),
             wowlan: WowlanState::default(),
             state: WifiState::Init,
+            bssid_ignore: BssidIgnoreList::default(),
             pmksa_cache: PmksaCache::default(),
             last_error: None,
         };
@@ -244,9 +245,109 @@ impl WifiIface {
                 && self.state != baseline
                 && !roaming_scan
             {
+                if matches!(
+                    self.state,
+                    WifiState::ConnectedWithoutOffloadRekey
+                        | WifiState::ConnectedWithOffloadRekey
+                ) {
+                    // A successful connection resets the failure history
+                    // so stale rejections do not steer future roaming.
+                    self.bssid_ignore.clear();
+                }
+                if prev_state == WifiState::Authenticating
+                    && self.state == WifiState::Failed
+                    && self.retry_with_next_bss().await?
+                {
+                    // Another BSS of the same ESS is available: try it
+                    // immediately (wpa_supplicant fast associate) instead
+                    // of surfacing the failure and waiting out the scan
+                    // backoff on the AP that just rejected us.
+                    continue;
+                }
                 return Ok(self.state);
             }
         }
+    }
+
+    /// Record the failed BSSID and start authentication with the next
+    /// strongest untried BSS of the same SSID/security family. Returns
+    /// `Ok(true)` when another BSS was started, `Ok(false)` when every
+    /// candidate has been tried and the caller should keep the normal
+    /// retry path.
+    async fn retry_with_next_bss(&mut self) -> Result<bool, WifiError> {
+        let failed_bssid = self.link.bss_info.bssid;
+        if failed_bssid == [0; ETH_ALEN] {
+            return Ok(false);
+        }
+        let count = self.bssid_ignore.add(failed_bssid);
+        log::warn!(
+            "connection to BSS {:02x?} failed; added to ignore list (failure \
+             count {count})",
+            failed_bssid
+        );
+        let next = {
+            let candidates = &self.roam.last_scan_candidates;
+            let bssid_ignore = &self.bssid_ignore;
+            best_retry_candidate(
+                candidates,
+                failed_bssid,
+                &self.link.network.ssid,
+                self.link.bss_info.security,
+                |bssid| bssid_ignore.is_ignored(bssid),
+            )
+        };
+        let Some((bss_info, network)) = next else {
+            log::warn!(
+                "no untried BSS of SSID {} available; keeping retry backoff",
+                self.link.network.ssid
+            );
+            return Ok(false);
+        };
+        log::info!(
+            "trying next BSS of SSID {}: bssid={:02x?}, freq={} MHz, \
+             signal={} dBm",
+            network.ssid,
+            bss_info.bssid,
+            bss_info.freq_mhz,
+            bss_info.signal_dbm
+        );
+        self.link.bss_info = bss_info;
+        self.link.network = network;
+        // Clear kernel-side connection state left by the failed attempt
+        // before authenticating with the replacement AP.
+        if let Err(e) = self.core.nl.disconnect().await {
+            log::debug!("disconnect before retry failed: {e}");
+        }
+        // The kernel can deliver the disconnect/auth-failure multicast
+        // events with a delay. Consume them while still in `Failed` so a
+        // stale event cannot be mistaken for a failure of the replacement
+        // connection (e.g. a PSK 4-way disconnect classified as a wrong
+        // password).
+        let drain_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            let remaining = drain_deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(
+                remaining,
+                self.core.event_receiver.next(),
+            )
+            .await
+            {
+                Ok(Some(raw_msg)) => {
+                    if let Some(event) = parse_client_event(raw_msg) {
+                        self.handle_client_event(event).await;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        self.send_out_auth_request().await?;
+        self.state = WifiState::Authenticating;
+        Ok(true)
     }
 
     /// Move into [`WifiState::FailedAuthentication`] and record the
@@ -996,6 +1097,7 @@ impl WifiIface {
         );
         self.auth.reset();
         self.roam.reset();
+        self.bssid_ignore.clear();
         self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
         self.state = WifiState::Init;
         log::info!(

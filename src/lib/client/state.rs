@@ -286,6 +286,77 @@ impl RoamEngine {
     }
 }
 
+/// How long a rejected BSSID stays out of the connection-candidate order
+/// after `count` failures (wpa_supplicant's `bssid_ignore` escalation).
+fn bssid_ignore_timeout_secs(count: u32) -> u64 {
+    match count {
+        1 | 2 => 10,
+        3 => 60,
+        4 => 120,
+        5 => 600,
+        _ => 1800,
+    }
+}
+
+/// A BSSID that rejected a connection attempt. While an entry is active,
+/// scan-result selection and the fast-retry path prefer every other BSS;
+/// after the timeout the BSS becomes eligible again so a single bad AP
+/// cannot permanently exclude an ESS.
+#[derive(Debug, Default)]
+pub(crate) struct BssidIgnoreList {
+    entries: Vec<BssidIgnoreEntry>,
+}
+
+#[derive(Debug)]
+struct BssidIgnoreEntry {
+    bssid: [u8; ETH_ALEN],
+    count: u32,
+    deadline: std::time::Instant,
+}
+
+impl BssidIgnoreList {
+    /// Record a failed attempt against `bssid` and return the new failure
+    /// count. Re-adding an already listed BSSID restarts its timeout and
+    /// escalates the next expiry like wpa_supplicant.
+    pub(crate) fn add(&mut self, bssid: [u8; ETH_ALEN]) -> u32 {
+        let now = std::time::Instant::now();
+        if let Some(entry) =
+            self.entries.iter_mut().find(|entry| entry.bssid == bssid)
+        {
+            entry.count = entry.count.saturating_add(1);
+            entry.deadline = now
+                + std::time::Duration::from_secs(bssid_ignore_timeout_secs(
+                    entry.count,
+                ));
+            entry.count
+        } else {
+            self.entries.push(BssidIgnoreEntry {
+                bssid,
+                count: 1,
+                deadline: now
+                    + std::time::Duration::from_secs(
+                        bssid_ignore_timeout_secs(1),
+                    ),
+            });
+            1
+        }
+    }
+
+    /// Whether `bssid` is currently in the ignore list.
+    pub(crate) fn is_ignored(&self, bssid: &[u8; ETH_ALEN]) -> bool {
+        let now = std::time::Instant::now();
+        self.entries
+            .iter()
+            .any(|entry| entry.bssid == *bssid && entry.deadline > now)
+    }
+
+    /// Drop all entries (after a successful connection or a network-list
+    /// update).
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 pub(crate) struct WifiIface {
     pub(crate) core: IfaceCore,
     pub(crate) caps: WiphyCaps,
@@ -295,6 +366,9 @@ pub(crate) struct WifiIface {
     pub(crate) roam: RoamEngine,
     pub(crate) wowlan: WowlanState,
     pub(crate) state: WifiState,
+    /// BSSIDs that recently rejected a connection attempt; scan-result
+    /// selection and the fast-retry path try other BSSes first.
+    pub(crate) bssid_ignore: BssidIgnoreList,
     /// PMKSA cache: reconnects and roams to a cached BSS
     /// skip the full authentication.
     pub(crate) pmksa_cache: PmksaCache,
@@ -302,4 +376,31 @@ pub(crate) struct WifiIface {
     /// change, surfaced once to the caller by `run()` (e.g. a
     /// wrong-password rejection). Cleared when reported.
     pub(crate) last_error: Option<WifiError>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BssidIgnoreList, bssid_ignore_timeout_secs};
+
+    #[test]
+    fn bssid_ignore_timeout_escalates_like_wpa_supplicant() {
+        assert_eq!(bssid_ignore_timeout_secs(1), 10);
+        assert_eq!(bssid_ignore_timeout_secs(2), 10);
+        assert_eq!(bssid_ignore_timeout_secs(3), 60);
+        assert_eq!(bssid_ignore_timeout_secs(4), 120);
+        assert_eq!(bssid_ignore_timeout_secs(5), 600);
+        assert_eq!(bssid_ignore_timeout_secs(6), 1800);
+    }
+
+    #[test]
+    fn bssid_ignore_tracks_count_and_clears() {
+        let bssid = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut list = BssidIgnoreList::default();
+        assert_eq!(list.add(bssid), 1);
+        assert!(list.is_ignored(&bssid));
+        assert_eq!(list.add(bssid), 2);
+        assert!(list.is_ignored(&bssid));
+        list.clear();
+        assert!(!list.is_ignored(&bssid));
+    }
 }

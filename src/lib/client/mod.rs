@@ -35,7 +35,7 @@ use crate::{
         PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
         PmksaEntry, entry_with_fresh_lifetime,
     },
-    scan::{SecurityType, format_ssids},
+    scan::{SecurityType, best_retry_candidate, format_ssids},
 };
 
 type Nl80211EventMsg = NetlinkMessage<genetlink::message::RawGenlMessage>;
@@ -103,8 +103,8 @@ mod wiphy;
 
 pub use state::WifiState;
 pub(crate) use state::{
-    AuthSession, IfaceCore, Link, RoamEngine, ScanEngine, WifiIface, WiphyCaps,
-    WowlanState,
+    AuthSession, BssidIgnoreList, IfaceCore, Link, RoamEngine, ScanEngine,
+    WifiIface, WiphyCaps, WowlanState,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]
