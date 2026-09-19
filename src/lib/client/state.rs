@@ -39,6 +39,59 @@ pub enum WifiState {
     FailedAuthentication,
 }
 
+/// One-shot retry path used after an established connection is lost.
+///
+/// A lost connection is different from "the configured SSID was not
+/// found": there is no reason to wait out the scan-retry backoff before
+/// the first recovery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastReconnect {
+    /// Start a host scan immediately instead of waiting out the
+    /// scan-retry backoff.
+    ScanNow,
+    /// Re-authenticate directly to the BSS that was just lost; the
+    /// normal scan is only used when this fails.
+    SameBss,
+}
+
+/// What a system-resume notification should do in the current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeAction {
+    /// Nothing to do (already scanning/authenticating, or the kernel
+    /// state could not be determined).
+    None,
+    /// The association survived; keep it.
+    KeepConnected,
+    /// The link is gone or the state machine is waiting out a
+    /// backoff: retry now.
+    RetryNow,
+    /// Credentials are known to be wrong; do not bypass the long
+    /// authentication backoff.
+    IgnoreAuthBackoff,
+}
+
+/// Decide how to react to a system resume without touching the kernel.
+///
+/// `kernel_associated` is `Some(true)` when the kernel still has a
+/// station entry, `Some(false)` when it does not, and `None` when the
+/// state could not be queried.
+pub(crate) fn resume_action(
+    state: WifiState,
+    kernel_associated: Option<bool>,
+) -> ResumeAction {
+    match state {
+        WifiState::ConnectedWithoutOffloadRekey
+        | WifiState::ConnectedWithOffloadRekey => match kernel_associated {
+            Some(true) => ResumeAction::KeepConnected,
+            Some(false) => ResumeAction::RetryNow,
+            None => ResumeAction::None,
+        },
+        WifiState::Failed | WifiState::SchedScanWait => ResumeAction::RetryNow,
+        WifiState::FailedAuthentication => ResumeAction::IgnoreAuthBackoff,
+        _ => ResumeAction::None,
+    }
+}
+
 pub(crate) struct IfaceCore {
     pub(crate) nl: ShuliNl80211Connection,
     pub(crate) event_receiver: Nl80211EventReceiver,
@@ -366,6 +419,13 @@ pub(crate) struct WifiIface {
     pub(crate) roam: RoamEngine,
     pub(crate) wowlan: WowlanState,
     pub(crate) state: WifiState,
+    /// One-shot fast retry path after an established link was lost.
+    pub(crate) fast_reconnect: Option<FastReconnect>,
+    /// System-resume notification generation receiver. The value is
+    /// changed by [`crate::WifiClient::notify_resume`].
+    pub(crate) resume_rx: tokio::sync::watch::Receiver<u64>,
+    /// Resume generation consumed by this interface.
+    pub(crate) last_resume: u64,
     /// BSSIDs that recently rejected a connection attempt; scan-result
     /// selection and the fast-retry path try other BSSes first.
     pub(crate) bssid_ignore: BssidIgnoreList,
@@ -380,7 +440,10 @@ pub(crate) struct WifiIface {
 
 #[cfg(test)]
 mod tests {
-    use super::{BssidIgnoreList, bssid_ignore_timeout_secs};
+    use super::{
+        BssidIgnoreList, ResumeAction, WifiState, bssid_ignore_timeout_secs,
+        resume_action,
+    };
 
     #[test]
     fn bssid_ignore_timeout_escalates_like_wpa_supplicant() {
@@ -402,5 +465,45 @@ mod tests {
         assert!(list.is_ignored(&bssid));
         list.clear();
         assert!(!list.is_ignored(&bssid));
+    }
+
+    #[test]
+    fn resume_keeps_a_live_association() {
+        assert_eq!(
+            resume_action(WifiState::ConnectedWithoutOffloadRekey, Some(true)),
+            ResumeAction::KeepConnected
+        );
+    }
+
+    #[test]
+    fn resume_reconnects_after_stale_association() {
+        assert_eq!(
+            resume_action(WifiState::ConnectedWithOffloadRekey, Some(false)),
+            ResumeAction::RetryNow
+        );
+        assert_eq!(
+            resume_action(WifiState::Failed, None),
+            ResumeAction::RetryNow
+        );
+        assert_eq!(
+            resume_action(WifiState::SchedScanWait, None),
+            ResumeAction::RetryNow
+        );
+    }
+
+    #[test]
+    fn resume_does_not_bypass_auth_backoff() {
+        assert_eq!(
+            resume_action(WifiState::FailedAuthentication, None),
+            ResumeAction::IgnoreAuthBackoff
+        );
+        assert_eq!(
+            resume_action(WifiState::Authenticating, None),
+            ResumeAction::None
+        );
+        assert_eq!(
+            resume_action(WifiState::ConnectedWithoutOffloadRekey, None),
+            ResumeAction::None
+        );
     }
 }

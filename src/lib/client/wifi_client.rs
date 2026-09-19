@@ -30,6 +30,8 @@ pub struct WifiIfaceState {
 pub struct WifiClient {
     pub(crate) ifaces: HashMap<String, WifiIface>,
     dispatcher_shutdown_tx: UnboundedSender<()>,
+    /// Generation counter bumped by [`WifiClient::notify_resume`].
+    resume_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl WifiClient {
@@ -69,6 +71,7 @@ impl WifiClient {
         let mut ifaces = HashMap::new();
         let mut iface_tx_by_if_index: HashMap<u32, Nl80211EventSender> =
             HashMap::new();
+        let (resume_tx, resume_rx) = tokio::sync::watch::channel(0u64);
         for config in configs {
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
             let nl = ShuliNl80211Connection::from_handle(
@@ -76,7 +79,9 @@ impl WifiClient {
                 &config.iface_name,
             )
             .await?;
-            let iface = WifiIface::init(nl, event_rx, config).await?;
+            let iface =
+                WifiIface::init(nl, event_rx, resume_rx.clone(), config)
+                    .await?;
             iface_tx_by_if_index.insert(iface.core.nl.if_index, event_tx);
             ifaces.insert(iface.core.config.iface_name.clone(), iface);
         }
@@ -92,7 +97,20 @@ impl WifiClient {
         Ok(Self {
             ifaces,
             dispatcher_shutdown_tx,
+            resume_tx,
         })
+    }
+
+    /// Notify every managed interface that the host resumed from
+    /// suspend.
+    ///
+    /// The notification is a generation bump on an internal watch
+    /// channel: it never blocks and does not touch the connection state
+    /// itself. The next drive cycle re-checks the kernel association
+    /// and cancels any retry backoff when the link is gone.
+    pub fn notify_resume(&self) {
+        self.resume_tx
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Drive every managed interface until one of them reports a state

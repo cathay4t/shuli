@@ -5,17 +5,19 @@ use wl_nl80211::{Ieee80211ReasonCode, Nl80211Command, Nl80211WowlanWakeup};
 
 use super::{
     AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, BssidIgnoreList,
-    ErrorKind, IfaceCore, Link, MAX_SCHED_SCAN_SSIDS, NetworkConfig,
-    Nl80211Attr, Nl80211Disconnect, Nl80211Event, Nl80211EventReceiver,
-    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
-    Nl80211SchedScanPlanAttr, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
-    PmksaCache, RETRY_AUTH_SEC, RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC,
-    ROAM_SIGNAL_CHECK_SECS, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS,
-    SAE_SYNC_MAX, SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
+    ErrorKind, FAST_RECONNECT_DELAY_MS, FastReconnect, IfaceCore, Link,
+    MAX_SCHED_SCAN_SSIDS, NetworkConfig, Nl80211Attr, Nl80211Disconnect,
+    Nl80211Event, Nl80211EventReceiver, Nl80211SchedScanMatch,
+    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
+    Nl80211Wowlan, Nl80211WowlanTriggersSupport, PmksaCache, RETRY_AUTH_SEC,
+    RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC, ROAM_SIGNAL_CHECK_SECS,
+    ResumeAction, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
+    SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
     SCHED_SCAN_WATCHDOG_SECS, ScanEngine, ShuliNl80211Connection, WifiConfig,
     WifiError, WifiIface, WifiState, WiphyCaps, WowlanState,
     best_retry_candidate, drain_request, format_ssids, is_eopnotsupp,
-    next_sched_scan_ssids, wiphy_sched_scan_caps, wiphy_wowlan_support,
+    next_sched_scan_ssids, resume_action, wiphy_sched_scan_caps,
+    wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
 
@@ -35,6 +37,7 @@ impl WifiIface {
     pub(crate) async fn init(
         mut nl: ShuliNl80211Connection,
         event_receiver: Nl80211EventReceiver,
+        resume_rx: tokio::sync::watch::Receiver<u64>,
         config: WifiConfig,
     ) -> Result<Self, WifiError> {
         let if_index = nl.if_index;
@@ -184,6 +187,7 @@ impl WifiIface {
             ft: None,
             pending_ft_msg1: None,
         };
+        let last_resume = *resume_rx.borrow();
 
         let mut client = WifiIface {
             core,
@@ -194,6 +198,9 @@ impl WifiIface {
             roam: RoamEngine::default(),
             wowlan: WowlanState::default(),
             state: WifiState::Init,
+            fast_reconnect: None,
+            resume_rx,
+            last_resume,
             bssid_ignore: BssidIgnoreList::default(),
             pmksa_cache: PmksaCache::default(),
             last_error: None,
@@ -351,6 +358,7 @@ impl WifiIface {
     /// error for the caller.
     pub(crate) fn fail_auth(&mut self, error: WifiError) {
         self.last_error = Some(error);
+        self.fast_reconnect = None;
         self.state = WifiState::FailedAuthentication;
     }
 
@@ -364,8 +372,41 @@ impl WifiIface {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return Ok(());
         }
+        if self.resume_pending() {
+            self.consume_resume();
+            self.handle_resume().await;
+        }
         match self.state {
             WifiState::Init => {
+                if let Some(fast) = self.fast_reconnect.take() {
+                    match fast {
+                        FastReconnect::SameBss
+                            if self.link.bss_info.bssid != [0; ETH_ALEN]
+                                && self.link.bss_info.freq_mhz != 0 =>
+                        {
+                            log::info!(
+                                "fast reconnect to last BSS: ssid={}, \
+                                 bssid={:02x?}, freq={} MHz",
+                                self.link.network.ssid,
+                                self.link.bss_info.bssid,
+                                self.link.bss_info.freq_mhz
+                            );
+                            self.send_out_auth_request().await?;
+                            self.state = WifiState::Authenticating;
+                            return Ok(());
+                        }
+                        FastReconnect::ScanNow => {
+                            log::info!("fast reconnect: scanning immediately");
+                            self.scan.hint_scan = false;
+                            self.send_out_scan_request().await?;
+                            self.state = WifiState::Scanning;
+                            return Ok(());
+                        }
+                        // No usable last BSS: fall through to the normal
+                        // hinted/scan path.
+                        FastReconnect::SameBss => {}
+                    }
+                }
                 if self.scan.hint_scan
                     && let Some((network, bss_info)) = self.scan_free_target()
                 {
@@ -481,11 +522,26 @@ impl WifiIface {
                 } else {
                     SCHED_SCAN_WATCHDOG_SECS
                 };
-                let timed = tokio::time::timeout(
-                    std::time::Duration::from_secs(wait_secs),
-                    self.core.event_receiver.next(),
-                )
-                .await;
+                let step = tokio::select! {
+                    result = tokio::time::timeout(
+                        std::time::Duration::from_secs(wait_secs),
+                        self.core.event_receiver.next(),
+                    ) => Some(result),
+                    changed = self.resume_rx.changed() => {
+                        if changed.is_err() {
+                            log::debug!("resume channel closed");
+                        }
+                        None
+                    }
+                };
+                let timed = match step {
+                    Some(timed) => timed,
+                    None => {
+                        self.consume_resume();
+                        self.handle_resume().await;
+                        return Ok(());
+                    }
+                };
                 match timed {
                     Ok(Some(raw_msg)) => {
                         if let Some(event) = Nl80211Event::parse(raw_msg) {
@@ -692,15 +748,38 @@ impl WifiIface {
                 } else {
                     0
                 };
+                let mut resumed = false;
                 let next = if wait_secs > 0 {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(wait_secs),
-                        self.core.event_receiver.next(),
-                    )
-                    .await
+                    tokio::select! {
+                        result = tokio::time::timeout(
+                            std::time::Duration::from_secs(wait_secs),
+                            self.core.event_receiver.next(),
+                        ) => result,
+                        changed = self.resume_rx.changed() => {
+                            if changed.is_err() {
+                                log::debug!("resume channel closed");
+                            }
+                            resumed = true;
+                            Ok(None)
+                        }
+                    }
                 } else {
-                    Ok(self.core.event_receiver.next().await)
+                    tokio::select! {
+                        message = self.core.event_receiver.next() => Ok(message),
+                        changed = self.resume_rx.changed() => {
+                            if changed.is_err() {
+                                log::debug!("resume channel closed");
+                            }
+                            resumed = true;
+                            Ok(None)
+                        }
+                    }
                 };
+                if resumed {
+                    self.consume_resume();
+                    self.handle_resume().await;
+                    return Ok(());
+                }
                 match next {
                     Ok(Some(raw_msg)) => {
                         if let Some(event) = Nl80211Event::parse(raw_msg) {
@@ -730,12 +809,21 @@ impl WifiIface {
                 if self.scan.sched_scan_active {
                     let _ = self.stop_sched_scan().await;
                 }
-                let secs = if self.state == WifiState::FailedAuthentication {
-                    RETRY_AUTH_SEC
+                let fast = if self.state == WifiState::Failed {
+                    self.fast_reconnect
                 } else {
-                    self.scan.scan_retry_interval
+                    None
                 };
-                log::info!("{:?}; retrying in {} seconds", self.state, secs);
+                let wait = if fast.is_some() {
+                    std::time::Duration::from_millis(FAST_RECONNECT_DELAY_MS)
+                } else if self.state == WifiState::FailedAuthentication {
+                    std::time::Duration::from_secs(RETRY_AUTH_SEC)
+                } else {
+                    std::time::Duration::from_secs(
+                        self.scan.scan_retry_interval,
+                    )
+                };
+                log::info!("{:?}; retrying in {:?}", self.state, wait);
                 // Pump events instead of sleeping blindly: the kernel
                 // delivers MLME notifications with considerable lag
                 // (AP deauth/disassoc and the reply to our own
@@ -743,20 +831,34 @@ impl WifiIface {
                 // them here, before the next attempt starts, is what
                 // keeps the reconnect flow from tripping over stale
                 // events.
-                let deadline = tokio::time::Instant::now()
-                    + std::time::Duration::from_secs(secs);
+                let deadline = tokio::time::Instant::now() + wait;
+                let mut resumed = false;
                 loop {
                     let remaining = deadline
                         .saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(
-                        remaining,
-                        self.core.event_receiver.next(),
-                    )
-                    .await
-                    {
+                    let step = tokio::select! {
+                        result = tokio::time::timeout(
+                            remaining,
+                            self.core.event_receiver.next(),
+                        ) => Some(result),
+                        changed = self.resume_rx.changed(),
+                            if self.state == WifiState::Failed =>
+                        {
+                            if changed.is_err() {
+                                log::debug!("resume channel closed");
+                            }
+                            resumed = true;
+                            None
+                        }
+                    };
+                    let timed = match step {
+                        Some(timed) => timed,
+                        None => break,
+                    };
+                    match timed {
                         Ok(Some(raw_msg)) => {
                             if let Some(event) = Nl80211Event::parse(raw_msg) {
                                 self.handle_client_event(event).await;
@@ -781,7 +883,12 @@ impl WifiIface {
                         Err(_) => break, // backoff elapsed
                     }
                 }
-                if self.state == WifiState::Failed {
+                if resumed {
+                    self.consume_resume();
+                    self.handle_resume().await;
+                }
+                if self.state == WifiState::Failed && fast.is_none() && !resumed
+                {
                     // Exponential backoff: 10 -> 20 -> 40 -> ... -> 300.
                     self.scan.scan_retry_interval =
                         (self.scan.scan_retry_interval * 2)
@@ -791,6 +898,87 @@ impl WifiIface {
             }
         }
         Ok(())
+    }
+
+    /// Whether a resume notification arrived since the last time it was
+    /// consumed.
+    fn resume_pending(&self) -> bool {
+        *self.resume_rx.borrow() != self.last_resume
+    }
+
+    /// Mark the current resume generation as consumed.
+    fn consume_resume(&mut self) {
+        self.last_resume = *self.resume_rx.borrow();
+    }
+
+    /// Re-check the kernel association after the host resumed from
+    /// suspend.
+    ///
+    /// A resume is not a command to reconnect: when the kernel still has
+    /// the association there is nothing to do. It is only used to recover
+    /// from a missed disconnect event or to cancel a pending retry
+    /// backoff when the link is gone.
+    pub(crate) async fn handle_resume(&mut self) {
+        let kernel_associated = match self.state {
+            WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey => {
+                match self.core.nl.is_associated().await {
+                    Ok(associated) => Some(associated),
+                    Err(e) => {
+                        log::warn!(
+                            "resume: failed to query association state on {}: \
+                             {e}",
+                            self.core.config.iface_name
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        match resume_action(self.state, kernel_associated) {
+            ResumeAction::None => {}
+            ResumeAction::KeepConnected => {
+                log::debug!(
+                    "resume: kernel association preserved on {}",
+                    self.core.config.iface_name
+                );
+                self.arm_wowlan_if_enabled().await;
+            }
+            ResumeAction::RetryNow => match self.state {
+                WifiState::SchedScanWait => {
+                    log::info!(
+                        "resume: restarting host scan on {}",
+                        self.core.config.iface_name
+                    );
+                    let _ = self.stop_sched_scan().await;
+                    self.scan.hint_scan = false;
+                    self.fast_reconnect = Some(FastReconnect::ScanNow);
+                    self.state = WifiState::Init;
+                }
+                WifiState::Failed => {
+                    log::info!(
+                        "resume: retrying WIFI on {}",
+                        self.core.config.iface_name
+                    );
+                    self.fast_reconnect = Some(FastReconnect::ScanNow);
+                }
+                _ => {
+                    log::warn!(
+                        "resume: association lost on {}; reconnecting",
+                        self.core.config.iface_name
+                    );
+                    self.mark_link_lost(FastReconnect::ScanNow).await;
+                }
+            },
+            ResumeAction::IgnoreAuthBackoff => {
+                log::debug!(
+                    "resume: keeping authentication backoff on {}",
+                    self.core.config.iface_name
+                );
+            }
+        }
     }
 
     /// Hand the periodic scanning over to the firmware (PNO): ask it to
@@ -1091,6 +1279,7 @@ impl WifiIface {
         self.auth.reset();
         self.roam.reset();
         self.bssid_ignore.clear();
+        self.fast_reconnect = None;
         self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
         self.state = WifiState::Init;
         log::info!(

@@ -50,6 +50,13 @@ pub(crate) const RETRY_BACKOFF_INIT_SEC: u64 = 10;
 /// Cap (seconds) for the scan-retry backoff; mirrors iwd's
 /// `MaximumPeriodicScanInterval` default.
 const RETRY_BACKOFF_MAX_SEC: u64 = 300;
+/// Delay (milliseconds) before the first retry after an established
+/// connection is lost.
+///
+/// This is not a scan-retry backoff: the disconnect event is often
+/// delivered immediately after a system resume, and wpa_supplicant
+/// likewise schedules its first recovery attempt within ~100 ms.
+pub(crate) const FAST_RECONNECT_DELAY_MS: u64 = 100;
 /// Interval (seconds) between hardware scheduled scan (PNO) iterations
 /// while hunting for the configured SSID. The firmware scans this often
 /// while the host sleeps; shuli only wakes on
@@ -102,8 +109,8 @@ mod wiphy;
 
 pub use state::WifiState;
 pub(crate) use state::{
-    AuthSession, BssidIgnoreList, IfaceCore, Link, RoamEngine, ScanEngine,
-    WifiIface, WiphyCaps, WowlanState,
+    AuthSession, BssidIgnoreList, FastReconnect, IfaceCore, Link, ResumeAction,
+    RoamEngine, ScanEngine, WifiIface, WiphyCaps, WowlanState, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]

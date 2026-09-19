@@ -143,6 +143,20 @@ impl ShuliNl80211Connection {
         drain_request(self.conn_handle.disconnect(attrs).execute().await).await
     }
 
+    /// Whether the kernel currently has a station entry for this
+    /// interface.
+    ///
+    /// This is the `iw dev <iface> station dump` equivalent: a connected
+    /// managed interface has one entry (the AP), a disconnected one has
+    /// none. It reflects the kernel's own view of the association,
+    /// unlike the client's cached state which can be stale after a
+    /// missed disconnect event.
+    pub(crate) async fn is_associated(&mut self) -> Result<bool, WifiError> {
+        let mut dump =
+            self.handle.station().dump(self.if_index).execute().await;
+        Ok(dump.try_next().await?.is_some())
+    }
+
     pub(crate) async fn authenticate(
         &mut self,
         attrs: Vec<Nl80211Attr>,

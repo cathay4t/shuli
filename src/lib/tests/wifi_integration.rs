@@ -1864,11 +1864,18 @@ async fn wifi_client_sae_pmksa_reconnect() {
         .join(":");
     hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
 
-    // Disconnect event -> Failed -> 10 s backoff -> scan -> PMKSA-cached
-    // association; allow enough iterations for the whole walk.
+    // Disconnect event -> Failed -> fast retry -> PMKSA-cached
+    // association. The old 10 s scan-retry backoff would push this past
+    // the 8 s bound below.
+    let started = std::time::Instant::now();
     let state = run_until_connected(&mut client, 40)
         .await
         .expect("reconnect");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "fast reconnect took {:?}",
+        started.elapsed()
+    );
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
@@ -1964,9 +1971,15 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
         .join(":");
     hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
 
+    let started = std::time::Instant::now();
     let state = run_until_connected(&mut client, 40)
         .await
         .expect("reconnect");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "fast reconnect took {:?}",
+        started.elapsed()
+    );
     assert!(matches!(
         state,
         WifiState::ConnectedWithoutOffloadRekey
@@ -1985,6 +1998,64 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
             .is_none(),
         "reconnect must use the cached PMKSA instead of re-deriving the PMK"
     );
+    client.shutdown().await;
+}
+
+/// A system-resume notification must cancel a pending retry backoff and
+/// re-check the link even when no disconnect event reached the client.
+#[tokio::test]
+async fn wifi_client_resume_cancels_retry_backoff() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_resume_cancels_retry_backoff: test binary \
+             not running as root (`.cargo/config.toml` runs tests via `sudo`, \
+             so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        assert!(
+            iface.core.nl.is_associated().await.expect("query"),
+            "connected interface must report associated"
+        );
+        // Simulate a resume where the disconnect event never reached
+        // the client: it is left in Failed with the long scan-retry
+        // backoff.
+        iface.fast_reconnect = None;
+        iface.scan.scan_retry_interval = 300;
+        iface.state = WifiState::Failed;
+    }
+
+    let started = std::time::Instant::now();
+    client.notify_resume();
+    let step =
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.run())
+            .await
+            .expect("resume must cancel the 300 s retry backoff")
+            .expect("resume run");
+    assert!(
+        matches!(
+            step.state,
+            WifiState::Init | WifiState::Scanning | WifiState::Authenticating
+        ),
+        "resume must leave the Failed state immediately, got {:?}",
+        step.state
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     client.shutdown().await;
 }
 
