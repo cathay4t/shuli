@@ -11,10 +11,11 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use wl_nl80211::{
     ELEMENT_ID_MDIE, ELEMENT_ID_RSN, ELEMENT_ID_RSN_EXT, Ieee80211AkmSuite,
-    Ieee80211CipherSuite, Ieee80211ElementRsn, Ieee80211RsnCapbilities,
-    Nl80211BssInfo, Nl80211Event, ap_rsne_supports_ext_key_id,
-    ap_rsne_supports_ocv, ap_rsnxe_supports_sae_h2e, ap_supports_btm,
-    ap_supports_rm_neighbor_report, parse_group_mgmt_cipher, parse_mdie,
+    Ieee80211CipherSuite, Ieee80211ElementBuffer, Ieee80211ElementRsn,
+    Ieee80211RsnCapbilities, Nl80211BssInfo, Nl80211Event,
+    ap_rsne_supports_ext_key_id, ap_rsne_supports_ocv,
+    ap_rsnxe_supports_sae_h2e, ap_supports_btm, ap_supports_rm_neighbor_report,
+    ie_at, parse_group_mgmt_cipher, parse_mdie,
 };
 
 use crate::{
@@ -741,6 +742,7 @@ impl WifiIface {
     }
 }
 
+/// Element ID of a vendor specific element; the WPA IE below uses it.
 const IE_ID_VENDOR: u8 = 0xDD;
 /// WPA vendor IE OUI (Microsoft): 00:50:F2, type 1 = WPA (WPA1/TKIP).
 const WPA_IE_OUI: [u8; 3] = [0x00, 0x50, 0xF2];
@@ -794,34 +796,30 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let mut mdie = None;
     let mut wpa_ie = false;
     let mut pos = 0;
-    while pos + 2 <= ies.len() {
-        let id = ies[pos];
-        let len = ies[pos + 1] as usize;
-        if pos + 2 + len > ies.len() {
-            break;
-        }
-        match id {
+    // An element that is not complete - trailing bytes that are too
+    // short for their Length field - ends the parse.
+    while let Ok((header, body)) = Ieee80211ElementBuffer::split(&ies[pos..]) {
+        match header.element_id {
             ELEMENT_ID_RSN if rsne.is_empty() => {
-                rsne = ies[pos..pos + 2 + len].to_vec();
+                rsne = ie_at(ies, pos).to_vec();
             }
             ELEMENT_ID_RSN_EXT if rsnxe.is_empty() => {
-                rsnxe = ies[pos..pos + 2 + len].to_vec();
+                rsnxe = ie_at(ies, pos).to_vec();
             }
             ELEMENT_ID_MDIE if mdie.is_none() => {
-                mdie = parse_mdie(&ies[pos + 2..pos + 2 + len])
+                mdie = parse_mdie(body)
                     .map(|(mdid, ft_capab)| MdieInfo { mdid, ft_capab });
             }
             IE_ID_VENDOR if !wpa_ie => {
                 // Vendor-specific: WPA (OUI 00:50:F2, type 1) marks a
                 // WPA1/TKIP AP - encrypted, but not joinable by shuli.
-                let body = &ies[pos + 2..pos + 2 + len];
                 wpa_ie = body.len() >= 4
                     && body[..3] == WPA_IE_OUI
                     && body[3] == WPA_IE_TYPE;
             }
             _ => {}
         }
-        pos += 2 + len;
+        pos += header.buffer_len();
     }
     let security = if rsne.len() > 2 {
         security_from_rsne(&rsne[2..])

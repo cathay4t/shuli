@@ -13,6 +13,7 @@ use p256::{
     ecdh::diffie_hellman,
     elliptic_curve::{Generate, sec1::ToSec1Point},
 };
+use wl_nl80211::Ieee80211ElementBuffer;
 
 use crate::{ErrorKind, WifiError, crypto::kdf};
 
@@ -22,6 +23,10 @@ const P256_COORD_LEN: usize = 32;
 /// §4.3.1), 32 bytes for P-256.
 const P256_PUBKEY_LEN: usize = P256_COORD_LEN;
 const PMK_LEN: usize = 32;
+/// Element ID Extension of the Diffie-Hellman Parameter element
+/// (IEEE 802.11-2024 §9.4.2.312): Element ID 255 with this extension
+/// carries the Diffie-Hellman parameter of the OWE exchange.
+const OWE_DH_EXTENSION_ID: u8 = 32;
 
 /// OWE Diffie-Hellman state for a single association attempt.
 pub(crate) struct OweAuth {
@@ -150,20 +155,14 @@ impl OweAuth {
 /// at the Group field).
 pub(crate) fn find_owe_dh_element(ies: &[u8]) -> Option<&[u8]> {
     let mut pos = 0;
-    while pos + 2 <= ies.len() {
-        let id = ies[pos];
-        let len = ies[pos + 1] as usize;
-        let body_start = pos + 2;
-        let body_end = body_start + len;
-        if body_end > ies.len() {
-            break;
-        }
-        // Element ID 255 (Extension) with Extension ID 32 (OWE DH).
-        if id == 255 && len >= 1 && ies[body_start] == 32 {
+    // An element that is not complete - trailing bytes that are too
+    // short for their Length field - ends the parse.
+    while let Ok((header, body)) = Ieee80211ElementBuffer::split(&ies[pos..]) {
+        if header.element_id_ext(body) == Some(OWE_DH_EXTENSION_ID) {
             // Return everything after the extension octet.
-            return Some(&ies[body_start + 1..body_end]);
+            return Some(&body[1..]);
         }
-        pos = body_end;
+        pos += header.buffer_len();
     }
     None
 }
