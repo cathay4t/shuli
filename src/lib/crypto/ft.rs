@@ -25,9 +25,12 @@
 //! with XXKey = PMK for both FT-PSK and FT-SAE.
 
 use aws_lc_rs::digest;
+use wl_nl80211::Ieee80211FtKeySubelem;
 
 use super::kdf::kdf;
-use crate::{ETH_ALEN, WifiError};
+use crate::{
+    ETH_ALEN, ErrorKind, WifiError, crypto::handshake4::aes_key_unwrap,
+};
 
 pub(crate) const FT_PTK_LEN: usize = 48;
 pub(crate) const FT_KCK_LEN: usize = 16;
@@ -155,4 +158,77 @@ pub(crate) fn ft_mic(
     data.push(transaction_seqnum);
     data.extend_from_slice(elements);
     super::handshake4::aes_cmac(kck, &data)
+}
+
+/// FTIE subelement identifiers (802.11-2020 §9.4.2.48).
+const FTIE_SUBELEM_R1KH_ID: u8 = 1;
+const FTIE_SUBELEM_R0KH_ID: u8 = 3;
+
+/// Build the FTIE of an FT Reassociation Request, MIC included
+/// (802.11-2020 §12.8.4: transaction sequence number 5 over
+/// STA-ADDR || AP-ADDR || seq || RSNE || MDIE || FTIE(MIC=0) ||
+/// [RSNXE]). `rsne` / `mdie` / `rsnxe` are full elements (with their
+/// IE headers).
+#[allow(clippy::too_many_arguments)] // the FTIE MIC covers all of them
+pub(crate) fn ftie_reassoc_request(
+    kck: &[u8; FT_KCK_LEN],
+    sta_addr: [u8; ETH_ALEN],
+    ap_addr: [u8; ETH_ALEN],
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+    r0kh_id: &[u8],
+    r1kh_id: &[u8; FT_R1KH_ID_LEN],
+    rsne: &[u8],
+    mdie: &[u8],
+    rsnxe: Option<&[u8]>,
+) -> Result<Vec<u8>, WifiError> {
+    let elem_count = 3 + u8::from(rsnxe.is_some());
+    // RSNXE Used bit in the MIC Control when the RSNXE is part of the
+    // MIC (SAE H2E networks).
+    let mic_control = [u8::from(rsnxe.is_some()), elem_count];
+
+    let body_len = 2 + 16 + 32 + 32 + (2 + 6) + (2 + r0kh_id.len());
+    let mut ftie = Vec::with_capacity(2 + body_len);
+    ftie.push(wl_nl80211::ELEMENT_ID_FTIE);
+    ftie.push(body_len as u8);
+    ftie.extend_from_slice(&mic_control);
+    let mic_pos = ftie.len();
+    ftie.extend_from_slice(&[0u8; 16]);
+    ftie.extend_from_slice(anonce);
+    ftie.extend_from_slice(snonce);
+    ftie.push(FTIE_SUBELEM_R1KH_ID);
+    ftie.push(6);
+    ftie.extend_from_slice(r1kh_id);
+    ftie.push(FTIE_SUBELEM_R0KH_ID);
+    ftie.push(r0kh_id.len() as u8);
+    ftie.extend_from_slice(r0kh_id);
+
+    let mut mic_data = Vec::with_capacity(
+        rsne.len()
+            + mdie.len()
+            + ftie.len()
+            + rsnxe.map(<[u8]>::len).unwrap_or(0),
+    );
+    mic_data.extend_from_slice(rsne);
+    mic_data.extend_from_slice(mdie);
+    mic_data.extend_from_slice(&ftie);
+    if let Some(rsnxe) = rsnxe {
+        mic_data.extend_from_slice(rsnxe);
+    }
+    let mic = ft_mic(kck, sta_addr, ap_addr, 5, &mic_data)?;
+    ftie[mic_pos..mic_pos + 16].copy_from_slice(&mic);
+    Ok(ftie)
+}
+
+/// Unwrap a group key delivered in an FTIE subelement with the KEK.
+pub(crate) fn unwrap_ft_key(
+    kek: &[u8; FT_KEK_LEN],
+    subelem: &Ieee80211FtKeySubelem,
+) -> Result<Vec<u8>, WifiError> {
+    aes_key_unwrap(kek, &subelem.wrapped_key).map_err(|e| {
+        WifiError::new(
+            ErrorKind::HandshakeFailed,
+            format!("FT key unwrap failed: {e}"),
+        )
+    })
 }

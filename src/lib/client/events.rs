@@ -4,7 +4,10 @@ use wl_nl80211::{
     Ieee80211ActionFrame, Ieee80211AkmSuite, Ieee80211AuthFrame,
     Ieee80211EapolEapFrame, Ieee80211EapolFrame, Ieee80211EapolKeyFrame,
     Ieee80211Frame, Nl80211AuthType, Nl80211Command, Nl80211UseMfp,
-    Nl80211WowlanWakeup,
+    Nl80211WowlanWakeup, ft_psk_ie_cipher, ft_sae_ext_key_ie_cipher,
+    ft_sae_ie_cipher, owe_ie_cipher, rsne_set_ext_key_id, rsne_set_ocvc,
+    sae_ext_key_ie_cipher, sae_ie_cipher, wpa2_ent_ie_cipher,
+    wpa2_ent_sha256_ie_cipher, wpa2_psk_ie_cipher, wpa2_psk_sha256_ie_cipher,
 };
 
 use super::{
@@ -12,19 +15,19 @@ use super::{
     Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, Nl80211Authenticate,
     Nl80211Event, Nl80211Key, Nl80211KeyDefaultType, Nl80211RekeyOffload,
     OweAuth, RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError,
-    WifiIface, WifiState, elements, fatal_disconnect_error,
-    fmt_transition_disable, is_fatal_disconnect_reason, owe,
-    wowlan_wakeup_requires_reconnect,
+    WifiIface, WifiState, fatal_disconnect_error, fmt_transition_disable,
+    is_fatal_disconnect_reason, owe, wowlan_wakeup_requires_reconnect,
 };
-use crate::{crypto::handshake4::FourWayState, nl80211::ClientEvent};
+use crate::crypto::handshake4::FourWayState;
 
 impl WifiIface {
-    pub(crate) async fn handle_client_event(&mut self, event: ClientEvent) {
+    pub(crate) async fn handle_client_event(&mut self, event: Nl80211Event) {
         match event {
-            ClientEvent::Nl80211(event) => self.handle_event(event).await,
-            ClientEvent::RekeyOffload { bssid, replay_ctr } => {
-                self.handle_rekey_offload_event(bssid, replay_ctr).await
+            Nl80211Event::RekeyOffload(rekey) => {
+                self.handle_rekey_offload_event(rekey.bssid, rekey.replay_ctr)
+                    .await
             }
+            event => self.handle_event(event).await,
         }
     }
 
@@ -123,7 +126,7 @@ impl WifiIface {
                                 "open-system AUTHENTICATE ok - sending OWE \
                                  ASSOCIATE"
                             );
-                            let mut ie_buf = elements::owe_ie_cipher(
+                            let mut ie_buf = owe_ie_cipher(
                                 self.link.bss_info.group_mgmt_cipher,
                             );
                             ie_buf.extend_from_slice(&dh_elem);
@@ -157,7 +160,7 @@ impl WifiIface {
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(
-                                    elements::wpa2_psk_ie_cipher(
+                                    wpa2_psk_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     mfp,
@@ -183,7 +186,7 @@ impl WifiIface {
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(
-                                    elements::wpa2_psk_sha256_ie_cipher(
+                                    wpa2_psk_sha256_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     mfp,
@@ -210,7 +213,7 @@ impl WifiIface {
                                 .then_some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(
-                                    elements::wpa2_ent_ie_cipher(
+                                    wpa2_ent_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     mfp,
@@ -232,7 +235,7 @@ impl WifiIface {
                             let mfp = Some(Nl80211UseMfp::Required);
                             if let Err(e) = self
                                 .associate(
-                                    elements::wpa2_ent_sha256_ie_cipher(
+                                    wpa2_ent_sha256_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     mfp,
@@ -251,7 +254,7 @@ impl WifiIface {
                                 "open-system AUTHENTICATE ok - sending FT-PSK \
                                  ASSOCIATE"
                             );
-                            let mut ies = elements::ft_psk_ie_cipher(
+                            let mut ies = ft_psk_ie_cipher(
                                 None,
                                 self.link.bss_info.group_mgmt_cipher,
                             );
@@ -815,22 +818,18 @@ impl WifiIface {
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
                 let rsne = match self.link.bss_info.security {
-                    SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                    SecurityType::FtSae => ft_sae_ie_cipher(
                         None,
                         self.link.bss_info.group_mgmt_cipher,
                     ),
-                    SecurityType::FtSaeExtKey => {
-                        elements::ft_sae_ext_key_ie_cipher(
-                            None,
-                            self.link.bss_info.group_mgmt_cipher,
-                        )
-                    }
-                    SecurityType::SaeExtKey => elements::sae_ext_key_ie_cipher(
+                    SecurityType::FtSaeExtKey => ft_sae_ext_key_ie_cipher(
+                        None,
                         self.link.bss_info.group_mgmt_cipher,
                     ),
-                    _ => elements::sae_ie_cipher(
+                    SecurityType::SaeExtKey => sae_ext_key_ie_cipher(
                         self.link.bss_info.group_mgmt_cipher,
                     ),
+                    _ => sae_ie_cipher(self.link.bss_info.group_mgmt_cipher),
                 };
                 let mut ies = rsne;
                 // FT initial mobility domain association: the request
@@ -1007,17 +1006,15 @@ impl WifiIface {
                         return;
                     };
                     let mut rsne = match self.link.bss_info.security {
-                        SecurityType::FtSae => elements::ft_sae_ie_cipher(
+                        SecurityType::FtSae => ft_sae_ie_cipher(
                             Some(ft.pmk_r1.name),
                             self.link.bss_info.group_mgmt_cipher,
                         ),
-                        SecurityType::FtSaeExtKey => {
-                            elements::ft_sae_ext_key_ie_cipher(
-                                Some(ft.pmk_r1.name),
-                                self.link.bss_info.group_mgmt_cipher,
-                            )
-                        }
-                        _ => elements::ft_psk_ie_cipher(
+                        SecurityType::FtSaeExtKey => ft_sae_ext_key_ie_cipher(
+                            Some(ft.pmk_r1.name),
+                            self.link.bss_info.group_mgmt_cipher,
+                        ),
+                        _ => ft_psk_ie_cipher(
                             Some(ft.pmk_r1.name),
                             self.link.bss_info.group_mgmt_cipher,
                         ),
@@ -1026,10 +1023,10 @@ impl WifiIface {
                     // RSNE in the Message 2 key data.
                     rsne.extend_from_slice(&ft.assoc_resp_ft_ies);
                     if self.link.network.ocv {
-                        elements::rsne_set_ocvc(&mut rsne, true);
+                        rsne_set_ocvc(&mut rsne, true);
                     }
                     if self.link.network.ext_key_id {
-                        elements::rsne_set_ext_key_id(&mut rsne, true);
+                        rsne_set_ext_key_id(&mut rsne, true);
                     }
                     let mut fw = FourWayState::new_ft(
                         ft.pmk_r1.clone(),
@@ -1071,7 +1068,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::owe_ie_cipher(
+                                    owe_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::HmacSha256,
@@ -1087,7 +1084,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_psk_ie_cipher(
+                                    wpa2_psk_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::HmacSha1,
@@ -1103,7 +1100,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_psk_sha256_ie_cipher(
+                                    wpa2_psk_sha256_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::AesCmac,
@@ -1119,7 +1116,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_ent_ie_cipher(
+                                    wpa2_ent_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::HmacSha1,
@@ -1135,7 +1132,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::wpa2_ent_sha256_ie_cipher(
+                                    wpa2_ent_sha256_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::AesCmac,
@@ -1157,7 +1154,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::sae_ext_key_ie_cipher(
+                                    sae_ext_key_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::HmacSha256,
@@ -1177,7 +1174,7 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    elements::sae_ie_cipher(
+                                    sae_ie_cipher(
                                         self.link.bss_info.group_mgmt_cipher,
                                     ),
                                     MicAlg::AesCmac,
@@ -1186,10 +1183,10 @@ impl WifiIface {
                         }
                     };
                     if self.link.network.ocv {
-                        elements::rsne_set_ocvc(&mut rsne, true);
+                        rsne_set_ocvc(&mut rsne, true);
                     }
                     if self.link.network.ext_key_id {
-                        elements::rsne_set_ext_key_id(&mut rsne, true);
+                        rsne_set_ext_key_id(&mut rsne, true);
                     }
                     let mut fw = FourWayState::new_with_ap_ies(
                         &pmk,

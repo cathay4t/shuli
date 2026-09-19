@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use wl_nl80211::{Nl80211Associate, Nl80211Pmksa, Nl80211UseMfp};
+use wl_nl80211::{
+    Nl80211Associate, Nl80211Pmksa, Nl80211UseMfp, ft_psk_ie_cipher,
+    ft_sae_ext_key_ie_cipher, ft_sae_ie_cipher, owe_ie_cipher,
+    rsne_set_ext_key_id, rsne_set_ocvc, sae_ext_key_ie_with_pmkid_cipher,
+    sae_ie_with_pmkid_cipher, wpa2_ent_ie_cipher, wpa2_ent_sha256_ie_cipher,
+    wpa2_psk_ie_with_pmkid_cipher, wpa2_psk_sha256_ie_with_pmkid_cipher,
+};
 
 use super::{
     MicAlg, PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaEntry,
-    WifiIface, elements, entry_with_fresh_lifetime, kdf,
+    WifiIface, entry_with_fresh_lifetime, kdf,
 };
 use crate::{
     SecurityType, WifiError, WifiState, crypto::handshake4::FourWayState,
@@ -31,7 +37,7 @@ impl WifiIface {
             );
             return true;
         }
-        match crate::crypto::ocv::oci_from_freq(self.link.bss_info.freq_mhz) {
+        match wl_nl80211::Ieee80211Oci::from_freq(self.link.bss_info.freq_mhz) {
             Some(oci) => {
                 fw.set_ocv(true, oci, self.link.bss_info.freq_mhz);
                 true
@@ -80,10 +86,10 @@ impl WifiIface {
         // advertise the OCVC RSN capability when OCV is
         // enabled for this network.
         if self.link.network.ocv {
-            elements::rsne_set_ocvc(&mut ie, true);
+            rsne_set_ocvc(&mut ie, true);
         }
         if self.link.network.ext_key_id {
-            elements::rsne_set_ext_key_id(&mut ie, true);
+            rsne_set_ext_key_id(&mut ie, true);
         }
         let mut builder = Nl80211Associate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
@@ -113,46 +119,42 @@ impl WifiIface {
     /// Both sites must stay byte-identical - the AP verifies that.
     pub(crate) fn rsne_with_pmkid(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
         match self.link.bss_info.security {
-            SecurityType::Sae => elements::sae_ie_with_pmkid_cipher(
+            SecurityType::Sae => sae_ie_with_pmkid_cipher(
                 pmkid,
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            SecurityType::SaeExtKey => {
-                elements::sae_ext_key_ie_with_pmkid_cipher(
-                    pmkid,
-                    self.link.bss_info.group_mgmt_cipher,
-                )
+            SecurityType::SaeExtKey => sae_ext_key_ie_with_pmkid_cipher(
+                pmkid,
+                self.link.bss_info.group_mgmt_cipher,
+            ),
+            SecurityType::FtSae => {
+                ft_sae_ie_cipher(pmkid, self.link.bss_info.group_mgmt_cipher)
             }
-            SecurityType::FtSae => elements::ft_sae_ie_cipher(
+            SecurityType::FtSaeExtKey => ft_sae_ext_key_ie_cipher(
                 pmkid,
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_ie_cipher(
-                pmkid,
-                self.link.bss_info.group_mgmt_cipher,
-            ),
-            SecurityType::Wpa2Psk => elements::wpa2_psk_ie_with_pmkid_cipher(
+            SecurityType::Wpa2Psk => wpa2_psk_ie_with_pmkid_cipher(
                 pmkid,
                 self.link.bss_info.group_mgmt_cipher,
             ),
             SecurityType::Wpa2PskSha256 => {
-                elements::wpa2_psk_sha256_ie_with_pmkid_cipher(
+                wpa2_psk_sha256_ie_with_pmkid_cipher(
                     pmkid,
                     self.link.bss_info.group_mgmt_cipher,
                 )
             }
-            SecurityType::Wpa2Ent => elements::wpa2_ent_ie_cipher(
-                self.link.bss_info.group_mgmt_cipher,
-            ),
-            SecurityType::Wpa2EntSha256 => elements::wpa2_ent_sha256_ie_cipher(
-                self.link.bss_info.group_mgmt_cipher,
-            ),
-            SecurityType::FtPsk => elements::ft_psk_ie_cipher(
-                pmkid,
-                self.link.bss_info.group_mgmt_cipher,
-            ),
+            SecurityType::Wpa2Ent => {
+                wpa2_ent_ie_cipher(self.link.bss_info.group_mgmt_cipher)
+            }
+            SecurityType::Wpa2EntSha256 => {
+                wpa2_ent_sha256_ie_cipher(self.link.bss_info.group_mgmt_cipher)
+            }
+            SecurityType::FtPsk => {
+                ft_psk_ie_cipher(pmkid, self.link.bss_info.group_mgmt_cipher)
+            }
             SecurityType::Owe => {
-                elements::owe_ie_cipher(self.link.bss_info.group_mgmt_cipher)
+                owe_ie_cipher(self.link.bss_info.group_mgmt_cipher)
             }
             SecurityType::Open | SecurityType::Unsupported => Vec::new(),
         }

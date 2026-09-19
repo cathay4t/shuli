@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_lc_rs::key_wrap::{self, KeyWrap};
-use wl_nl80211::Ieee80211EapolKeyFrame;
+use wl_nl80211::{
+    Ieee80211EapolKeyFrame, Ieee80211KeyDataKdes, Ieee80211Oci, build_oci_kde,
+    parse_oci_kde,
+};
 
 use crate::{
     ErrorKind, WifiError,
     crypto::{
         ft::PmkR1,
-        handshake4::{
-            FourWayState, KEK_LEN, KeyDataKdes, MicAlg, aes_cmac,
-            aes_key_unwrap, parse_gtk_kde, parse_key_data_kdes,
-        },
+        handshake4::{FourWayState, KEK_LEN, MicAlg, aes_cmac, aes_key_unwrap},
         kdf::hmac_sha256_mic,
-        ocv::{build_oci_kde, parse_oci_kde},
     },
 };
+
+/// The OCI of a 20 MHz STA: operating class, channel, segment 0.
+fn oci(operating_class: u8, channel: u8) -> Ieee80211Oci {
+    Ieee80211Oci {
+        operating_class,
+        channel,
+        segment: 0,
+    }
+}
 
 fn aes_key_wrap(
     kek_bytes: &[u8; KEK_LEN],
@@ -174,25 +182,6 @@ fn test_gtk_unwrap() {
 }
 
 #[test]
-fn test_parse_gtk_kde() {
-    let gtk = [0x77u8; 16];
-    let mut kde = vec![
-        0xDD,
-        (6 + gtk.len()) as u8,
-        0x00,
-        0x0F,
-        0xAC,
-        0x01,
-        0x01,
-        0x00,
-    ];
-    kde.extend_from_slice(&gtk);
-    let (idx, parsed) = parse_gtk_kde(&kde).unwrap();
-    assert_eq!(idx, 1);
-    assert_eq!(parsed, gtk.to_vec());
-}
-
-#[test]
 fn test_group_rekey() {
     let pmk = [0x11u8; 32];
     let sta = [0x03u8; 6];
@@ -338,64 +327,12 @@ fn build_mgmt_key_kde(
     kde
 }
 
-#[test]
-fn test_parse_key_data_kdes_all() {
-    let gtk = [0x77u8; 16];
-    let igtk = [0x88u8; 16];
-    let bigtk = [0x99u8; 16];
-    let ipn = [1, 2, 3, 4, 5, 6];
-    let rsne = vec![0x30, 0x02, 0x01, 0x00];
-    let rsnxe = vec![0xF4, 0x01, 0x20];
-
-    let mut key_data = vec![
-        0xDD,
-        (6 + gtk.len()) as u8,
-        0x00,
-        0x0F,
-        0xAC,
-        0x01,
-        0x02,
-        0x00,
-    ];
-    key_data.extend_from_slice(&gtk);
-    key_data.extend_from_slice(&build_mgmt_key_kde(9, 4, &ipn, &igtk));
-    key_data.extend_from_slice(&build_mgmt_key_kde(14, 6, &ipn, &bigtk));
-    // Key ID KDE (Extended Key ID): OUI(3) type(2) key_id(2 LE).
-    key_data.extend_from_slice(&[0xDD, 6, 0x00, 0x0F, 0xAC, 10, 1, 0]);
-    // Transition Disable KDE (WFA OUI 50:6F:9A, type 0x20, bitmap 0x09
-    // = WPA3-Personal + WPA3-Enterprise disabled).
-    key_data.extend_from_slice(&[0xDD, 5, 0x50, 0x6F, 0x9A, 0x20, 0x09]);
-    key_data.extend_from_slice(&rsne);
-    key_data.extend_from_slice(&rsnxe);
-
-    let kdes = parse_key_data_kdes(&key_data);
-    assert_eq!(kdes.gtk, Some((2, gtk.to_vec())));
-    assert_eq!(
-        kdes.igtk
-            .as_ref()
-            .map(|k| (k.key_index, k.ipn, k.key.clone())),
-        Some((4, ipn, igtk.to_vec()))
-    );
-    assert_eq!(
-        kdes.bigtk
-            .as_ref()
-            .map(|k| (k.key_index, k.ipn, k.key.clone())),
-        Some((6, ipn, bigtk.to_vec()))
-    );
-    assert_eq!(kdes.rsne.as_deref(), Some(rsne.as_slice()));
-    assert_eq!(kdes.rsnxe.as_deref(), Some(rsnxe.as_slice()));
-    assert_eq!(kdes.transition_disable, Some(0x09));
-    assert_eq!(kdes.key_id, Some(1));
-    // parse_gtk_kde keeps its GTK-only contract on top of the full parser.
-    assert_eq!(parse_gtk_kde(&key_data), Some((2, gtk.to_vec())));
-}
-
 /// Run Message 1 then a wrapped Message 3 against `state`, returning the
 /// parsed Message 4 and the Message 3 KDEs.
 fn run_msg1_msg3(
     state: &mut FourWayState,
     key_data_plain: &[u8],
-) -> Result<(Vec<u8>, KeyDataKdes), WifiError> {
+) -> Result<(Vec<u8>, Ieee80211KeyDataKdes), WifiError> {
     let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008, // ack + pairwise
         16,
@@ -572,7 +509,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         vec![],
         vec![],
     );
-    state.set_ocv(true, [81, 1, 0], 2412);
+    state.set_ocv(true, oci(81, 1), 2412);
 
     let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008,
@@ -596,14 +533,14 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
     let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
     assert_eq!(
         parse_oci_kde(&m2.key_data),
-        Some([81, 1, 0]),
+        Some(oci(81, 1)),
         "Message 2 must carry the STA OCI KDE"
     );
 
     // Message 3 with a matching OCI: accepted.
     let kck = state.kck().unwrap();
     let kek = state.kek().unwrap();
-    let mut key_data = build_oci_kde(&[81, 1, 0]);
+    let mut key_data = build_oci_kde(oci(81, 1));
     while key_data.len() < 16 || !key_data.len().is_multiple_of(8) {
         key_data.push(0);
     }
@@ -637,7 +574,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         vec![],
         vec![],
     );
-    state2.set_ocv(true, [81, 1, 0], 2412);
+    state2.set_ocv(true, oci(81, 1), 2412);
     let msg1 = Ieee80211EapolKeyFrame::build(
         0x0080 | 0x0008,
         16,
@@ -698,7 +635,10 @@ fn test_extended_key_id_handshake() {
     let ap = [0x04u8; 6];
 
     let run =
-        |key_data: Vec<u8>| -> Result<(FourWayState, KeyDataKdes), WifiError> {
+        |key_data: Vec<u8>| -> Result<
+            (FourWayState, Ieee80211KeyDataKdes),
+            WifiError,
+        > {
             let mut state = FourWayState::new_with_ap_ies(
                 &pmk,
                 MicAlg::AesCmac,

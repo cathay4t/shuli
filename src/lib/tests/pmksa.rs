@@ -122,9 +122,9 @@ fn test_rsne_pmkid_builder_roundtrip() {
     // The PMKID must appear verbatim in the RSNE built for association
     // and Message 2 (17th/18th bytes of the body = pmkid_count, then
     // the PMKID itself).
-    use crate::ieee80211::elements;
+    use wl_nl80211::sae_ie_with_pmkid_cipher;
     let pmkid = [0xAB; 16];
-    let ie = elements::sae_ie_with_pmkid_cipher(
+    let ie = sae_ie_with_pmkid_cipher(
         Some(pmkid),
         wl_nl80211::Ieee80211CipherSuite::BipCmac128,
     );
@@ -134,7 +134,7 @@ fn test_rsne_pmkid_builder_roundtrip() {
     assert_eq!(pmkid_count, 1);
     assert_eq!(&ie[24..40], pmkid.as_slice());
     // No PMKID: count must be zero.
-    let ie = elements::sae_ie_with_pmkid_cipher(
+    let ie = sae_ie_with_pmkid_cipher(
         None,
         wl_nl80211::Ieee80211CipherSuite::BipCmac128,
     );

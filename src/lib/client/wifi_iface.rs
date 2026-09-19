@@ -17,10 +17,7 @@ use super::{
     best_retry_candidate, drain_request, format_ssids, is_eopnotsupp,
     next_sched_scan_ssids, wiphy_sched_scan_caps, wiphy_wowlan_support,
 };
-use crate::{
-    BssInfo, ETH_ALEN,
-    nl80211::{ClientEvent, parse_client_event},
-};
+use crate::{BssInfo, ETH_ALEN};
 
 impl WifiIface {
     /// Pick the first configured network whose hints are complete
@@ -338,7 +335,7 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
-                    if let Some(event) = parse_client_event(raw_msg) {
+                    if let Some(event) = Nl80211Event::parse(raw_msg) {
                         self.handle_client_event(event).await;
                     }
                 }
@@ -491,19 +488,15 @@ impl WifiIface {
                 .await;
                 match timed {
                     Ok(Some(raw_msg)) => {
-                        if let Some(event) = parse_client_event(raw_msg) {
+                        if let Some(event) = Nl80211Event::parse(raw_msg) {
                             match event {
-                                ClientEvent::Nl80211(
-                                    Nl80211Event::Unknown(
-                                        Nl80211Command::SchedScanResults,
-                                    ),
+                                Nl80211Event::Unknown(
+                                    Nl80211Command::SchedScanResults,
                                 ) => {
                                     self.handle_sched_scan_results().await?;
                                 }
-                                ClientEvent::Nl80211(
-                                    Nl80211Event::Unknown(
-                                        Nl80211Command::SchedScanStopped,
-                                    ),
+                                Nl80211Event::Unknown(
+                                    Nl80211Command::SchedScanStopped,
                                 ) => {
                                     if self.scan.sched_scan_stop_pending {
                                         // Echo of our own stop request
@@ -602,7 +595,7 @@ impl WifiIface {
                     .await;
                     match timed {
                         Ok(Some(raw_msg)) => {
-                            if let Some(event) = parse_client_event(raw_msg) {
+                            if let Some(event) = Nl80211Event::parse(raw_msg) {
                                 self.handle_client_event(event).await;
                             }
                             break;
@@ -710,7 +703,7 @@ impl WifiIface {
                 };
                 match next {
                     Ok(Some(raw_msg)) => {
-                        if let Some(event) = parse_client_event(raw_msg) {
+                        if let Some(event) = Nl80211Event::parse(raw_msg) {
                             self.handle_client_event(event).await;
                         }
                     }
@@ -765,7 +758,7 @@ impl WifiIface {
                     .await
                     {
                         Ok(Some(raw_msg)) => {
-                            if let Some(event) = parse_client_event(raw_msg) {
+                            if let Some(event) = Nl80211Event::parse(raw_msg) {
                                 self.handle_client_event(event).await;
                             }
                             if !matches!(

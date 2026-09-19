@@ -12,7 +12,10 @@
 //! MIC (RFC 8110 Table 2).
 
 use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
-use wl_nl80211::Ieee80211EapolKeyFrame;
+use wl_nl80211::{
+    Ieee80211EapolKeyFrame, Ieee80211KeyDataKdes, Ieee80211Oci, build_oci_kde,
+    parse_key_data_kdes,
+};
 
 use crate::{ErrorKind, WifiError, crypto::kdf};
 
@@ -67,7 +70,7 @@ pub struct FourWayState {
     /// group rekeys, and send our OCI in Message 2).
     ocv: bool,
     /// Our OCI (operating class, channel, segment) for OCV.
-    oci: Option<[u8; 3]>,
+    oci: Option<Ieee80211Oci>,
     /// BSS frequency (MHz) the OCI must match.
     freq_mhz: u32,
     /// Extended Key ID for pairwise keys (driver must
@@ -163,7 +166,7 @@ impl FourWayState {
 
     /// enable OCV for this handshake with our OCI and the
     /// BSS frequency to validate against.
-    pub fn set_ocv(&mut self, enabled: bool, oci: [u8; 3], freq_mhz: u32) {
+    pub fn set_ocv(&mut self, enabled: bool, oci: Ieee80211Oci, freq_mhz: u32) {
         self.ocv = enabled;
         self.oci = Some(oci);
         self.freq_mhz = freq_mhz;
@@ -327,8 +330,7 @@ impl FourWayState {
         if self.ocv
             && let Some(oci) = self.oci
         {
-            key_data
-                .extend_from_slice(&crate::crypto::ocv::build_oci_kde(&oci));
+            key_data.extend_from_slice(&build_oci_kde(oci));
         }
         let mut msg2 = Ieee80211EapolKeyFrame::build_message_2(
             &self.snonce,
@@ -353,7 +355,7 @@ impl FourWayState {
     pub fn process_message_3(
         &mut self,
         frame: &Ieee80211EapolKeyFrame,
-    ) -> Result<(Vec<u8>, KeyDataKdes), WifiError> {
+    ) -> Result<(Vec<u8>, Ieee80211KeyDataKdes), WifiError> {
         // 802.11-2020 §12.7.6.4: replay counter must be >= Message 1's.
         if frame.replay_counter < self.replay_counter {
             return Err(WifiError::new(
@@ -384,7 +386,7 @@ impl FourWayState {
 
         // Unwrap the key data and parse its KDEs: GTK plus (with PMF) the
         // IGTK / BIGTK and the AP's RSNE / RSNXE.
-        let mut kdes = KeyDataKdes::default();
+        let mut kdes = Ieee80211KeyDataKdes::default();
         if !frame.key_data.is_empty() {
             let kek = self.kek().ok_or_else(|| {
                 WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
@@ -447,7 +449,10 @@ impl FourWayState {
 
     /// RSNE / RSNXE downgrade check for Message 3. Skipped when no
     /// AP RSNE was recorded (e.g. unit tests building handshakes by hand).
-    fn validate_ap_ies(&self, kdes: &KeyDataKdes) -> Result<(), WifiError> {
+    fn validate_ap_ies(
+        &self,
+        kdes: &Ieee80211KeyDataKdes,
+    ) -> Result<(), WifiError> {
         if self.ap_rsne.is_empty() {
             return Ok(());
         }
@@ -461,10 +466,7 @@ impl FourWayState {
         // which the beacon RSNE lacks; compare while ignoring the PMKID
         // list there (wpa_supplicant compares strictly otherwise).
         let rsne_ok = if self.ft_pmk_r1.is_some() {
-            crate::ieee80211::elements::rsne_match_ignore_pmkid(
-                rsne,
-                &self.ap_rsne,
-            )
+            wl_nl80211::rsne_match_ignore_pmkid(rsne, &self.ap_rsne)
         } else {
             rsne == &self.ap_rsne
         };
@@ -590,131 +592,6 @@ pub(crate) fn aes_cmac(
     let mut mic = [0u8; EAPOL_MIC_LEN];
     mic.copy_from_slice(tag.as_ref());
     Ok(mic)
-}
-
-/// An IGTK or BIGTK extracted from its EAPOL-Key key data KDE: key index,
-/// the 6-octet IPN (initial packet number = RX sequence counter) and the
-/// key itself (802.11-2020 §12.7.2, KDE types 9 and 10).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MgmtKeyKde {
-    pub key_index: u8,
-    pub ipn: [u8; 6],
-    pub key: Vec<u8>,
-}
-
-/// The KDEs / IEs parsed out of a decrypted EAPOL-Key key data field
-/// (Message 3 of the 4-way handshake).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct KeyDataKdes {
-    /// GTK KDE (type 1): (key index, GTK).
-    pub gtk: Option<(u8, Vec<u8>)>,
-    /// IGTK KDE (type 9), present on every PMF AP.
-    pub igtk: Option<MgmtKeyKde>,
-    /// BIGTK KDE (type 10), present when the AP enables beacon protection.
-    pub bigtk: Option<MgmtKeyKde>,
-    /// The AP's RSNE as a full element (ID + length + body).
-    pub rsne: Option<Vec<u8>>,
-    /// The AP's RSNXE as a full element (ID 244 + length + body).
-    pub rsnxe: Option<Vec<u8>>,
-    /// Extended Key ID KDE (type 10): the pairwise key id (0/1) the AP
-    /// selected.
-    pub key_id: Option<u8>,
-    /// Transition Disable KDE bitmap (WFA OUI 50:6F:9A, type 0x20):
-    /// bit 0 = WPA3-Personal, 1 = SAE-PK, 2 = WPA3-Enterprise,
-    /// 3 = Enhanced Open.
-    pub transition_disable: Option<u8>,
-}
-
-const KDE_OUI: [u8; 3] = [0x00, 0x0F, 0xAC];
-const WFA_OUI: [u8; 3] = [0x50, 0x6F, 0x9A];
-const GTK_KDE_TYPE: u8 = 1;
-const IGTK_KDE_TYPE: u8 = 9;
-const KEY_ID_KDE_TYPE: u8 = 10;
-const BIGTK_KDE_TYPE: u8 = 14;
-const WFA_TRANSITION_DISABLE_TYPE: u8 = 0x20;
-const IE_ID_RSN: u8 = 48;
-const IE_ID_RSNXE: u8 = 244;
-
-/// Parse the (decrypted) EAPOL-Key key data of Message 3: a sequence of
-/// KDEs (vendor elements with OUI 00-0F-AC) and plain IEs. Collects the
-/// GTK, IGTK and BIGTK KDEs plus the AP's RSNE / RSNXE for the downgrade
-/// check.
-pub(crate) fn parse_key_data_kdes(key_data: &[u8]) -> KeyDataKdes {
-    let mut kdes = KeyDataKdes::default();
-    let mut pos = 0;
-    while pos + 2 <= key_data.len() {
-        let id = key_data[pos];
-        let len = key_data[pos + 1] as usize;
-        let body_start = pos + 2;
-        let body_end = body_start + len;
-        if body_end > key_data.len() {
-            break;
-        }
-        let body = &key_data[body_start..body_end];
-        match id {
-            0xDD if body.len() >= 4 && body[..3] == WFA_OUI => {
-                // WFA vendor KDEs: Transition Disable (type 0x20)
-                // carries a bitmap after the OUI + type.
-                if body[3] == WFA_TRANSITION_DISABLE_TYPE && body.len() >= 5 {
-                    kdes.transition_disable = Some(body[4]);
-                }
-            }
-            0xDD if body.len() >= 4 && body[..3] == KDE_OUI => {
-                let data_type = body[3];
-                match data_type {
-                    GTK_KDE_TYPE => {
-                        // body: OUI(3) type(1) keyinfo(1) reserved(1) GTK(..)
-                        if body.len() >= 7 {
-                            let key_id = body[4] & 0x03;
-                            let gtk = body[6..].to_vec();
-                            if !gtk.is_empty() {
-                                kdes.gtk = Some((key_id, gtk));
-                            }
-                        }
-                    }
-                    IGTK_KDE_TYPE | BIGTK_KDE_TYPE
-                        if body.len() >= 4 + 8 + 16 =>
-                    {
-                        // body: OUI(3) type(1) KeyID(2 LE) IPN(6) Key(..)
-                        let mgmt_key = MgmtKeyKde {
-                            key_index: u16::from_le_bytes([body[4], body[5]])
-                                as u8,
-                            ipn: [
-                                body[6], body[7], body[8], body[9], body[10],
-                                body[11],
-                            ],
-                            key: body[12..].to_vec(),
-                        };
-                        if data_type == IGTK_KDE_TYPE {
-                            kdes.igtk = Some(mgmt_key);
-                        } else {
-                            kdes.bigtk = Some(mgmt_key);
-                        }
-                    }
-                    KEY_ID_KDE_TYPE if body.len() >= 5 => {
-                        // Key ID KDE: OUI(3) type(1) key_id(2 LE); only
-                        // the low two bits of the first octet are used.
-                        kdes.key_id = Some(body[4] & 0x03);
-                    }
-                    _ => {}
-                }
-            }
-            IE_ID_RSN => kdes.rsne = Some(key_data[pos..body_end].to_vec()),
-            IE_ID_RSNXE => kdes.rsnxe = Some(key_data[pos..body_end].to_vec()),
-            _ => {}
-        }
-        pos = body_end;
-    }
-    kdes
-}
-
-/// Parse a GTK KDE from (decrypted) EAPOL-Key key data. Returns (key index,
-/// GTK). Key data is a sequence of KDEs/IEs; the GTK KDE has element id 0xDD,
-/// OUI 00-0F-AC, data type 1, followed by a key-info octet (low 2 bits = key
-/// id), a reserved octet, then the GTK.
-#[allow(dead_code)] // kept for tests; group rekey uses parse_key_data_kdes
-pub(crate) fn parse_gtk_kde(key_data: &[u8]) -> Option<(u8, Vec<u8>)> {
-    parse_key_data_kdes(key_data).gtk
 }
 
 /// AES Key Unwrap (RFC 3394 / NIST SP 800-38F) for GTK extraction.

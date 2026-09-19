@@ -2,11 +2,15 @@
 
 //! Unit tests for the scan-phase security classification.
 
-use wl_nl80211::Nl80211BssInfo;
+use wl_nl80211::{
+    Ieee80211CipherSuite, Nl80211BssInfo, parse_group_mgmt_cipher,
+    wpa2_ent_ie_cipher, wpa2_ent_sha256_ie_cipher,
+    wpa2_psk_ie_with_pmkid_cipher,
+};
 
 use crate::{
     nl80211::extract_signal_dbm,
-    scan::{SecurityType, detect_security},
+    scan::{SecurityType, detect_security, negotiate_group_mgmt_cipher},
 };
 
 /// Build an RSNE element (ID 48 + length + body) advertising a single
@@ -182,4 +186,44 @@ fn test_rsne_with_bogus_akm_suite_oid_is_unsupported() {
     ies.extend_from_slice(&body);
     let sec = detect_security(&ies);
     assert_eq!(sec.security, SecurityType::Unsupported);
+}
+
+/// The negotiated BIP cipher is parsed back from built RSNEs (with and
+/// without a PMKID) and defaults to BIP-CMAC-128.
+#[test]
+fn group_mgmt_cipher_negotiation_roundtrip() {
+    let gmac256 = wpa2_ent_sha256_ie_cipher(Ieee80211CipherSuite::BipGmac256);
+    assert_eq!(
+        parse_group_mgmt_cipher(&gmac256),
+        Some(Ieee80211CipherSuite::BipGmac256)
+    );
+    assert_eq!(
+        negotiate_group_mgmt_cipher(&gmac256),
+        Ieee80211CipherSuite::BipGmac256
+    );
+
+    let cmac256 = wpa2_psk_ie_with_pmkid_cipher(
+        Some([0xAB; 16]),
+        Ieee80211CipherSuite::BipCmac256,
+    );
+    assert_eq!(
+        parse_group_mgmt_cipher(&cmac256),
+        Some(Ieee80211CipherSuite::BipCmac256),
+        "parse must skip the PMKID list before the mgmt cipher"
+    );
+    assert_eq!(
+        negotiate_group_mgmt_cipher(&cmac256),
+        Ieee80211CipherSuite::BipCmac256
+    );
+
+    let cmac128 = wpa2_ent_ie_cipher(Ieee80211CipherSuite::BipCmac128);
+    assert_eq!(
+        negotiate_group_mgmt_cipher(&cmac128),
+        Ieee80211CipherSuite::BipCmac128
+    );
+    assert_eq!(
+        negotiate_group_mgmt_cipher(&[]),
+        Ieee80211CipherSuite::BipCmac128,
+        "missing group mgmt cipher defaults to BIP-CMAC-128"
+    );
 }

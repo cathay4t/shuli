@@ -18,14 +18,21 @@
 use aws_lc_rs::rand::SecureRandom;
 use futures::StreamExt;
 use wl_nl80211::{
+    ELEMENT_ID_FTIE, ELEMENT_ID_MDIE, ELEMENT_ID_RSN, ELEMENT_ID_RSN_EXT,
     Ieee80211ActionFrame, Ieee80211ActionFrameBtmRequest,
     Ieee80211ActionFrameBtmResponse, Ieee80211ActionFrameNeighborReportRequest,
     Ieee80211ActionFrameNeighborReportResponse,
     Ieee80211AuthFrameFastBssTransition, Ieee80211BtmRequest,
     Ieee80211BtmResponse, Ieee80211Frame, Ieee80211NeighborReportRequest,
-    Ieee80211NeighborReportResponse, Ieee80211StatusCode, Nl80211Associate,
-    Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm, Nl80211CqmAttr,
-    Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent, Nl80211UseMfp,
+    Ieee80211NeighborReportResponse, Ieee80211OperatingClass,
+    Ieee80211StatusCode, Nl80211Associate, Nl80211AuthType,
+    Nl80211Authenticate, Nl80211Cqm, Nl80211CqmAttr, Nl80211CqmRssiEvent,
+    Nl80211CqmRssiThresholdEvent, Nl80211Event, Nl80211UseMfp, find_ie,
+    find_ie_pos, ft_psk_ie_cipher, ft_psk_rsne_cipher,
+    ft_sae_ext_key_ie_cipher, ft_sae_ext_key_rsne_cipher, ft_sae_ie_cipher,
+    ft_sae_rsne_cipher, ftie_auth_request, ie_at, mdie, parse_ftie, parse_mdie,
+    rsne_first_pmkid, rsne_match_ignore_pmkid, rsne_set_ext_key_id,
+    rsne_set_ocvc, sae_rsnxe,
 };
 
 use crate::{
@@ -34,12 +41,10 @@ use crate::{
     crypto::{
         ft::{
             FT_PTK_LEN, PmkR0, PmkR1, derive_ft_ptk, derive_pmk_r0,
-            derive_pmk_r1,
+            derive_pmk_r1, ftie_reassoc_request, unwrap_ft_key,
         },
         handshake4::FourWayState,
     },
-    ieee80211::elements,
-    nl80211::{ClientEvent, parse_client_event},
     scan::{BssInfo, SecurityType},
 };
 
@@ -156,13 +161,13 @@ impl WifiIface {
         &self,
         ies: &mut Vec<u8>,
     ) -> Result<(), WifiError> {
-        let Some(mdie) = self.link.bss_info.mdie else {
+        let Some(mdie_info) = self.link.bss_info.mdie else {
             return Err(WifiError::new(
                 ErrorKind::Roaming,
                 "FT BSS without MDIE in scan results",
             ));
         };
-        ies.extend_from_slice(&elements::mdie(mdie.mdid, mdie.ft_capab));
+        ies.extend_from_slice(&mdie(mdie_info.mdid, mdie_info.ft_capab));
         Ok(())
     }
 
@@ -175,22 +180,21 @@ impl WifiIface {
         &mut self,
         ies: &[u8],
     ) -> Result<(), WifiError> {
-        let (mdid, ft_capab) = elements::find_ie(ies, elements::IE_ID_MDIE)
-            .and_then(elements::parse_mdie)
+        let (mdid, ft_capab) = find_ie(ies, ELEMENT_ID_MDIE)
+            .and_then(parse_mdie)
             .ok_or_else(|| {
                 WifiError::new(
                     ErrorKind::Roaming,
                     "no MDIE in FT association response",
                 )
             })?;
-        let ftie_body = elements::find_ie(ies, elements::IE_ID_FTIE)
-            .ok_or_else(|| {
-                WifiError::new(
-                    ErrorKind::Roaming,
-                    "no FTIE in FT association response",
-                )
-            })?;
-        let ftie = elements::parse_ftie(ftie_body).ok_or_else(|| {
+        let ftie_body = find_ie(ies, ELEMENT_ID_FTIE).ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::Roaming,
+                "no FTIE in FT association response",
+            )
+        })?;
+        let ftie = parse_ftie(ftie_body).ok_or_else(|| {
             WifiError::new(
                 ErrorKind::Roaming,
                 "malformed FTIE in FT association response",
@@ -238,11 +242,11 @@ impl WifiIface {
         // MDIE + FTIE of the response are echoed in the 4-way Message 2
         // key data for FT AKMs.
         let mut assoc_resp_ft_ies = Vec::new();
-        if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_MDIE) {
-            assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
+        if let Some(pos) = find_ie_pos(ies, ELEMENT_ID_MDIE) {
+            assoc_resp_ft_ies.extend_from_slice(ie_at(ies, pos));
         }
-        if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_FTIE) {
-            assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
+        if let Some(pos) = find_ie_pos(ies, ELEMENT_ID_FTIE) {
+            assoc_resp_ft_ies.extend_from_slice(ie_at(ies, pos));
         }
 
         log::debug!(
@@ -571,10 +575,8 @@ impl WifiIface {
                 break;
             }
             let Some(freq) =
-                crate::ieee80211::band::operating_class_channel_to_freq(
-                    candidate.operating_class,
-                    candidate.channel,
-                )
+                Ieee80211OperatingClass::from(candidate.operating_class)
+                    .channel_to_freq(candidate.channel)
             else {
                 continue;
             };
@@ -643,10 +645,8 @@ impl WifiIface {
                 break;
             }
             let Some(freq) =
-                crate::ieee80211::band::operating_class_channel_to_freq(
-                    entry.operating_class,
-                    entry.channel,
-                )
+                Ieee80211OperatingClass::from(entry.operating_class)
+                    .channel_to_freq(entry.channel)
             else {
                 continue;
             };
@@ -719,29 +719,26 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
-                    if let Some(event) = parse_client_event(raw_msg) {
+                    if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {
-                            ClientEvent::Nl80211(
-                                wl_nl80211::Nl80211Event::Frame(
-                                    Ieee80211Frame::Action(
-                                        Ieee80211ActionFrame::NeighborReportResponse(
-                                            frame,
-                                        ),
-                                    ),
+                            Nl80211Event::Frame(Ieee80211Frame::Action(
+                                Ieee80211ActionFrame::NeighborReportResponse(
+                                    frame,
                                 ),
-                            ) => {
+                            )) => {
                                 self.handle_rrm_frame(&frame).await;
                                 if self.roam.pending_nr_dialog.is_none() {
                                     return;
                                 }
                             }
-                            ClientEvent::Nl80211(_) => {}
-                            ClientEvent::RekeyOffload { bssid, replay_ctr } => {
+                            Nl80211Event::RekeyOffload(rekey) => {
                                 self.handle_rekey_offload_event(
-                                    bssid, replay_ctr,
+                                    rekey.bssid,
+                                    rekey.replay_ctr,
                                 )
                                 .await;
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -972,28 +969,22 @@ impl WifiIface {
         // request with INVALID_PMKID when the RSNE / PMKR0Name is
         // missing.
         let rsne = match self.link.bss_info.security {
-            SecurityType::FtSae => elements::ft_sae_rsne_cipher(
+            SecurityType::FtSae => ft_sae_rsne_cipher(
                 Some(ft.pmk_r0.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
+            SecurityType::FtSaeExtKey => ft_sae_ext_key_rsne_cipher(
                 Some(ft.pmk_r0.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            _ => elements::ft_psk_rsne_cipher(
+            _ => ft_psk_rsne_cipher(
                 Some(ft.pmk_r0.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
         };
         let mut ft_ies = rsne;
-        ft_ies.extend_from_slice(&elements::mdie(
-            target_mdie.mdid,
-            target_mdie.ft_capab,
-        ));
-        ft_ies.extend_from_slice(&elements::ftie_auth_request(
-            &snonce,
-            &ft.r0kh_id,
-        ));
+        ft_ies.extend_from_slice(&mdie(target_mdie.mdid, target_mdie.ft_capab));
+        ft_ies.extend_from_slice(&ftie_auth_request(&snonce, &ft.r0kh_id));
 
         log::info!(
             "FT roam to {:02x?} (freq {} MHz): sending FT AUTHENTICATE",
@@ -1085,8 +1076,8 @@ impl WifiIface {
         }
         let ies = auth.body();
 
-        let mdie = elements::find_ie(ies, elements::IE_ID_MDIE)
-            .and_then(elements::parse_mdie)
+        let mdie = find_ie(ies, ELEMENT_ID_MDIE)
+            .and_then(parse_mdie)
             .ok_or_else(|| {
                 WifiError::new(
                     ErrorKind::Roaming,
@@ -1100,14 +1091,10 @@ impl WifiIface {
             ));
         }
 
-        let ftie_body = elements::find_ie(ies, elements::IE_ID_FTIE)
-            .ok_or_else(|| {
-                WifiError::new(
-                    ErrorKind::Roaming,
-                    "no FTIE in FT auth response",
-                )
-            })?;
-        let ftie = elements::parse_ftie(ftie_body).ok_or_else(|| {
+        let ftie_body = find_ie(ies, ELEMENT_ID_FTIE).ok_or_else(|| {
+            WifiError::new(ErrorKind::Roaming, "no FTIE in FT auth response")
+        })?;
+        let ftie = parse_ftie(ftie_body).ok_or_else(|| {
             WifiError::new(
                 ErrorKind::Roaming,
                 "malformed FTIE in FT auth response",
@@ -1136,8 +1123,8 @@ impl WifiIface {
         };
 
         // The response RSNE carries PMKR0Name as its PMKID.
-        if let Some(rsne_body) = elements::find_ie(ies, elements::IE_ID_RSNE)
-            && let Some(pmkid) = elements::rsne_first_pmkid(rsne_body)
+        if let Some(rsne_body) = find_ie(ies, ELEMENT_ID_RSN)
+            && let Some(pmkid) = rsne_first_pmkid(rsne_body)
             && pmkid != ft.pmk_r0.name
         {
             return Err(WifiError::new(
@@ -1195,20 +1182,20 @@ impl WifiIface {
         })?;
 
         let rsne = match target.security {
-            SecurityType::FtSae => elements::ft_sae_rsne_cipher(
+            SecurityType::FtSae => ft_sae_rsne_cipher(
                 Some(pmk_r1.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_rsne_cipher(
+            SecurityType::FtSaeExtKey => ft_sae_ext_key_rsne_cipher(
                 Some(pmk_r1.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
-            _ => elements::ft_psk_rsne_cipher(
+            _ => ft_psk_rsne_cipher(
                 Some(pmk_r1.name),
                 self.link.bss_info.group_mgmt_cipher,
             ),
         };
-        let mdie = elements::mdie(target_mdie.mdid, target_mdie.ft_capab);
+        let mdie = mdie(target_mdie.mdid, target_mdie.ft_capab);
         // The RSNXE participates in the FTIE MIC (after the FTIE,
         // 802.11-2020 §12.8.4) and is included only when SAE H2E was
         // actually used for the exchange.
@@ -1218,10 +1205,10 @@ impl WifiIface {
             target.ap_supports_sae_h2e(),
             self.link.network.sae_password_id.as_deref(),
         )
-        .then(elements::sae_rsnxe);
+        .then(sae_rsnxe);
 
         let kck: [u8; 16] = ptk[..16].try_into().unwrap();
-        let ftie = elements::ftie_reassoc_request(
+        let ftie = ftie_reassoc_request(
             &kck,
             self.core.nl.mac,
             target.bssid,
@@ -1312,14 +1299,10 @@ impl WifiIface {
         let ft_r0kh_id = ft.r0kh_id.clone();
         let ft_pmk_r0 = ft.pmk_r0.clone();
 
-        let ftie_body = elements::find_ie(ies, elements::IE_ID_FTIE)
-            .ok_or_else(|| {
-                WifiError::new(
-                    ErrorKind::Roaming,
-                    "no FTIE in reassoc response",
-                )
-            })?;
-        let ftie = elements::parse_ftie(ftie_body).ok_or_else(|| {
+        let ftie_body = find_ie(ies, ELEMENT_ID_FTIE).ok_or_else(|| {
+            WifiError::new(ErrorKind::Roaming, "no FTIE in reassoc response")
+        })?;
+        let ftie = parse_ftie(ftie_body).ok_or_else(|| {
             WifiError::new(
                 ErrorKind::Roaming,
                 "malformed reassoc response FTIE",
@@ -1334,15 +1317,15 @@ impl WifiIface {
 
         // RSNE: PMKID must be PMKR1Name and the body must match the
         // target's beacon RSNE (ignoring the PMKID).
-        let rsne_elem = elements::find_ie_pos(ies, elements::IE_ID_RSNE)
-            .map(|pos| elements::ie_at(ies, pos))
+        let rsne_elem = find_ie_pos(ies, ELEMENT_ID_RSN)
+            .map(|pos| ie_at(ies, pos))
             .ok_or_else(|| {
                 WifiError::new(
                     ErrorKind::Roaming,
                     "no RSNE in reassoc response",
                 )
             })?;
-        if let Some(pmkid) = elements::rsne_first_pmkid(&rsne_elem[2..])
+        if let Some(pmkid) = rsne_first_pmkid(&rsne_elem[2..])
             && let Some(ref pmk_r1) = roam.pmk_r1
             && pmkid != pmk_r1.name
         {
@@ -1352,7 +1335,7 @@ impl WifiIface {
             ));
         }
         if !target.ap_rsne.is_empty()
-            && !elements::rsne_match_ignore_pmkid(rsne_elem, &target.ap_rsne)
+            && !rsne_match_ignore_pmkid(rsne_elem, &target.ap_rsne)
         {
             return Err(WifiError::new(
                 ErrorKind::Roaming,
@@ -1362,12 +1345,12 @@ impl WifiIface {
 
         // FTIE MIC: STA || target AP || 6 || RSNE || MDIE ||
         // FTIE(MIC=0) || [RSNXE].
-        let mdie_elem = elements::find_ie_pos(ies, elements::IE_ID_MDIE)
-            .map(|pos| elements::ie_at(ies, pos));
-        let rsnxe_elem = elements::find_ie_pos(ies, elements::IE_ID_RSNXE)
-            .map(|pos| elements::ie_at(ies, pos));
+        let mdie_elem =
+            find_ie_pos(ies, ELEMENT_ID_MDIE).map(|pos| ie_at(ies, pos));
+        let rsnxe_elem =
+            find_ie_pos(ies, ELEMENT_ID_RSN_EXT).map(|pos| ie_at(ies, pos));
         let mut ftie_zmic = Vec::with_capacity(2 + ftie_body.len());
-        ftie_zmic.push(elements::IE_ID_FTIE);
+        ftie_zmic.push(ELEMENT_ID_FTIE);
         ftie_zmic.push(ftie_body.len() as u8);
         ftie_zmic.extend_from_slice(&ftie_body[..2]); // mic_control
         ftie_zmic.extend_from_slice(&[0u8; 16]); // zeroed MIC
@@ -1402,7 +1385,7 @@ impl WifiIface {
         self.install_ft_ptk(&target, &ptk).await?;
         let kek: [u8; 16] = ptk[16..32].try_into().unwrap();
         if let Some(ref gtk) = ftie.gtk {
-            let key = elements::unwrap_ft_key(&kek, gtk)?;
+            let key = unwrap_ft_key(&kek, gtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_gtk(
                 self.core.nl.if_index,
                 key,
@@ -1419,7 +1402,7 @@ impl WifiIface {
             log::info!("FT roam: GTK[{}] installed", gtk.key_index);
         }
         if let Some(ref igtk) = ftie.igtk {
-            let key = elements::unwrap_ft_key(&kek, igtk)?;
+            let key = unwrap_ft_key(&kek, igtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_igtk(
                 self.core.nl.if_index,
                 key,
@@ -1434,7 +1417,7 @@ impl WifiIface {
             }
         }
         if let Some(ref bigtk) = ftie.bigtk {
-            let key = elements::unwrap_ft_key(&kek, bigtk)?;
+            let key = unwrap_ft_key(&kek, bigtk)?;
             let attrs = wl_nl80211::Nl80211Key::new_bigtk(
                 self.core.nl.if_index,
                 key,
@@ -1453,11 +1436,11 @@ impl WifiIface {
         // Echo MDIE + FTIE of this response in a later 4-way Message 2
         // (group rekeys use the FT AKM too).
         let mut assoc_resp_ft_ies = Vec::new();
-        if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_MDIE) {
-            assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
+        if let Some(pos) = find_ie_pos(ies, ELEMENT_ID_MDIE) {
+            assoc_resp_ft_ies.extend_from_slice(ie_at(ies, pos));
         }
-        if let Some(pos) = elements::find_ie_pos(ies, elements::IE_ID_FTIE) {
-            assoc_resp_ft_ies.extend_from_slice(elements::ie_at(ies, pos));
+        if let Some(pos) = find_ie_pos(ies, ELEMENT_ID_FTIE) {
+            assoc_resp_ft_ies.extend_from_slice(ie_at(ies, pos));
         }
         self.link.bss_info = target.clone();
 
@@ -1466,25 +1449,21 @@ impl WifiIface {
         // KCK/KEK and a replay counter (wpa_supplicant clears its replay
         // counter on every association, including FT reassociation).
         let mut rsne = match target.security {
-            SecurityType::FtSae => elements::ft_sae_ie_cipher(
+            SecurityType::FtSae => {
+                ft_sae_ie_cipher(Some(pmk_r1.name), target.group_mgmt_cipher)
+            }
+            SecurityType::FtSaeExtKey => ft_sae_ext_key_ie_cipher(
                 Some(pmk_r1.name),
                 target.group_mgmt_cipher,
             ),
-            SecurityType::FtSaeExtKey => elements::ft_sae_ext_key_ie_cipher(
-                Some(pmk_r1.name),
-                target.group_mgmt_cipher,
-            ),
-            _ => elements::ft_psk_ie_cipher(
-                Some(pmk_r1.name),
-                target.group_mgmt_cipher,
-            ),
+            _ => ft_psk_ie_cipher(Some(pmk_r1.name), target.group_mgmt_cipher),
         };
         rsne.extend_from_slice(&assoc_resp_ft_ies);
         if self.link.network.ocv {
-            elements::rsne_set_ocvc(&mut rsne, true);
+            rsne_set_ocvc(&mut rsne, true);
         }
         if self.link.network.ext_key_id {
-            elements::rsne_set_ext_key_id(&mut rsne, true);
+            rsne_set_ext_key_id(&mut rsne, true);
         }
         let mut fw = FourWayState::new_ft(
             pmk_r1.clone(),

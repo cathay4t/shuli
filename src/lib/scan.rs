@@ -9,14 +9,20 @@ use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use wl_nl80211::{Ieee80211CipherSuite, Nl80211BssInfo, Nl80211Event};
+use wl_nl80211::{
+    ELEMENT_ID_MDIE, ELEMENT_ID_RSN, ELEMENT_ID_RSN_EXT, Ieee80211AkmSuite,
+    Ieee80211CipherSuite, Ieee80211ElementRsn, Ieee80211RsnCapbilities,
+    Nl80211BssInfo, Nl80211Event, ap_rsne_supports_ext_key_id,
+    ap_rsne_supports_ocv, ap_rsnxe_supports_sae_h2e, ap_supports_btm,
+    ap_supports_rm_neighbor_report, parse_group_mgmt_cipher, parse_mdie,
+};
 
 use crate::{
     DEFAULT_SWITCH_SSID_LOWER_THAN_DBM, ETH_ALEN, ErrorKind, NetworkConfig,
     ShuliNl80211Connection, WifiClient, WifiError, WifiIface,
     nl80211::{
-        ClientEvent, extract_bssid, extract_freq, extract_ies,
-        extract_signal_dbm, extract_ssid_from_ies, parse_client_event,
+        extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
+        extract_ssid_from_ies,
     },
 };
 
@@ -154,9 +160,6 @@ impl Default for BssInfo {
     }
 }
 
-const RSN_CAP_MFPR: u16 = 1 << 6;
-const RSN_CAP_MFPC: u16 = 1 << 7;
-
 impl BssInfo {
     /// Whether the AP advertises management frame protection (IEEE
     /// 802.11w) in its RSNE capabilities: MFPC (optional) or MFPR
@@ -171,7 +174,7 @@ impl BssInfo {
     /// Hash-to-Element support. Used to pick H2E vs. hunting-and-pecking
     /// up front instead of guessing.
     pub(crate) fn ap_supports_sae_h2e(&self) -> bool {
-        crate::ieee80211::elements::ap_rsnxe_supports_sae_h2e(&self.ap_rsnxe)
+        ap_rsnxe_supports_sae_h2e(&self.ap_rsnxe)
     }
 
     /// Whether the AP advertises the OCVC RSN capability (Operating
@@ -180,7 +183,7 @@ impl BssInfo {
     /// (no OCI KDE in Message 3), so it must be gated on this check
     /// rather than on local network config alone.
     pub(crate) fn ap_ocv_capable(&self) -> bool {
-        crate::ieee80211::elements::ap_rsne_supports_ocv(&self.ap_rsne)
+        ap_rsne_supports_ocv(&self.ap_rsne)
     }
 
     /// Whether the AP advertises the Extended Key ID RSN capability.
@@ -189,7 +192,7 @@ impl BssInfo {
     /// ID KDE in Message 3), so it must be gated on this check rather
     /// than on local network config alone.
     pub(crate) fn ap_ext_key_id_capable(&self) -> bool {
-        crate::ieee80211::elements::ap_rsne_supports_ext_key_id(&self.ap_rsne)
+        ap_rsne_supports_ext_key_id(&self.ap_rsne)
     }
 
     /// Whether the AP advertises a capability that makes a client
@@ -206,24 +209,21 @@ impl BssInfo {
 /// Parse an RSNE element (ID + length + body) and report the MFPC/MFPR
 /// bits of its RSN capabilities field.
 fn rsne_mfp_capable(rsne: &[u8]) -> bool {
-    // Skip element ID + length; need version(2) + group(4) + pcount(2).
-    if rsne.len() < 2 + 8 {
+    if rsne.len() < 2 {
         return false;
     }
-    let body = &rsne[2..];
-    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
-    let akm_offset = 8 + pcount * 4;
-    if body.len() < akm_offset + 2 {
+    let len = rsne[1] as usize;
+    if rsne.len() < len + 2 {
         return false;
     }
-    let acount =
-        u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
-    let cap_offset = akm_offset + 2 + acount * 4;
-    if body.len() < cap_offset + 2 {
-        return false;
-    }
-    let capab = u16::from_le_bytes([body[cap_offset], body[cap_offset + 1]]);
-    capab & (RSN_CAP_MFPR | RSN_CAP_MFPC) != 0
+    Ieee80211ElementRsn::parse(&rsne[2..len + 2])
+        .ok()
+        .and_then(|rsn| rsn.rsn_capbilities)
+        .is_some_and(|capab| {
+            capab.intersects(
+                Ieee80211RsnCapbilities::Mfpr | Ieee80211RsnCapbilities::Mfpc,
+            )
+        })
 }
 
 // Prefer the strongest signal; break ties by frequency (higher band first),
@@ -435,11 +435,9 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
-                    if let Some(event) = parse_client_event(raw_msg) {
+                    if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {
-                            ClientEvent::Nl80211(
-                                Nl80211Event::NewScanResults,
-                            ) => {
+                            Nl80211Event::NewScanResults => {
                                 if self.roam.roam_scan {
                                     log::trace!("scan finished");
                                 } else {
@@ -707,12 +705,8 @@ impl WifiIface {
                     group_mgmt_cipher: bss_security.group_mgmt_cipher,
                     mdie: bss_security.mdie,
                     hidden: false,
-                    btm_support:
-                        crate::ieee80211::elements::ap_supports_btm(ies),
-                    rm_neighbor_report:
-                        crate::ieee80211::elements::ap_supports_rm_neighbor_report(
-                            ies,
-                        ),
+                    btm_support: ap_supports_btm(ies),
+                    rm_neighbor_report: ap_supports_rm_neighbor_report(ies),
                 },
                 network,
             ));
@@ -747,25 +741,33 @@ impl WifiIface {
     }
 }
 
-const IE_ID_RSN: u8 = 48;
-const IE_ID_RSNXE: u8 = 244;
-const IE_ID_MDIE: u8 = 54;
 const IE_ID_VENDOR: u8 = 0xDD;
-const AKM_PSK: u8 = 2;
-const AKM_PSK_SHA256: u8 = 6;
-const AKM_1X: u8 = 1;
-const AKM_1X_SHA256: u8 = 5;
-const AKM_FT_PSK: u8 = 4;
-const AKM_OWE: u8 = 18;
-const AKM_SAE: u8 = 8;
-const AKM_FT_SAE: u8 = 9;
-const AKM_SAE_EXT_KEY: u8 = 24;
-const AKM_FT_SAE_EXT_KEY: u8 = 25;
 /// WPA vendor IE OUI (Microsoft): 00:50:F2, type 1 = WPA (WPA1/TKIP).
 const WPA_IE_OUI: [u8; 3] = [0x00, 0x50, 0xF2];
 const WPA_IE_TYPE: u8 = 1;
-/// Cipher suite 00:50:F2:2 = TKIP (WPA1 default; rejected by shuli).
-const CIPHER_TKIP: u8 = 2;
+
+/// Negotiate the group management (BIP) cipher with the AP: the best
+/// supported suite the AP advertises, defaulting to BIP-CMAC-128. The
+/// preference order matches iwd: GMAC-256 > CMAC-256 > GMAC-128 >
+/// CMAC-128.
+pub(crate) fn negotiate_group_mgmt_cipher(
+    ap_rsne: &[u8],
+) -> Ieee80211CipherSuite {
+    let Some(ap) = parse_group_mgmt_cipher(ap_rsne) else {
+        return Ieee80211CipherSuite::BipCmac128;
+    };
+    for preferred in [
+        Ieee80211CipherSuite::BipGmac256,
+        Ieee80211CipherSuite::BipCmac256,
+        Ieee80211CipherSuite::BipGmac128,
+        Ieee80211CipherSuite::BipCmac128,
+    ] {
+        if ap == preferred {
+            return preferred;
+        }
+    }
+    Ieee80211CipherSuite::BipCmac128
+}
 
 /// Security facts about a BSS collected from its scan IEs.
 pub(crate) struct BssScanSecurity {
@@ -799,17 +801,15 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
             break;
         }
         match id {
-            IE_ID_RSN if rsne.is_empty() => {
+            ELEMENT_ID_RSN if rsne.is_empty() => {
                 rsne = ies[pos..pos + 2 + len].to_vec();
             }
-            IE_ID_RSNXE if rsnxe.is_empty() => {
+            ELEMENT_ID_RSN_EXT if rsnxe.is_empty() => {
                 rsnxe = ies[pos..pos + 2 + len].to_vec();
             }
-            IE_ID_MDIE if mdie.is_none() => {
-                mdie = crate::ieee80211::elements::parse_mdie(
-                    &ies[pos + 2..pos + 2 + len],
-                )
-                .map(|(mdid, ft_capab)| MdieInfo { mdid, ft_capab });
+            ELEMENT_ID_MDIE if mdie.is_none() => {
+                mdie = parse_mdie(&ies[pos + 2..pos + 2 + len])
+                    .map(|(mdid, ft_capab)| MdieInfo { mdid, ft_capab });
             }
             IE_ID_VENDOR if !wpa_ie => {
                 // Vendor-specific: WPA (OUI 00:50:F2, type 1) marks a
@@ -831,7 +831,7 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
         SecurityType::Open
     };
     let group_mgmt_cipher = if rsne.len() > 2 {
-        crate::ieee80211::elements::negotiate_group_mgmt_cipher(&rsne)
+        negotiate_group_mgmt_cipher(&rsne)
     } else {
         Ieee80211CipherSuite::BipCmac128
     };
@@ -863,9 +863,8 @@ fn akm_rank(security: SecurityType) -> u8 {
     }
 }
 
-/// Parse the RSNE body (after element ID + length) and check AKM suites.
-/// RSNE layout: version(2) | group(4) | pcount(2) | pciphers(4*n) |
-///              acount(2) | akms(4*m) | ...
+/// Parse the RSNE body (after element ID + length) and check its AKM
+/// suites with the `wl-nl80211` typed RSN model.
 ///
 /// The caller only passes a body from an actual RSNE element, so a
 /// result of `Open` would mean "no usable security information": every
@@ -873,55 +872,36 @@ fn akm_rank(security: SecurityType) -> u8 {
 /// `Unsupported` instead (an encrypted AP shuli cannot join must not be
 /// treated as open).
 fn security_from_rsne(body: &[u8]) -> SecurityType {
-    // Minimum: version(2) + group(4) + pcount(2) = 8 bytes before
-    // pairwise ciphers.
-    if body.len() < 8 {
+    let Ok(rsn) = Ieee80211ElementRsn::parse(body) else {
         return SecurityType::Unsupported;
-    }
+    };
     // TKIP as the group cipher means a WPA1/WPA2 hybrid or TKIP-only
-    // AP - shuli does not implement TKIP and must not connect. The
-    // group cipher suite (RSN OUI 00-0F-AC) sits at body[2..6].
-    if body.len() >= 6
-        && body[2] == 0x00
-        && body[3] == 0x0F
-        && body[4] == 0xAC
-        && body[5] == CIPHER_TKIP
-    {
+    // AP - shuli does not implement TKIP and must not connect.
+    if rsn.group_cipher == Some(Ieee80211CipherSuite::Tkip) {
         return SecurityType::Unsupported;
     }
-    let pcount = u16::from_le_bytes([body[6], body[7]]) as usize;
-    let akm_offset = 8 + pcount * 4;
-    if body.len() < akm_offset + 2 {
-        return SecurityType::Unsupported;
-    }
-    let acount =
-        u16::from_le_bytes([body[akm_offset], body[akm_offset + 1]]) as usize;
-    let mut off = akm_offset + 2;
     let mut best = SecurityType::Open;
-    for _ in 0..acount {
-        if body.len() < off + 4 {
-            break;
-        }
-        // AKM suite: OUI(3) + type(1).  We only care about 00-0F-AC.
-        if body[off] == 0x00 && body[off + 1] == 0x0F && body[off + 2] == 0xAC {
-            let candidate = match body[off + 3] {
-                AKM_FT_SAE => SecurityType::FtSae,
-                AKM_FT_SAE_EXT_KEY => SecurityType::FtSaeExtKey,
-                AKM_FT_PSK => SecurityType::FtPsk,
-                AKM_SAE => SecurityType::Sae,
-                AKM_SAE_EXT_KEY => SecurityType::SaeExtKey,
-                AKM_OWE => SecurityType::Owe,
-                AKM_PSK => SecurityType::Wpa2Psk,
-                AKM_PSK_SHA256 => SecurityType::Wpa2PskSha256,
-                AKM_1X => SecurityType::Wpa2Ent,
-                AKM_1X_SHA256 => SecurityType::Wpa2EntSha256,
-                _ => SecurityType::Unsupported,
-            };
-            if akm_rank(candidate) > akm_rank(best) {
-                best = candidate;
+    for akm in &rsn.akm_suits {
+        let candidate = match akm {
+            Ieee80211AkmSuite::FtSae => SecurityType::FtSae,
+            Ieee80211AkmSuite::FtSaeGroupDependentHash => {
+                SecurityType::FtSaeExtKey
             }
+            Ieee80211AkmSuite::FtPsk => SecurityType::FtPsk,
+            Ieee80211AkmSuite::Sae => SecurityType::Sae,
+            Ieee80211AkmSuite::SaeGroupDependentHash => SecurityType::SaeExtKey,
+            Ieee80211AkmSuite::Owe => SecurityType::Owe,
+            Ieee80211AkmSuite::Psk => SecurityType::Wpa2Psk,
+            Ieee80211AkmSuite::PskSha256 => SecurityType::Wpa2PskSha256,
+            Ieee80211AkmSuite::Ieee8021x => SecurityType::Wpa2Ent,
+            Ieee80211AkmSuite::Ieee8021xSha256 => SecurityType::Wpa2EntSha256,
+            // AKMs shuli cannot join (FT-802.1X, TDLS, WPA3-Enterprise
+            // 192-bit, other OUIs and vendor suites) contribute nothing.
+            _ => continue,
+        };
+        if akm_rank(candidate) > akm_rank(best) {
+            best = candidate;
         }
-        off += 4;
     }
     // No supported AKM suite among the advertised ones: an encrypted
     // AP shuli cannot join.
@@ -1041,11 +1021,8 @@ impl WifiClient {
                 group_mgmt_cipher: bss_security.group_mgmt_cipher,
                 mdie: bss_security.mdie,
                 hidden: beacon_has_ssid.get(&bssid) == Some(&false),
-                btm_support: crate::ieee80211::elements::ap_supports_btm(ies),
-                rm_neighbor_report:
-                    crate::ieee80211::elements::ap_supports_rm_neighbor_report(
-                        ies,
-                    ),
+                btm_support: ap_supports_btm(ies),
+                rm_neighbor_report: ap_supports_rm_neighbor_report(ies),
             };
             if seen_bssids.insert(bssid) {
                 results.push((info, ies.to_vec()));
