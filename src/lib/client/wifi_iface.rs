@@ -342,8 +342,9 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
+                    let info = self.disconnect_info(&raw_msg);
                     if let Some(event) = Nl80211Event::parse(raw_msg) {
-                        self.handle_client_event(event).await;
+                        self.handle_client_event(event, info).await;
                     }
                 }
                 Ok(None) | Err(_) => break,
@@ -378,11 +379,20 @@ impl WifiIface {
         }
         match self.state {
             WifiState::Init => {
+                // Established link was lost: run the one-shot fast
+                // recovery armed by the disconnect instead of waiting
+                // out the scan-retry backoff.
                 if let Some(fast) = self.fast_reconnect.take() {
                     match fast {
+                        // wpa_supplicant parity: retry the same BSS
+                        // directly for the recoverable AP-reported
+                        // reasons; only scan when this fails.
                         FastReconnect::SameBss
                             if self.link.bss_info.bssid != [0; ETH_ALEN]
-                                && self.link.bss_info.freq_mhz != 0 =>
+                                && self.link.bss_info.freq_mhz != 0
+                                && !self
+                                    .bssid_ignore
+                                    .is_ignored(&self.link.bss_info.bssid) =>
                         {
                             log::info!(
                                 "fast reconnect to last BSS: ssid={}, \
@@ -391,19 +401,29 @@ impl WifiIface {
                                 self.link.bss_info.bssid,
                                 self.link.bss_info.freq_mhz
                             );
+                            // wpa_supplicant falls back to a full scan
+                            // when `wpa_supplicant_connect()` fails;
+                            // arm that scan for the retry loop before
+                            // the attempt, so a failed direct reconnect
+                            // lands in a scan instead of the
+                            // scan-retry backoff.
+                            self.fast_reconnect = Some(FastReconnect::ScanNow);
                             self.send_out_auth_request().await?;
                             self.state = WifiState::Authenticating;
                             return Ok(());
                         }
                         FastReconnect::ScanNow => {
-                            log::info!("fast reconnect: scanning immediately");
+                            log::info!(
+                                "fast reconnect: scanning immediately for an \
+                                 alternative BSS or SSID"
+                            );
                             self.scan.hint_scan = false;
                             self.send_out_scan_request().await?;
                             self.state = WifiState::Scanning;
                             return Ok(());
                         }
-                        // No usable last BSS: fall through to the normal
-                        // hinted/scan path.
+                        // No usable last BSS: fall through to the
+                        // normal hinted/scan path.
                         FastReconnect::SameBss => {}
                     }
                 }
@@ -544,6 +564,7 @@ impl WifiIface {
                 };
                 match timed {
                     Ok(Some(raw_msg)) => {
+                        let info = self.disconnect_info(&raw_msg);
                         if let Some(event) = Nl80211Event::parse(raw_msg) {
                             match event {
                                 Nl80211Event::Unknown(
@@ -585,7 +606,9 @@ impl WifiIface {
                                         }
                                     }
                                 }
-                                other => self.handle_client_event(other).await,
+                                other => {
+                                    self.handle_client_event(other, info).await
+                                }
                             }
                         }
                     }
@@ -651,8 +674,9 @@ impl WifiIface {
                     .await;
                     match timed {
                         Ok(Some(raw_msg)) => {
+                            let info = self.disconnect_info(&raw_msg);
                             if let Some(event) = Nl80211Event::parse(raw_msg) {
-                                self.handle_client_event(event).await;
+                                self.handle_client_event(event, info).await;
                             }
                             break;
                         }
@@ -782,8 +806,9 @@ impl WifiIface {
                 }
                 match next {
                     Ok(Some(raw_msg)) => {
+                        let info = self.disconnect_info(&raw_msg);
                         if let Some(event) = Nl80211Event::parse(raw_msg) {
-                            self.handle_client_event(event).await;
+                            self.handle_client_event(event, info).await;
                         }
                     }
                     Ok(None) => {
@@ -860,8 +885,9 @@ impl WifiIface {
                     };
                     match timed {
                         Ok(Some(raw_msg)) => {
+                            let info = self.disconnect_info(&raw_msg);
                             if let Some(event) = Nl80211Event::parse(raw_msg) {
-                                self.handle_client_event(event).await;
+                                self.handle_client_event(event, info).await;
                             }
                             if !matches!(
                                 self.state,

@@ -39,7 +39,8 @@ pub enum WifiState {
     FailedAuthentication,
 }
 
-/// One-shot retry path used after an established connection is lost.
+/// One-shot retry path used after an established connection is lost,
+/// mirroring wpa_supplicant's `wpa_supplicant_event_disassoc_finish()`.
 ///
 /// A lost connection is different from "the configured SSID was not
 /// found": there is no reason to wait out the scan-retry backoff before
@@ -47,10 +48,13 @@ pub enum WifiState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FastReconnect {
     /// Start a host scan immediately instead of waiting out the
-    /// scan-retry backoff.
+    /// scan-retry backoff. Used for every transient disconnect except
+    /// the AP-reported recoverable reasons (see
+    /// [`FastReconnect::SameBss`]) and for locally generated ones.
     ScanNow,
     /// Re-authenticate directly to the BSS that was just lost; the
-    /// normal scan is only used when this fails.
+    /// normal scan is only used when this fails (wpa_supplicant's
+    /// "reconnect to the same BSS without a full scan").
     SameBss,
 }
 
@@ -419,7 +423,10 @@ pub(crate) struct WifiIface {
     pub(crate) roam: RoamEngine,
     pub(crate) wowlan: WowlanState,
     pub(crate) state: WifiState,
-    /// One-shot fast retry path after an established link was lost.
+    /// One-shot retry path after an established link was lost: the next
+    /// `Init` either scans immediately for an alternative BSS/SSID or
+    /// re-authenticates to the BSS that was just lost (wpa_supplicant
+    /// parity, see [`FastReconnect`]).
     pub(crate) fast_reconnect: Option<FastReconnect>,
     /// System-resume notification generation receiver. The value is
     /// changed by [`crate::WifiClient::notify_resume`].

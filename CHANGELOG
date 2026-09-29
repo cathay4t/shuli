@@ -32,6 +32,11 @@
  - Refresh driver rekey offload after userspace group rekeys and after
    FT roam, and apply the replay counter reported by the driver after a
    firmware GTK rekey.
+ - Recover a lost established connection like wpa_supplicant: an
+   AP-initiated disconnect with a recoverable reason (4/6/7) retries
+   the same BSS directly and falls back to a scan when that fails;
+   every other disconnect scans immediately for an alternative BSS or
+   configured SSID.
 
 ## [0.2.0] - 2026-08-16
 ### Breaking changes

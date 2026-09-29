@@ -20,7 +20,7 @@ use wl_nl80211::{
 
 use crate::{
     DEFAULT_SWITCH_SSID_LOWER_THAN_DBM, ETH_ALEN, ErrorKind, NetworkConfig,
-    ShuliNl80211Connection, WifiClient, WifiError, WifiIface,
+    ShuliNl80211Connection, WifiClient, WifiError, WifiIface, WifiState,
     nl80211::{
         extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
         extract_ssid_from_ies,
@@ -436,6 +436,7 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
+                    let info = self.disconnect_info(&raw_msg);
                     if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {
                             Nl80211Event::NewScanResults => {
@@ -446,7 +447,18 @@ impl WifiIface {
                                 }
                                 return;
                             }
-                            other => self.handle_client_event(other).await,
+                            other => {
+                                self.handle_client_event(other, info).await;
+                                if self.state != WifiState::Scanning {
+                                    // An event (e.g. an AP disconnect
+                                    // during a roam scan) ended the
+                                    // scan's purpose; let the state
+                                    // machine drive on instead of
+                                    // waiting for results that no
+                                    // longer matter.
+                                    return;
+                                }
+                            }
                         }
                     }
                 }

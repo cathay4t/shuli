@@ -36,7 +36,7 @@ use wl_nl80211::{Ieee80211EapolEapFrame, Ieee80211EapolKeyFrame};
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
-    client::RETRY_BACKOFF_INIT_SEC,
+    client::{FastReconnect, RETRY_BACKOFF_INIT_SEC},
     eap::{CODE_REQUEST, CODE_SUCCESS, EapPacket, TYPE_IDENTITY, TYPE_TLS},
     eap_tls::{
         EAP_TLS_FLAG_START, build_tls_message, cert_from_pem, key_from_pem,
@@ -592,6 +592,21 @@ async fn run_until_connected(
     client: &mut WifiClient,
     max_iters: u32,
 ) -> Result<WifiState, crate::WifiError> {
+    run_until_connected_recording_scan(client, max_iters)
+        .await
+        .map(|(state, _)| state)
+}
+
+/// Like [`run_until_connected`], but also reports whether a host scan
+/// was observed on the way. The reconnect tests use this to prove the
+/// recovery path scans for an alternative BSS or configured SSID
+/// instead of re-authenticating to the BSS that just dropped the
+/// client.
+async fn run_until_connected_recording_scan(
+    client: &mut WifiClient,
+    max_iters: u32,
+) -> Result<(WifiState, bool), crate::WifiError> {
+    let mut saw_scan = false;
     for _ in 0..max_iters {
         let step = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -600,9 +615,10 @@ async fn run_until_connected(
         .await;
         match step {
             Ok(Ok(iface_state)) => match iface_state.state {
+                WifiState::Scanning => saw_scan = true,
                 WifiState::ConnectedWithoutOffloadRekey
                 | WifiState::ConnectedWithOffloadRekey => {
-                    return Ok(iface_state.state);
+                    return Ok((iface_state.state, saw_scan));
                 }
                 _ => {}
             },
@@ -1862,15 +1878,22 @@ async fn wifi_client_sae_pmksa_reconnect() {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":");
-    hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
+    // A recoverable AP-reported reason (4, disassoc due to inactivity)
+    // must take wpa_supplicant's same-BSS fast path: re-authenticate
+    // directly with the cached PMKID, without scanning.
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac} reason=4"));
 
-    // Disconnect event -> Failed -> fast retry -> PMKSA-cached
-    // association. The old 10 s scan-retry backoff would push this past
-    // the 8 s bound below.
+    // Disconnect event -> Failed -> direct re-authentication to the
+    // same BSS -> PMKSA-cached association. A scan would mean the
+    // same-BSS fast path did not run.
     let started = std::time::Instant::now();
-    let state = run_until_connected(&mut client, 40)
+    let (state, saw_scan) = run_until_connected_recording_scan(&mut client, 40)
         .await
         .expect("reconnect");
+    assert!(
+        !saw_scan,
+        "a recoverable AP disconnect must retry the same BSS, not scan"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(8),
         "fast reconnect took {:?}",
@@ -1969,12 +1992,21 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":");
-    hostapd_cli(&format!("DISASSOCIATE {sta_mac}"));
+    // A non-recoverable AP-reported reason (1, unspecified) must take
+    // the scan path: look for an alternative BSS or configured SSID.
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac} reason=1"));
 
+    // Disconnect event -> immediate scan (for an alternative BSS/SSID)
+    // -> PMKSA-cached association. The old 10 s scan-retry backoff would
+    // push this past the 8 s bound below.
     let started = std::time::Instant::now();
-    let state = run_until_connected(&mut client, 40)
+    let (state, saw_scan) = run_until_connected_recording_scan(&mut client, 40)
         .await
         .expect("reconnect");
+    assert!(
+        saw_scan,
+        "reconnect after a disconnect must scan for a replacement BSS or SSID"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(8),
         "fast reconnect took {:?}",
@@ -1997,6 +2029,85 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
             .psk_pmk
             .is_none(),
         "reconnect must use the cached PMKSA instead of re-deriving the PMK"
+    );
+    client.shutdown().await;
+}
+
+/// wpa_supplicant falls back to a full scan when the direct
+/// reconnection to the same BSS fails. Force that: the AP disassociates
+/// the STA with a recoverable reason (4) and is then disabled, so the
+/// same-BSS re-authentication cannot complete and the retry loop must
+/// start a scan instead of waiting out the scan-retry backoff.
+#[tokio::test]
+async fn wifi_client_same_bss_retry_falls_back_to_scan() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_same_bss_retry_falls_back_to_scan: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    let sta_mac = client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .core
+        .nl
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    // Recoverable AP-initiated disconnect, then take the AP off the air
+    // before the client processes the event: the direct same-BSS
+    // re-authentication has to fail.
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac} reason=4"));
+    hostapd_cli("DISABLE");
+
+    let mut saw_auth = false;
+    let mut saw_scan = false;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline && !saw_scan {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(iface_state)) => match iface_state.state {
+                WifiState::Authenticating => saw_auth = true,
+                WifiState::Scanning => saw_scan = true,
+                _ => {}
+            },
+            Ok(Err(e)) => panic!("client error during fallback: {e}"),
+            Err(_) => panic!("client made no progress during fallback"),
+        }
+    }
+    assert!(
+        saw_auth,
+        "the same-BSS fast path must have been attempted before the scan"
+    );
+    assert!(
+        saw_scan,
+        "a failed same-BSS retry must fall back to an immediate scan"
     );
     client.shutdown().await;
 }
@@ -2420,9 +2531,12 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
         .values_mut()
         .next()
         .unwrap()
-        .handle_event(wl_nl80211::Nl80211Event::ControlPortFrame(
-            wl_nl80211::Ieee80211EapolFrame::parse(&msg1),
-        ))
+        .handle_event(
+            wl_nl80211::Nl80211Event::ControlPortFrame(
+                wl_nl80211::Ieee80211EapolFrame::parse(&msg1),
+            ),
+            Default::default(),
+        )
         .await;
 
     assert!(
@@ -2757,6 +2871,77 @@ async fn wifi_client_roam_scan_stays_connected() {
         "the roam engine must actively request and receive an 802.11k \
          neighbor report before the quick scan"
     );
+    client.shutdown().await;
+}
+
+/// An AP-initiated disconnect that lands while a roam scan is in flight
+/// must not be dropped as stale. The link the scan was meant to preserve
+/// is gone, so the client abandons the roam and recovers through the
+/// normal immediate scan for a replacement BSS/SSID.
+#[tokio::test]
+async fn wifi_client_disconnect_during_roam_scan_reconnects() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_disconnect_during_roam_scan_reconnects: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    // Put the interface into the state the roam engine holds while its
+    // scan is in flight (the scan itself is covered by the roam tests),
+    // then feed the AP-initiated disconnect the kernel would report.
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        iface.roam.roam_scan = true;
+        iface.roam.pre_roam_state =
+            Some(WifiState::ConnectedWithoutOffloadRekey);
+        iface.state = WifiState::Scanning;
+        iface.handle_ap_disconnect(None, None).await;
+        assert_eq!(
+            iface.state,
+            WifiState::Failed,
+            "a disconnect during a roam scan must start recovery"
+        );
+        assert_eq!(
+            iface.fast_reconnect,
+            Some(FastReconnect::ScanNow),
+            "recovery must scan for a replacement BSS or SSID"
+        );
+        assert!(
+            !iface.roam.roam_scan && iface.roam.pre_roam_state.is_none(),
+            "the roam scan and its stale pre-roam state must be abandoned"
+        );
+    }
+
+    // The recovery path must run a scan and reconnect on the same BSS.
+    let (state, saw_scan) = run_until_connected_recording_scan(&mut client, 40)
+        .await
+        .expect("reconnect");
+    assert!(
+        saw_scan,
+        "reconnect after a disconnect must scan for a replacement BSS or SSID"
+    );
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
     client.shutdown().await;
 }
 
