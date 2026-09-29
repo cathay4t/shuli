@@ -551,7 +551,8 @@ impl WifiIface {
                 }
             }
 
-            Nl80211Event::ConnectResult(status) => {
+            Nl80211Event::ConnectResult(event) => {
+                let status = event.status;
                 if status == Ieee80211StatusCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
