@@ -286,6 +286,7 @@ impl WifiIface {
         self.auth.sae_hnp_attempted = false;
         self.auth.eap_peer = None;
         self.auth.eap_pmk = None;
+        self.link.stale_connect_failure = false;
 
         // WPA2-Enterprise runs EAP over the control port
         // after association.  Prepare the EAP peer + EAP-TLS method

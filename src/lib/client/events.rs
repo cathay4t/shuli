@@ -84,6 +84,42 @@ fn classify_fast_reconnect(
     }
 }
 
+/// Whether an AP-originated deauth/disassoc that arrived while a
+/// PMKID-based association is in flight is the AP refusing the cached
+/// PMKSA.
+///
+/// Some APs reject a (Re)Association Request that carries a PMKID by
+/// deauthenticating the station with reason 9
+/// (`STA_REQ_ASSOC_WITHOUT_AUTH`) instead of answering with a failure
+/// status. wpa_supplicant's `sme_event_deauth()` drops the PMKSA cache
+/// entry for the AP in that case so the next attempt runs a full SAE
+/// exchange instead of fetching the same stale entry again. The same
+/// conditions apply here: only a SAE-family association that has not
+/// reached the 4-way handshake, and a frame the AP really sent, count -
+/// a locally generated teardown or any other reason keeps its existing
+/// handling.
+fn pmksa_rejected_by_deauth(
+    state: WifiState,
+    security: SecurityType,
+    pmksa_in_use: bool,
+    fourway_started: bool,
+    reason: Option<Ieee80211ReasonCode>,
+    from_ap: Option<bool>,
+) -> bool {
+    state == WifiState::Authenticating
+        && matches!(
+            security,
+            SecurityType::Sae
+                | SecurityType::SaeExtKey
+                | SecurityType::FtSae
+                | SecurityType::FtSaeExtKey
+        )
+        && pmksa_in_use
+        && !fourway_started
+        && reason == Some(Ieee80211ReasonCode::StaReqAssocWithoutAuth)
+        && from_ap == Some(true)
+}
+
 impl WifiIface {
     /// Extract [`DisconnectInfo`] from a raw event before
     /// [`Nl80211Event::parse`] consumes it.
@@ -545,6 +581,11 @@ impl WifiIface {
                          - retrying with full authentication"
                     );
                     self.pmksa_fallback().await;
+                    // The kernel reports every association response twice
+                    // - this `ASSOCIATE` event and the trailing `CONNECT`
+                    // result: suppress the latter so it cannot tear down
+                    // the full-authentication attempt started above.
+                    self.link.stale_connect_failure = true;
                 } else {
                     log::warn!("ASSOCIATE failed: status={status}");
                     self.state = WifiState::Failed;
@@ -553,9 +594,24 @@ impl WifiIface {
 
             Nl80211Event::ConnectResult(event) => {
                 let status = event.status;
+                // The kernel sends a CONNECT result for every association
+                // response, right after the `ASSOCIATE` event (and for an
+                // association timeout, without one). Consume the stale
+                // marker here so it can never leak into a later attempt.
+                let stale =
+                    std::mem::take(&mut self.link.stale_connect_failure);
                 if status == Ieee80211StatusCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
+                    );
+                } else if stale {
+                    // The `ASSOCIATE` failure was already handled by
+                    // continuing the attempt (PMKSA fallback); acting on
+                    // this duplicate would tear down the recovery attempt
+                    // it started.
+                    log::debug!(
+                        "stale CONNECT failure (status={status}) for an \
+                         already-handled association response; ignored"
                     );
                 } else {
                     log::warn!("CONNECT failed: status={status}");
@@ -742,15 +798,29 @@ impl WifiIface {
                 | WifiState::ConnectedWithOffloadRekey
         ) {
             let fatal = is_fatal_disconnect_reason(reason);
-            log::warn!(
-                "AP disconnect (reason={reason:?}, from_ap={from_ap:?}); \
-                 retrying{}",
-                if fatal {
-                    " with long authentication backoff"
-                } else {
-                    ""
-                }
-            );
+            let backoff = if fatal {
+                " with long authentication backoff"
+            } else {
+                ""
+            };
+            if from_ap == Some(false) {
+                // mac80211 generates the teardown locally when the
+                // driver or firmware reported the connection lost
+                // (e.g. the mt7925 firmware's beacon-loss event ->
+                // `ieee80211_connection_loss()`); the AP sent no frame.
+                // The reason code is a local placeholder - reason 4 in
+                // particular does NOT mean the AP kicked an inactive
+                // station - so name the origin to keep triage honest.
+                log::warn!(
+                    "connection lost locally (driver/firmware, \
+                     reason={reason:?}); retrying{backoff}"
+                );
+            } else {
+                log::warn!(
+                    "AP disconnect (reason={reason:?}, from_ap={from_ap:?}); \
+                     retrying{backoff}"
+                );
+            }
             // For a socket-owned connection the kernel keeps its
             // connection state (wdev->connected) until userspace cleans
             // up, and rejects the next ASSOCIATE with -EALREADY
@@ -799,6 +869,26 @@ impl WifiIface {
                 log::debug!("disconnect cleanup failed: {e}");
             }
             self.fail_auth(WifiError::wrong_password(&self.link.network.ssid));
+        } else if pmksa_rejected_by_deauth(
+            self.state,
+            self.link.bss_info.security,
+            self.link.pmksa_in_use.is_some(),
+            self.link.fourway.is_some(),
+            reason,
+            from_ap,
+        ) {
+            // wpa_supplicant's `sme_event_deauth()`: some APs reject a
+            // (Re)Association Request that carries a PMKID by
+            // deauthenticating with reason 9 instead of answering with a
+            // failure status. Drop the stale entry and retry with full
+            // authentication now, instead of waiting out the attempt
+            // timeout and fetching the same PMKID again.
+            log::warn!(
+                "PMKSA caching attempt rejected with deauthentication \
+                 (reason={reason:?}); dropping the cached PMKSA and falling \
+                 back to full authentication"
+            );
+            self.pmksa_fallback().await;
         } else {
             log::debug!(
                 "stale AP disconnect (reason={reason:?}) in state {:?}; \
@@ -1905,6 +1995,78 @@ mod tests {
             classify_fast_reconnect(None, Some(true), true),
             FastReconnect::ScanNow
         );
+    }
+
+    /// wpa_supplicant's `sme_event_deauth()`: an AP that answers a
+    /// PMKID-bearing association with a deauth reason 9
+    /// (`STA_REQ_ASSOC_WITHOUT_AUTH`) is refusing the cached PMKSA, so
+    /// the entry must be dropped before the next attempt.
+    #[test]
+    fn pmksa_deauth_rejection_requires_association_phase() {
+        let reason = Some(Ieee80211ReasonCode::StaReqAssocWithoutAuth);
+        let pmksa = |security, fourway, reason, from_ap| {
+            pmksa_rejected_by_deauth(
+                WifiState::Authenticating,
+                security,
+                true,
+                fourway,
+                reason,
+                from_ap,
+            )
+        };
+
+        // The canonical rejection: an AP-generated reason 9 during the
+        // SAE PMKID association, before the 4-way handshake.
+        for security in [
+            SecurityType::Sae,
+            SecurityType::SaeExtKey,
+            SecurityType::FtSae,
+            SecurityType::FtSaeExtKey,
+        ] {
+            assert!(
+                pmksa(security, false, reason, Some(true)),
+                "{security:?} must drop the rejected PMKSA"
+            );
+        }
+        // wpa_supplicant gates this fallback on SAE key management.
+        assert!(!pmksa(SecurityType::Wpa2Psk, false, reason, Some(true)));
+        // Once the 4-way handshake started, the handshake-failure paths
+        // own the stale-PMKSA handling.
+        assert!(!pmksa(SecurityType::Sae, true, reason, Some(true)));
+        // No cached PMKID in the attempt: nothing to reject.
+        assert!(!pmksa_rejected_by_deauth(
+            WifiState::Authenticating,
+            SecurityType::Sae,
+            false,
+            false,
+            reason,
+            Some(true)
+        ));
+        // A locally generated teardown or a missing origin is not the
+        // AP refusing the PMKSA.
+        assert!(!pmksa(SecurityType::Sae, false, reason, Some(false)));
+        assert!(!pmksa(SecurityType::Sae, false, reason, None));
+        // Other reasons keep their existing handling.
+        for other in [
+            Ieee80211ReasonCode::Unspecified,
+            Ieee80211ReasonCode::DisassocDueToInactivity,
+            Ieee80211ReasonCode::DeauthLeaving,
+            Ieee80211ReasonCode::FourWayHandshakeTimeout,
+        ] {
+            assert!(
+                !pmksa(SecurityType::Sae, false, Some(other), Some(true)),
+                "{other:?} is not a PMKSA rejection"
+            );
+        }
+        // Only an attempt in flight qualifies.
+        assert!(!pmksa_rejected_by_deauth(
+            WifiState::ConnectedWithoutOffloadRekey,
+            SecurityType::Sae,
+            true,
+            false,
+            reason,
+            Some(true)
+        ));
     }
 
     #[test]

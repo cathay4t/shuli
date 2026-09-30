@@ -186,6 +186,7 @@ impl WifiIface {
             pmksa_in_use: None,
             ft: None,
             pending_ft_msg1: None,
+            stale_connect_failure: false,
         };
         let last_resume = *resume_rx.borrow();
 
@@ -282,6 +283,21 @@ impl WifiIface {
         let failed_bssid = self.link.bss_info.bssid;
         if failed_bssid == [0; ETH_ALEN] {
             return Ok(false);
+        }
+        // A failed attempt that still holds a cached PMKID was not
+        // rejected by the BSS: the cached PMKSA is stale, which is the
+        // only failure a PMKID can add. Blacklisting the healthy BSS
+        // would only delay the recovery (and another BSS of the ESS
+        // would fetch the same stale entry), so drop it and retry full
+        // authentication on this BSS instead.
+        if self.link.pmksa_in_use.is_some() {
+            log::warn!(
+                "BSS {:02x?} failed while using a cached PMKID; dropping the \
+                 PMKSA and retrying with full authentication",
+                failed_bssid
+            );
+            self.pmksa_fallback().await;
+            return Ok(self.state == WifiState::Authenticating);
         }
         let count = self.bssid_ignore.add(failed_bssid);
         log::warn!(
@@ -733,6 +749,25 @@ impl WifiIface {
                                      treating as wrong password"
                                 );
                                 self.fail_auth(err);
+                                break;
+                            }
+                            // The AP did not complete the PMKID-based
+                            // association in time (some APs silently
+                            // drop an association request whose PMKID
+                            // they no longer know): the cached entry is
+                            // stale, so drop it and retry with full
+                            // authentication instead of repeating the
+                            // same PMKID attempt.
+                            if self.link.pmksa_in_use.is_some() {
+                                log::warn!(
+                                    "PMKID-based association timed out; \
+                                     dropping the cached PMKSA and retrying \
+                                     with full authentication"
+                                );
+                                self.pmksa_fallback().await;
+                                if self.state == WifiState::Authenticating {
+                                    continue;
+                                }
                                 break;
                             }
                             log::warn!("authentication timed out; will retry");

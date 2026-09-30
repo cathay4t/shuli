@@ -37,6 +37,19 @@
    the same BSS directly and falls back to a scan when that fails;
    every other disconnect scans immediately for an alternative BSS or
    configured SSID.
+ - Reject a PMKID-based association like wpa_supplicant's
+   `sme_event_deauth()`: an AP deauthenticating with reason 9
+   (`STA_REQ_ASSOC_WITHOUT_AUTH`) is treated as the cached-PMKSA
+   rejection, dropping the entry and retrying with full authentication
+   instead of waiting out the attempt timeout and repeating the stale
+   PMKID.
+ - Drop a stale PMKSA and fall back to full authentication when a
+   PMKID-based association fails or times out, instead of repeating the
+   same cached-PMKID attempt and blacklisting the healthy BSS.
+ - Ignore the kernel's trailing `CONNECT` failure for an association
+   response a PMKSA fallback already handled, and log locally generated
+   (driver/firmware) teardowns distinctly from AP-initiated
+   disconnects.
 
 ## [0.2.0] - 2026-08-16
 ### Breaking changes

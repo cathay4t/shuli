@@ -1920,6 +1920,122 @@ async fn wifi_client_sae_pmksa_reconnect() {
     client.shutdown().await;
 }
 
+/// A PMKID the AP no longer knows must not blacklist the BSS or repeat
+/// the same cached-PMKID attempt: the client drops the stale entry and
+/// reconnects with full SAE right away. hostapd answers the PMKID
+/// association with `WLAN_STATUS_INVALID_PMKID` (a failure (Re)Association
+/// Response); APs that deauthenticate the station with reason 9
+/// (`STA_REQ_ASSOC_WITHOUT_AUTH`) take the same fallback.
+#[tokio::test]
+async fn wifi_client_sae_pmksa_rejected_falls_back_to_sae() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_sae_pmksa_rejected_falls_back_to_sae: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    let bssid = client.ifaces.values().next().unwrap().link.bss_info.bssid;
+    assert!(
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .pmksa_cache
+            .lookup("Test-WIFI", bssid)
+            .is_some(),
+        "PMKSA must be cached after the first connection"
+    );
+
+    // Drain the trailing events of the first connection (e.g. the
+    // control-port TX status) so the disconnect below is seen cleanly.
+    drain_pending_events(&mut client).await;
+
+    // The AP forgets the PMKSA; the next PMKID-based association is
+    // rejected with WLAN_STATUS_INVALID_PMKID.
+    hostapd_cli("PMKSA_FLUSH");
+
+    let sta_mac = client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .core
+        .nl
+        .mac
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    hostapd_cli(&format!("DISASSOCIATE {sta_mac} reason=4"));
+
+    // Rejection -> drop the stale PMKSA -> full SAE -> connected. The
+    // old behaviour waited out the 15 s attempt timeout, retried the
+    // same PMKID and blacklisted the healthy BSS on the way.
+    let started = std::time::Instant::now();
+    let state = run_until_connected(&mut client, 40)
+        .await
+        .expect("reconnect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert!(
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .auth
+            .method
+            .is_some(),
+        "the rejected PMKID must fall back to a full SAE exchange"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "PMKSA rejection recovery took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !client
+            .ifaces
+            .values()
+            .next()
+            .unwrap()
+            .bssid_ignore
+            .is_ignored(&bssid),
+        "a stale PMKSA rejection must not blacklist the healthy BSS"
+    );
+    assert!(
+        client
+            .ifaces
+            .values_mut()
+            .next()
+            .unwrap()
+            .pmksa_cache
+            .lookup("Test-WIFI", bssid)
+            .is_some(),
+        "the full SAE fallback must cache a fresh PMKSA"
+    );
+    client.shutdown().await;
+}
+
 /// exit criterion 3: after the first WPA2-PSK connection the PMKSA
 /// is cached. When the AP disconnects the STA, the client must
 /// reconnect through the cached PMK: `psk_pmk` stays `None` on the

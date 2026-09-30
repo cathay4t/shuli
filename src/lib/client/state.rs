@@ -193,6 +193,13 @@ pub(crate) struct Link {
     /// A 4-way Message 1 that arrived before the FT context could be
     /// built from the association response event (the two can race).
     pub(crate) pending_ft_msg1: Option<Vec<u8>>,
+    /// Set when an association-response failure was already handled by
+    /// continuing the attempt (PMKSA fallback). The kernel reports every
+    /// association response twice - the `ASSOCIATE` event and the
+    /// trailing `CONNECT` result - so the CONNECT failure of that
+    /// already-handled response must not tear down the recovery attempt
+    /// the fallback started.
+    pub(crate) stale_connect_failure: bool,
 }
 
 /// Per-attempt pre-association and key-derivation state. Reset at the
@@ -315,6 +322,7 @@ impl Link {
         self.pmksa_in_use = None;
         self.ft = None;
         self.pending_ft_msg1 = None;
+        self.stale_connect_failure = false;
     }
 }
 
