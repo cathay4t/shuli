@@ -749,7 +749,10 @@ async fn wifi_client_reports_tkip_group_as_no_support() {
         .await
         .expect_err("a TKIP-group AP must not connect");
     assert_eq!(err.kind, ErrorKind::NoSupport, "unexpected error: {err}");
-    assert_eq!(err.msg, "TKIP WPA2 is not supported");
+    assert_eq!(
+        err.msg,
+        "TKIP WPA2 is deprecated and not supported by shuli"
+    );
     assert_eq!(err.ssid.as_deref(), Some("Test-WIFI-TKIP"));
     client.shutdown().await;
 }

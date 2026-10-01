@@ -823,14 +823,14 @@ pub(crate) struct BssScanSecurity {
     pub(crate) group_mgmt_cipher: Ieee80211CipherSuite,
     pub(crate) mdie: Option<MdieInfo>,
     /// Why `security` is [`SecurityType::Unsupported`], e.g.
-    /// `TKIP WPA2 is not supported`. `None` when the BSS is joinable or
-    /// open.
+    /// `TKIP WPA2 is deprecated and not supported by shuli`. `None` when
+    /// the BSS is joinable or open.
     pub(crate) unsupported_reason: Option<String>,
 }
 
 /// Human-readable description of a supported security type, used to
 /// name the protocol in an unsupported-security reason (e.g. the
-/// `WPA2` in `TKIP WPA2 is not supported`).
+/// `WPA2` in `TKIP WPA2 is deprecated and not supported by shuli`).
 fn security_name(security: SecurityType) -> &'static str {
     match security {
         SecurityType::Open => "Open",
@@ -944,7 +944,8 @@ fn akm_rank(security: SecurityType) -> u8 {
 /// treated as open).
 ///
 /// Returns the detected security type plus, when it is `Unsupported`, a
-/// user-facing reason (e.g. `TKIP WPA2 is not supported`).
+/// user-facing reason (e.g. `TKIP WPA2 is deprecated and not supported
+/// by shuli`).
 fn security_from_rsne(body: &[u8]) -> (SecurityType, Option<String>) {
     let Ok(rsn) = Ieee80211ElementRsn::parse(body) else {
         return (
@@ -980,16 +981,16 @@ fn security_from_rsne(body: &[u8]) -> (SecurityType, Option<String>) {
     // protocol in the reason is derived from the AP's AKM suites so the
     // caller can say what exactly is unsupported.
     if rsn.group_cipher == Some(Ieee80211CipherSuite::Tkip) {
-        let proto = if best == SecurityType::Open {
-            // No supported AKM: report the plain protocol name.
-            "TKIP".to_string()
+        let reason = if best == SecurityType::Open {
+            // No supported AKM: TKIP itself is the unsupported protocol.
+            "TKIP is deprecated and not supported by shuli".to_string()
         } else {
-            security_name(best).to_string()
+            format!(
+                "TKIP {} is deprecated and not supported by shuli",
+                security_name(best)
+            )
         };
-        return (
-            SecurityType::Unsupported,
-            Some(format!("TKIP {proto} is not supported")),
-        );
+        return (SecurityType::Unsupported, Some(reason));
     }
     // No supported AKM suite among the advertised ones: an encrypted
     // AP shuli cannot join.

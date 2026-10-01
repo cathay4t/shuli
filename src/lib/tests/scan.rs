@@ -165,7 +165,7 @@ fn test_tkip_group_cipher_is_unsupported() {
     );
     assert_eq!(
         sec.unsupported_reason.as_deref(),
-        Some("TKIP WPA2 is not supported"),
+        Some("TKIP WPA2 is deprecated and not supported by shuli"),
         "the reason must name the protocol for the API caller"
     );
 }
