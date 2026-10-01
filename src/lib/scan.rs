@@ -500,6 +500,26 @@ impl WifiIface {
             })
             .or_else(|| best_scan_candidate(&self.roam.last_scan_candidates));
         let Some((bss_info, network)) = best else {
+            // The scan saw a configured SSID encrypted in a way shuli
+            // cannot join (e.g. the AP's group cipher is TKIP): report
+            // that precisely instead of a generic "SSID not found" so the
+            // API user can tell "AP present but unsupported" from "AP
+            // absent" and surface an actionable error.
+            if let Some((unsupported_ssid, reason)) =
+                self.scan.unsupported_security.as_ref()
+                && self
+                    .core
+                    .config
+                    .networks
+                    .iter()
+                    .any(|network| network.ssid == *unsupported_ssid)
+            {
+                return Err(WifiError::new(
+                    ErrorKind::NoSupport,
+                    reason.clone(),
+                )
+                .with_ssid(unsupported_ssid.clone()));
+            }
             return Err(WifiError::new(
                 ErrorKind::SsidNotFound,
                 format!(
@@ -665,6 +685,11 @@ impl WifiIface {
         let bss_list = self.core.nl.get_scan_results().await?;
         log::trace!("scan dump returned {} BSS entries", bss_list.len());
 
+        // Remember (for this dump only) whether a configured SSID was
+        // seen with a security mode shuli cannot join. When the dump
+        // yields no joinable candidate, this turns the generic "SSID not
+        // found" into a precise NoSupport error for the API user.
+        self.scan.unsupported_security = None;
         let mut candidates: Vec<(BssInfo, NetworkConfig)> = Vec::new();
         for bss in &bss_list {
             let Some(ies) = extract_ies(bss) else {
@@ -701,10 +726,17 @@ impl WifiIface {
             // it open would make the client associate without
             // encryption.
             if bss_security.security == SecurityType::Unsupported {
+                let reason = bss_security
+                    .unsupported_reason
+                    .unwrap_or_else(|| "unsupported security mode".to_string());
                 log::info!(
                     "BSS {bssid:02x?} (ssid={bss_ssid}) has no supported \
-                     security mode; skipping"
+                     security mode ({reason}); skipping"
                 );
+                if self.scan.unsupported_security.is_none() {
+                    self.scan.unsupported_security =
+                        Some((bss_ssid.clone(), reason));
+                }
                 continue;
             }
             candidates.push((
@@ -790,6 +822,30 @@ pub(crate) struct BssScanSecurity {
     pub(crate) ap_rsnxe: Vec<u8>,
     pub(crate) group_mgmt_cipher: Ieee80211CipherSuite,
     pub(crate) mdie: Option<MdieInfo>,
+    /// Why `security` is [`SecurityType::Unsupported`], e.g.
+    /// `TKIP WPA2 is not supported`. `None` when the BSS is joinable or
+    /// open.
+    pub(crate) unsupported_reason: Option<String>,
+}
+
+/// Human-readable description of a supported security type, used to
+/// name the protocol in an unsupported-security reason (e.g. the
+/// `WPA2` in `TKIP WPA2 is not supported`).
+fn security_name(security: SecurityType) -> &'static str {
+    match security {
+        SecurityType::Open => "Open",
+        SecurityType::Wpa2Psk | SecurityType::Wpa2PskSha256 => "WPA2",
+        SecurityType::Wpa2Ent | SecurityType::Wpa2EntSha256 => {
+            "WPA2-Enterprise"
+        }
+        SecurityType::Owe => "OWE",
+        SecurityType::Sae | SecurityType::SaeExtKey => "WPA3",
+        SecurityType::FtPsk => "WPA2",
+        SecurityType::FtSae | SecurityType::FtSaeExtKey => "WPA3",
+        // The named security types cover every joinable AKM;
+        // `Unsupported` has no protocol name.
+        SecurityType::Unsupported => "WPA",
+    }
 }
 
 /// Walk an 802.11 IE buffer and determine the security type from the
@@ -801,7 +857,8 @@ pub(crate) struct BssScanSecurity {
 /// join - an RSNE whose AKMs are all unknown, an RSNE with a TKIP
 /// group cipher, or a WPA1 AP (vendor WPA IE, no RSNE). Such a BSS
 /// must never fall through to `Open`, which would make the client
-/// associate without encryption.
+/// associate without encryption. `unsupported_reason` carries a
+/// user-facing explanation for the caller to surface.
 pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     let mut rsne = Vec::new();
     let mut rsnxe = Vec::new();
@@ -833,12 +890,15 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
         }
         pos += header.buffer_len();
     }
-    let security = if rsne.len() > 2 {
+    let (security, unsupported_reason) = if rsne.len() > 2 {
         security_from_rsne(&rsne[2..])
     } else if wpa_ie {
-        SecurityType::Unsupported
+        (
+            SecurityType::Unsupported,
+            Some("WPA1 is not supported".to_string()),
+        )
     } else {
-        SecurityType::Open
+        (SecurityType::Open, None)
     };
     let group_mgmt_cipher = if rsne.len() > 2 {
         negotiate_group_mgmt_cipher(&rsne)
@@ -851,6 +911,7 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
         ap_rsnxe: rsnxe,
         group_mgmt_cipher,
         mdie,
+        unsupported_reason,
     }
 }
 
@@ -881,15 +942,16 @@ fn akm_rank(security: SecurityType) -> u8 {
 /// parse failure and every all-unsupported AKM list maps to
 /// `Unsupported` instead (an encrypted AP shuli cannot join must not be
 /// treated as open).
-fn security_from_rsne(body: &[u8]) -> SecurityType {
+///
+/// Returns the detected security type plus, when it is `Unsupported`, a
+/// user-facing reason (e.g. `TKIP WPA2 is not supported`).
+fn security_from_rsne(body: &[u8]) -> (SecurityType, Option<String>) {
     let Ok(rsn) = Ieee80211ElementRsn::parse(body) else {
-        return SecurityType::Unsupported;
+        return (
+            SecurityType::Unsupported,
+            Some("unparsable security information".to_string()),
+        );
     };
-    // TKIP as the group cipher means a WPA1/WPA2 hybrid or TKIP-only
-    // AP - shuli does not implement TKIP and must not connect.
-    if rsn.group_cipher == Some(Ieee80211CipherSuite::Tkip) {
-        return SecurityType::Unsupported;
-    }
     let mut best = SecurityType::Open;
     for akm in &rsn.akm_suits {
         let candidate = match akm {
@@ -913,12 +975,31 @@ fn security_from_rsne(body: &[u8]) -> SecurityType {
             best = candidate;
         }
     }
+    // TKIP as the group cipher means a WPA1/WPA2 hybrid or TKIP-only
+    // AP - shuli does not implement TKIP and must not connect. The
+    // protocol in the reason is derived from the AP's AKM suites so the
+    // caller can say what exactly is unsupported.
+    if rsn.group_cipher == Some(Ieee80211CipherSuite::Tkip) {
+        let proto = if best == SecurityType::Open {
+            // No supported AKM: report the plain protocol name.
+            "TKIP".to_string()
+        } else {
+            security_name(best).to_string()
+        };
+        return (
+            SecurityType::Unsupported,
+            Some(format!("TKIP {proto} is not supported")),
+        );
+    }
     // No supported AKM suite among the advertised ones: an encrypted
     // AP shuli cannot join.
     if best == SecurityType::Open {
-        SecurityType::Unsupported
+        (
+            SecurityType::Unsupported,
+            Some("unsupported security mode".to_string()),
+        )
     } else {
-        best
+        (best, None)
     }
 }
 

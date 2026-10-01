@@ -250,6 +250,14 @@ pub(crate) struct ScanEngine {
     /// initialization race of an OS boot. Cleared by the first use or by
     /// a successful connection.
     pub(crate) startup_fast_retry: bool,
+    /// First configured SSID seen in the last scan dump whose BSS was
+    /// encrypted in a way shuli cannot join, with a user-facing reason
+    /// (e.g. `("空蝉", "TKIP WPA2 is not supported")`). Set by
+    /// `collect_scan_candidates()`; when the scan finds no joinable
+    /// candidate, `process_scan_results()` surfaces it as
+    /// [`crate::ErrorKind::NoSupport`] instead of `SsidNotFound` so the
+    /// API user can tell "AP present but unsupported" from "AP absent".
+    pub(crate) unsupported_security: Option<(String, String)>,
 }
 
 /// State that lives with the current target/association: the selected
@@ -387,6 +395,7 @@ impl ScanEngine {
         self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
         self.sched_scan_timeout_secs = SCHED_SCAN_WATCHDOG_SECS;
         self.hint_scan = true;
+        self.unsupported_security = None;
     }
 }
 

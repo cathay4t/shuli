@@ -22,6 +22,9 @@ pub enum ErrorKind {
     NetlinkDecode,
     Deprecated,
     Roaming,
+    /// The requested operation needs a feature this build does not
+    /// implement (e.g. connecting to a TKIP-only AP).
+    NoSupport,
 }
 
 impl fmt::Display for ErrorKind {
@@ -44,6 +47,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::NetlinkDecode => "netlink-decode",
             ErrorKind::Deprecated => "deprecated",
             ErrorKind::Roaming => "roaming",
+            ErrorKind::NoSupport => "no-support",
         };
         write!(f, "{s}")
     }
@@ -55,6 +59,9 @@ pub struct WifiError {
     pub kind: ErrorKind,
     pub msg: String,
     pub iface_name: Option<String>,
+    /// SSID the error is about, when known (e.g. the network a
+    /// [`ErrorKind::NoSupport`] scan result rejected).
+    pub ssid: Option<String>,
 }
 
 impl WifiError {
@@ -63,12 +70,19 @@ impl WifiError {
             kind,
             msg: msg.into(),
             iface_name: None,
+            ssid: None,
         }
     }
 
     /// Attach the interface the error belongs to.
     pub fn with_iface_name(mut self, iface_name: impl Into<String>) -> Self {
         self.iface_name = Some(iface_name.into());
+        self
+    }
+
+    /// Attach the SSID the error belongs to.
+    pub fn with_ssid(mut self, ssid: impl Into<String>) -> Self {
+        self.ssid = Some(ssid.into());
         self
     }
 

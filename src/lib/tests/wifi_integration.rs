@@ -319,6 +319,24 @@ rrm_neighbor_report=1
 ctrl_interface=/var/run/hostapd
 ";
 
+/// WPA2-PSK with a TKIP group cipher - the WPA/WPA2 hybrid layout many
+/// consumer routers (e.g. the Realtek RTL8671 `空蝉` AP) still ship.
+/// shuli does not implement TKIP and must report `NoSupport` with the
+/// protocol named instead of treating the SSID as absent.
+const TKIP_GROUP_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-TKIP
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+group_cipher=TKIP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 /// WPA2-Personal with SHA-256 algorithms (AKM 6).
 const WPA2_PSK_SHA256_HOSTAPD_CONF: &str = r"
 interface=wifi_ap
@@ -703,6 +721,36 @@ async fn wifi_client_open_connect() {
         WifiState::ConnectedWithoutOffloadRekey
             | WifiState::ConnectedWithOffloadRekey
     ));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn wifi_client_reports_tkip_group_as_no_support() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_reports_tkip_group_as_no_support: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(TKIP_GROUP_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-TKIP", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+
+    // The AP is on air with an unsupported security mode: the client
+    // must report NoSupport (not a generic "SSID not found") so nipart
+    // can fail `npt wifi connect` with the real reason.
+    let err = run_until_connected(&mut client, 5)
+        .await
+        .expect_err("a TKIP-group AP must not connect");
+    assert_eq!(err.kind, ErrorKind::NoSupport, "unexpected error: {err}");
+    assert_eq!(err.msg, "TKIP WPA2 is not supported");
+    assert_eq!(err.ssid.as_deref(), Some("Test-WIFI-TKIP"));
     client.shutdown().await;
 }
 

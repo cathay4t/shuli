@@ -98,6 +98,10 @@ fn test_supported_akms_are_recognized() {
         let sec = detect_security(&rsne_ie(akm));
         assert_eq!(sec.security, expected, "AKM 00-0F-AC:{akm}");
         assert!(!sec.ap_rsne.is_empty(), "RSNE must be collected");
+        assert!(
+            sec.unsupported_reason.is_none(),
+            "a joinable BSS must not carry an unsupported reason"
+        );
     }
 }
 
@@ -159,6 +163,11 @@ fn test_tkip_group_cipher_is_unsupported() {
         SecurityType::Unsupported,
         "TKIP group cipher must be rejected even with AKM PSK"
     );
+    assert_eq!(
+        sec.unsupported_reason.as_deref(),
+        Some("TKIP WPA2 is not supported"),
+        "the reason must name the protocol for the API caller"
+    );
 }
 
 #[test]
@@ -167,6 +176,10 @@ fn test_wpa1_ie_without_rsne_is_unsupported() {
     // classified open and shuli would associate without encryption.
     let sec = detect_security(&wpa1_ie());
     assert_eq!(sec.security, SecurityType::Unsupported);
+    assert_eq!(
+        sec.unsupported_reason.as_deref(),
+        Some("WPA1 is not supported")
+    );
     assert!(sec.ap_rsne.is_empty());
 }
 

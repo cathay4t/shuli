@@ -21,6 +21,13 @@
  * `NetworkConfigHints` and `SecurityType` now implement serde
    `Serialize`/`Deserialize` so hints can be persisted to a file and
    loaded back after reboot.
+ * A scan that sees a configured SSID only with an unsupported security
+   mode (e.g. an AP whose group cipher is TKIP, like many WPA/WPA2
+   hybrid consumer routers) now reports `ErrorKind::NoSupport` with a
+   user-facing reason such as `TKIP WPA2 is not supported` instead of
+   the generic `ErrorKind::SsidNotFound`. `WifiError` also carries the
+   SSID the error is about, so an API user (e.g. nipart's wifi plugin)
+   can fail the matching connection wait with the real reason.
 
 ### Bug fixes
  - `WifiClient::update_networks()` no longer tears down an in-flight

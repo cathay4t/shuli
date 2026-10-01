@@ -180,6 +180,7 @@ impl WifiIface {
             scan_wildcard_next: true,
             hint_scan: true,
             startup_fast_retry: true,
+            unsupported_security: None,
         };
         let link = Link {
             network,
@@ -506,8 +507,13 @@ impl WifiIface {
                 if let Err(e) = self.process_scan_results().await {
                     // A hinted-frequency scan missed: retry once with a
                     // full scan before handing the periodic search over
-                    // to PNO / host-side backoff.
-                    if e.kind == ErrorKind::SsidNotFound && self.scan.hint_scan
+                    // to PNO / host-side backoff. An unsupported-security
+                    // result is treated the same way: the full scan may
+                    // still find a joinable BSS of another configured
+                    // SSID (or of the same SSID on another band).
+                    if (e.kind == ErrorKind::SsidNotFound
+                        || e.kind == ErrorKind::NoSupport)
+                        && self.scan.hint_scan
                     {
                         self.scan.hint_scan = false;
                         log::debug!(
@@ -1286,8 +1292,8 @@ impl WifiIface {
     ///   connection.
     /// * Order is not part of a network's identity: a list carrying the same
     ///   entries in a different order is also a no-op, so a caller that
-    ///   re-sends the saved profiles from hash-map-backed state cannot
-    ///   disturb an in-flight attempt.
+    ///   re-sends the saved profiles from hash-map-backed state cannot disturb
+    ///   an in-flight attempt.
     /// * If the list changes while a scan or authentication is in flight and
     ///   the current target is still configured unchanged, the in-flight
     ///   attempt is kept and the new list applies to the next selection.
