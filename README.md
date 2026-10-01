@@ -109,7 +109,7 @@ Add these lines to your Cargo.toml:
 ```toml
 [dependencies.shuli]
 package = "shuli"
-version = "0.2.0"
+version = "0.3.0"
 ```
 
 A `WifiClient` manages one or more wifi-phy interfaces with a single

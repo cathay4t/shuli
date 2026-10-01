@@ -1,33 +1,33 @@
 # Changelog
-## [Unreleased]
+## [0.3.0] - 2026-10-01
 ### Breaking changes
- * `WifiClient` now manages all wifi-phy interfaces in one object; use
+ - `WifiClient` now manages all wifi-phy interfaces in one object; use
    `WifiClient::init()` and the `WifiRunResult`-returning
-   `run_multi()` when managing multiple interfaces.
+   `run_multi()` when managing multiple interfaces. (b7c4c6e, 85172f9)
 
 ### New features
  - Add per-network `prefered` flag: a preferred SSID found in scan
    results wins over stronger BSSes of other configured SSIDs; it is
    ignored when its signal is below
-   `DEFAULT_SWITCH_SSID_LOWER_THAN_DBM` (-80 dBm).
- * One `WifiClient` per network namespace: all interfaces share one
+   `DEFAULT_SWITCH_SSID_LOWER_THAN_DBM` (-80 dBm). (10d863e)
+ - One `WifiClient` per network namespace: all interfaces share one
    nl80211 socket and one event dispatcher that routes multicast events
-   by `IFINDEX`.
- * Add `NetworkConfig::hints` so API users can pass last-known BSS
+   by `IFINDEX`. (b7c4c6e)
+ - Add `NetworkConfig::hints` so API users can pass last-known BSS
    information for a scan-free connect, or partial hints (frequencies)
    for a best-effort quick scan with the normal scan flow as fallback.
    `WifiClient::export_hints()` exports the current BSS as hints for
-   the next run.
- * `NetworkConfigHints` and `SecurityType` now implement serde
+   the next run. (344dd6a)
+ - `NetworkConfigHints` and `SecurityType` now implement serde
    `Serialize`/`Deserialize` so hints can be persisted to a file and
-   loaded back after reboot.
- * A scan that sees a configured SSID only with an unsupported security
+   loaded back after reboot. (51eedf0)
+ - A scan that sees a configured SSID only with an unsupported security
    mode (e.g. an AP whose group cipher is TKIP, like many WPA/WPA2
    hybrid consumer routers) now reports `ErrorKind::NoSupport` with a
    user-facing reason such as `TKIP WPA2 is not supported` instead of
    the generic `ErrorKind::SsidNotFound`. `WifiError` also carries the
    SSID the error is about, so an API user (e.g. nipart's wifi plugin)
-   can fail the matching connection wait with the real reason.
+   can fail the matching connection wait with the real reason. (5c38027)
 
 ### Bug fixes
  - `WifiClient::update_networks()` no longer tears down an in-flight
@@ -35,37 +35,38 @@
    networks in a different order, or when the current target is still
    configured unchanged. A boot-time hand-off re-sending the saved
    profiles (e.g. nipart's wifi plugin) can no longer kill a 4-way
-   handshake mid-flight and cost the retry backoff.
+   handshake mid-flight and cost the retry backoff. (91b389d, bf3e35c)
  - The first connection-attempt failure after client start retries
    after 2 seconds instead of the full 10-second scan-retry backoff,
    covering the driver/firmware initialization race of an OS boot.
+   (bf3e35c)
  - Report wrong-password authentication failures as
    `ErrorKind::WrongPassword` on `WifiClient::run()` /
    `WifiRunResult::error` instead of only entering the generic
-   `FailedAuthentication` retry state.
+   `FailedAuthentication` retry state. (c17cb6f)
  - `SET_REKEY_OFFLOAD` now carries the negotiated AKM instead of always
-   reporting SAE.
+   reporting SAE. (ab9fa12)
  - Refresh driver rekey offload after userspace group rekeys and after
    FT roam, and apply the replay counter reported by the driver after a
-   firmware GTK rekey.
+   firmware GTK rekey. (ab9fa12)
  - Recover a lost established connection like wpa_supplicant: an
    AP-initiated disconnect with a recoverable reason (4/6/7) retries
    the same BSS directly and falls back to a scan when that fails;
    every other disconnect scans immediately for an alternative BSS or
-   configured SSID.
+   configured SSID. (6318a57, b080442)
  - Reject a PMKID-based association like wpa_supplicant's
    `sme_event_deauth()`: an AP deauthenticating with reason 9
    (`STA_REQ_ASSOC_WITHOUT_AUTH`) is treated as the cached-PMKSA
    rejection, dropping the entry and retrying with full authentication
    instead of waiting out the attempt timeout and repeating the stale
-   PMKID.
+   PMKID. (0434e4c)
  - Drop a stale PMKSA and fall back to full authentication when a
    PMKID-based association fails or times out, instead of repeating the
-   same cached-PMKID attempt and blacklisting the healthy BSS.
+   same cached-PMKID attempt and blacklisting the healthy BSS. (0434e4c)
  - Ignore the kernel's trailing `CONNECT` failure for an association
    response a PMKSA fallback already handled, and log locally generated
    (driver/firmware) teardowns distinctly from AP-initiated
-   disconnects.
+   disconnects. (0434e4c)
 
 ## [0.2.0] - 2026-08-16
 ### Breaking changes
