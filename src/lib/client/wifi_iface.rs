@@ -6,18 +6,19 @@ use wl_nl80211::{Ieee80211ReasonCode, Nl80211Command, Nl80211WowlanWakeup};
 use super::{
     AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, BssidIgnoreList,
     ErrorKind, FAST_RECONNECT_DELAY_MS, FastReconnect, IfaceCore, Link,
-    MAX_SCHED_SCAN_SSIDS, NetworkConfig, Nl80211Attr, Nl80211Disconnect,
-    Nl80211Event, Nl80211EventReceiver, Nl80211SchedScanMatch,
-    Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan, Nl80211SchedScanPlanAttr,
-    Nl80211Wowlan, Nl80211WowlanTriggersSupport, PmksaCache, RETRY_AUTH_SEC,
-    RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC, ROAM_SIGNAL_CHECK_SECS,
-    ResumeAction, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
-    SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
-    SCHED_SCAN_WATCHDOG_SECS, ScanEngine, ShuliNl80211Connection, WifiConfig,
+    MAX_SCHED_SCAN_SSIDS, NetworkConfig, NetworkUpdate, Nl80211Attr,
+    Nl80211Disconnect, Nl80211Event, Nl80211EventReceiver,
+    Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
+    Nl80211SchedScanPlanAttr, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
+    PmksaCache, RETRY_AUTH_SEC, RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC,
+    ROAM_SIGNAL_CHECK_SECS, ResumeAction, RoamEngine,
+    SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX, SCHED_SCAN_INTERVAL_SEC,
+    SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS, SCHED_SCAN_WATCHDOG_SECS,
+    STARTUP_RETRY_SEC, ScanEngine, ShuliNl80211Connection, WifiConfig,
     WifiError, WifiIface, WifiState, WiphyCaps, WowlanState,
     best_retry_candidate, drain_request, format_ssids, is_eopnotsupp,
-    next_sched_scan_ssids, resume_action, wiphy_sched_scan_caps,
-    wiphy_wowlan_support,
+    network_update_action, next_sched_scan_ssids, resume_action,
+    wiphy_sched_scan_caps, wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
 
@@ -178,6 +179,7 @@ impl WifiIface {
             scan_ssid_cursor: 0,
             scan_wildcard_next: true,
             hint_scan: true,
+            startup_fast_retry: true,
         };
         let link = Link {
             network,
@@ -256,8 +258,11 @@ impl WifiIface {
                         | WifiState::ConnectedWithOffloadRekey
                 ) {
                     // A successful connection resets the failure history
-                    // so stale rejections do not steer future roaming.
+                    // so stale rejections do not steer future roaming,
+                    // and ends the client-startup window: later failures
+                    // use the normal retry backoff.
                     self.bssid_ignore.clear();
+                    self.scan.startup_fast_retry = false;
                 }
                 if prev_state == WifiState::Authenticating
                     && self.state == WifiState::Failed
@@ -874,10 +879,23 @@ impl WifiIface {
                 } else {
                     None
                 };
+                // The first failure after client start retries quickly:
+                // a boot-time client races the WiFi driver/firmware
+                // initialization, so a transient first failure usually
+                // clears within a second or two. Consumed once; later
+                // failures use the normal scan-retry backoff.
+                let startup_retry = self.state == WifiState::Failed
+                    && fast.is_none()
+                    && self.scan.startup_fast_retry;
+                if startup_retry {
+                    self.scan.startup_fast_retry = false;
+                }
                 let wait = if fast.is_some() {
                     std::time::Duration::from_millis(FAST_RECONNECT_DELAY_MS)
                 } else if self.state == WifiState::FailedAuthentication {
                     std::time::Duration::from_secs(RETRY_AUTH_SEC)
+                } else if startup_retry {
+                    std::time::Duration::from_secs(STARTUP_RETRY_SEC)
                 } else {
                     std::time::Duration::from_secs(
                         self.scan.scan_retry_interval,
@@ -951,9 +969,14 @@ impl WifiIface {
                 if self.state == WifiState::Failed && fast.is_none() && !resumed
                 {
                     // Exponential backoff: 10 -> 20 -> 40 -> ... -> 300.
-                    self.scan.scan_retry_interval =
-                        (self.scan.scan_retry_interval * 2)
-                            .min(RETRY_BACKOFF_MAX_SEC);
+                    // The one-shot startup retry does not consume a
+                    // backoff step, so the normal cadence starts at
+                    // `RETRY_BACKOFF_INIT_SEC` on the next failure.
+                    if !startup_retry {
+                        self.scan.scan_retry_interval =
+                            (self.scan.scan_retry_interval * 2)
+                                .min(RETRY_BACKOFF_MAX_SEC);
+                    }
                 }
                 self.state = WifiState::Init;
             }
@@ -1261,7 +1284,14 @@ impl WifiIface {
     ///
     /// * An unchanged list is a no-op: idempotent re-apply keeps the current
     ///   connection.
-    /// * If a host scan is already in flight when the list changes, the update
+    /// * Order is not part of a network's identity: a list carrying the same
+    ///   entries in a different order is also a no-op, so a caller that
+    ///   re-sends the saved profiles from hash-map-backed state cannot
+    ///   disturb an in-flight attempt.
+    /// * If the list changes while a scan or authentication is in flight and
+    ///   the current target is still configured unchanged, the in-flight
+    ///   attempt is kept and the new list applies to the next selection.
+    /// * If the update must restart while a host scan is already in flight, it
     ///   first waits for the kernel's scan-completion event. Resetting to
     ///   `Init` while the kernel scan is still running would make the next
     ///   `run()` trigger a second scan and fail with `-EBUSY`.
@@ -1277,11 +1307,54 @@ impl WifiIface {
         &mut self,
         networks: Vec<NetworkConfig>,
     ) -> Result<(), WifiError> {
-        if networks == self.core.config.networks {
-            log::debug!("network list unchanged");
-            return Ok(());
+        let current_target = self.link.network.clone();
+        match network_update_action(
+            &self.core.config.networks,
+            &networks,
+            self.state,
+            &current_target,
+        ) {
+            NetworkUpdate::SameSet => {
+                // The same networks arrived (possibly in a different
+                // order): adopt the new list without touching any runtime
+                // state, so an in-flight scan or authentication is not
+                // disturbed.
+                if self.core.config.networks == networks {
+                    log::debug!("network list unchanged");
+                } else {
+                    log::debug!(
+                        "network list reordered; keeping current state"
+                    );
+                }
+                self.core.config.networks = networks;
+                return Ok(());
+            }
+            NetworkUpdate::KeepCurrentAttempt => {
+                // The list changed, but the network this client is
+                // scanning/authenticating toward is still configured
+                // unchanged: finish that attempt (a mid-handshake reset
+                // would make it fail and pay the retry backoff), then the
+                // new list applies to the next selection.
+                log::info!(
+                    "network list updated, keeping in-flight attempt toward \
+                     {}: [{}]",
+                    current_target.ssid,
+                    networks
+                        .iter()
+                        .map(|network| network.ssid.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                self.core.config.networks = networks;
+                self.scan.reset_rotation();
+                return Ok(());
+            }
+            NetworkUpdate::Restart => {}
         }
 
+        // The list changed and the in-flight attempt (if any) cannot be
+        // kept: drain a running scan before resetting so the next `run()`
+        // does not race it with a second scan (`-EBUSY`).
         if self.state == WifiState::Scanning {
             self.wait_scan_finish().await;
         }

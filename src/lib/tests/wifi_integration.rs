@@ -760,6 +760,56 @@ async fn wifi_client_update_networks_during_scan_does_not_race_next_scan() {
     client.shutdown().await;
 }
 
+/// regression: a caller (e.g. the boot hand-off) can re-send the same
+/// saved network list with its entries in a different order. Order is not
+/// part of a network's identity, so the update must be a no-op and must
+/// not reset the running scan.
+#[tokio::test]
+async fn wifi_client_update_networks_reordered_during_scan_keeps_scan() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping \
+             wifi_client_update_networks_reordered_during_scan_keeps_scan: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    config.add_network("Other-SSID", None);
+    let mut client =
+        WifiClient::init(vec![config.clone()]).await.expect("init");
+
+    let state = run_until_scan_started(&mut client, 3).await;
+    assert_eq!(
+        state,
+        WifiState::Scanning,
+        "client should be scanning when update_networks() is called"
+    );
+
+    let mut reordered = config.networks.clone();
+    reordered.reverse();
+    client
+        .update_networks(TEST_NIC, reordered)
+        .await
+        .expect("reordered update during scan");
+
+    let state = run_until_connected(&mut client, 20)
+        .await
+        .expect("connect after reordered update");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
 /// regression: a previous daemon that died without a clean shutdown can
 /// leave the radio associated. A fresh `WifiClient` must clear that stale
 /// kernel state at init; otherwise the first `AUTHENTICATE` fails with

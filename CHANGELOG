@@ -23,6 +23,15 @@
    loaded back after reboot.
 
 ### Bug fixes
+ - `WifiClient::update_networks()` no longer tears down an in-flight
+   scan or authentication when the re-applied list carries the same
+   networks in a different order, or when the current target is still
+   configured unchanged. A boot-time hand-off re-sending the saved
+   profiles (e.g. nipart's wifi plugin) can no longer kill a 4-way
+   handshake mid-flight and cost the retry backoff.
+ - The first connection-attempt failure after client start retries
+   after 2 seconds instead of the full 10-second scan-retry backoff,
+   covering the driver/firmware initialization race of an OS boot.
  - Report wrong-password authentication failures as
    `ErrorKind::WrongPassword` on `WifiClient::run()` /
    `WifiRunResult::error` instead of only entering the generic

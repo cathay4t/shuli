@@ -74,6 +74,78 @@ pub(crate) enum ResumeAction {
     IgnoreAuthBackoff,
 }
 
+/// What [`WifiIface::update_networks`] should do with a new network list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkUpdate {
+    /// The same networks arrived in a different order. Adopt the new
+    /// order but keep every bit of runtime state, including an in-flight
+    /// scan or authentication.
+    SameSet,
+    /// The list changed, but the network the client is currently working
+    /// toward is still configured with identical settings: finish the
+    /// in-flight scan/authentication, then use the new list for the next
+    /// selection.
+    KeepCurrentAttempt,
+    /// The current target is gone (or its settings changed), or no
+    /// connection attempt is in flight: reset with the new list.
+    Restart,
+}
+
+/// Whether two network lists carry the same entries regardless of their
+/// order.
+///
+/// Order is not part of a network's identity: scan-result selection is
+/// signal- and `prefered`-based, not position-based. A re-order therefore
+/// must not be mistaken for a configuration change, or an idempotent
+/// re-apply (e.g. the boot hand-off re-sending the same profiles) would
+/// tear down an in-flight association.
+fn same_network_contents(
+    current: &[NetworkConfig],
+    new: &[NetworkConfig],
+) -> bool {
+    if current.len() != new.len() {
+        return false;
+    }
+    // Match as a multiset: a list with duplicate entries must not compare
+    // equal to one with different multiplicities.
+    let mut matched = vec![false; new.len()];
+    current.iter().all(|network| {
+        let Some(index) = new
+            .iter()
+            .enumerate()
+            .position(|(index, other)| !matched[index] && other == network)
+        else {
+            return false;
+        };
+        matched[index] = true;
+        true
+    })
+}
+
+/// Decide how [`WifiIface::update_networks`] treats `new` while in
+/// `state` with `current_target` being the network the client is working
+/// toward (or is connected to).
+pub(crate) fn network_update_action(
+    current: &[NetworkConfig],
+    new: &[NetworkConfig],
+    state: WifiState,
+    current_target: &NetworkConfig,
+) -> NetworkUpdate {
+    if same_network_contents(current, new) {
+        return NetworkUpdate::SameSet;
+    }
+    // A scan or an authentication already committed to `current_target`
+    // may finish as long as that exact network is still configured.
+    // Adding/removing other networks, or changing their order, does not
+    // invalidate the attempt.
+    if matches!(state, WifiState::Scanning | WifiState::Authenticating)
+        && new.iter().any(|network| network == current_target)
+    {
+        return NetworkUpdate::KeepCurrentAttempt;
+    }
+    NetworkUpdate::Restart
+}
+
 /// Decide how to react to a system resume without touching the kernel.
 ///
 /// `kernel_associated` is `Some(true)` when the kernel still has a
@@ -172,6 +244,12 @@ pub(crate) struct ScanEngine {
     /// the first host scan is restricted to hinted frequencies. Cleared
     /// once either path has been tried.
     pub(crate) hint_scan: bool,
+    /// One-shot shortcut armed at client start: the first connection
+    /// failure retries after [`super::STARTUP_RETRY_SEC`] instead of the
+    /// full scan-retry backoff, covering the driver/firmware
+    /// initialization race of an OS boot. Cleared by the first use or by
+    /// a successful connection.
+    pub(crate) startup_fast_retry: bool,
 }
 
 /// State that lives with the current target/association: the selected
@@ -456,9 +534,130 @@ pub(crate) struct WifiIface {
 #[cfg(test)]
 mod tests {
     use super::{
-        BssidIgnoreList, ResumeAction, WifiState, bssid_ignore_timeout_secs,
-        resume_action,
+        BssidIgnoreList, NetworkUpdate, ResumeAction, WifiState,
+        bssid_ignore_timeout_secs, network_update_action, resume_action,
     };
+    use crate::NetworkConfig;
+
+    fn network(ssid: &str) -> NetworkConfig {
+        NetworkConfig::new(ssid)
+    }
+
+    #[test]
+    fn network_update_reordered_list_is_the_same_set() {
+        let a = network("A");
+        let b = network("B");
+        let current = [a.clone(), b.clone()];
+        // The list content is order-independent: a re-ordered re-apply
+        // (e.g. the daemon hand-off re-sending the saved profiles) must
+        // not be mistaken for a configuration change.
+        assert_eq!(
+            network_update_action(
+                &current,
+                &[b.clone(), a.clone()],
+                WifiState::Authenticating,
+                &a,
+            ),
+            NetworkUpdate::SameSet
+        );
+        // A different content (add/remove/change) is a real change.
+        assert_eq!(
+            network_update_action(&current, &[a.clone()], WifiState::Init, &a),
+            NetworkUpdate::Restart
+        );
+        assert_eq!(
+            network_update_action(
+                &current,
+                &[a.clone(), a.clone()],
+                WifiState::Init,
+                &a,
+            ),
+            NetworkUpdate::Restart
+        );
+    }
+
+    #[test]
+    fn network_update_keeps_in_flight_attempt_when_target_is_kept() {
+        let target = network("Home");
+        let other = network("Office");
+        let current = [target.clone(), other.clone()];
+        for state in [WifiState::Scanning, WifiState::Authenticating] {
+            assert_eq!(
+                network_update_action(
+                    &current,
+                    &[other.clone(), target.clone(), network("Cafe")],
+                    state,
+                    &target,
+                ),
+                NetworkUpdate::KeepCurrentAttempt,
+                "{state:?} must keep its in-flight attempt when another \
+                 network is added",
+            );
+            assert_eq!(
+                network_update_action(
+                    &current,
+                    &[target.clone()],
+                    state,
+                    &target,
+                ),
+                NetworkUpdate::KeepCurrentAttempt,
+                "{state:?} must keep its in-flight attempt when other \
+                 networks are dropped",
+            );
+        }
+    }
+
+    #[test]
+    fn network_update_restarts_when_target_is_gone_or_changed() {
+        let target = network("Home");
+        let mut changed_target = target.clone();
+        changed_target.set_password("new-secret");
+        let other = network("Office");
+        let current = [target.clone(), other.clone()];
+        for state in [
+            WifiState::Scanning,
+            WifiState::Authenticating,
+            WifiState::Init,
+            WifiState::Failed,
+        ] {
+            // Target SSID removed.
+            assert_eq!(
+                network_update_action(
+                    &current,
+                    &[other.clone()],
+                    state,
+                    &target,
+                ),
+                NetworkUpdate::Restart,
+                "{state:?}: dropped target must restart",
+            );
+            // Target SSID kept but with different settings (password).
+            assert_eq!(
+                network_update_action(
+                    &current,
+                    &[other.clone(), changed_target.clone()],
+                    state,
+                    &target,
+                ),
+                NetworkUpdate::Restart,
+                "{state:?}: changed target must restart",
+            );
+            // No attempt in flight: a changed list always restarts.
+            if !matches!(state, WifiState::Scanning | WifiState::Authenticating)
+            {
+                assert_eq!(
+                    network_update_action(
+                        &current,
+                        &[other.clone(), target.clone(), network("Cafe")],
+                        state,
+                        &target,
+                    ),
+                    NetworkUpdate::Restart,
+                    "{state:?}: no in-flight attempt to keep",
+                );
+            }
+        }
+    }
 
     #[test]
     fn bssid_ignore_timeout_escalates_like_wpa_supplicant() {

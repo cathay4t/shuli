@@ -47,6 +47,17 @@ type Nl80211EventReceiver =
 /// configured SSID. Doubles after each failed scan, capped at
 /// [`RETRY_BACKOFF_MAX_SEC`].
 pub(crate) const RETRY_BACKOFF_INIT_SEC: u64 = 10;
+/// One-shot retry delay (seconds) for the first connection-attempt
+/// failure after client start.
+///
+/// A freshly started client (OS boot) races the WiFi driver/firmware
+/// initialization: the first scan can complete before the 5/6 GHz band is
+/// usable, and the first authentication can be dropped while the radio is
+/// still settling. Waiting the full scan-retry backoff for that first
+/// transient failure would stall the boot connection for no reason. The
+/// shortcut is consumed once; every later failure uses the normal
+/// [`RETRY_BACKOFF_INIT_SEC`] cadence.
+const STARTUP_RETRY_SEC: u64 = 2;
 /// Cap (seconds) for the scan-retry backoff; mirrors iwd's
 /// `MaximumPeriodicScanInterval` default.
 const RETRY_BACKOFF_MAX_SEC: u64 = 300;
@@ -109,8 +120,9 @@ mod wiphy;
 
 pub use state::WifiState;
 pub(crate) use state::{
-    AuthSession, BssidIgnoreList, FastReconnect, IfaceCore, Link, ResumeAction,
-    RoamEngine, ScanEngine, WifiIface, WiphyCaps, WowlanState, resume_action,
+    AuthSession, BssidIgnoreList, FastReconnect, IfaceCore, Link,
+    NetworkUpdate, ResumeAction, RoamEngine, ScanEngine, WifiIface, WiphyCaps,
+    WowlanState, network_update_action, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]
