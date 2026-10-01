@@ -252,7 +252,7 @@ pub(crate) struct ScanEngine {
     pub(crate) startup_fast_retry: bool,
     /// First configured SSID seen in the last scan dump whose BSS was
     /// encrypted in a way shuli cannot join, with a user-facing reason
-    /// (e.g. `("空蝉", "TKIP WPA2 is not supported")`). Set by
+    /// (e.g. `("my_old_wifi", "TKIP WPA2 is not supported")`). Set by
     /// `collect_scan_candidates()`; when the scan finds no joinable
     /// candidate, `process_scan_results()` surfaces it as
     /// [`crate::ErrorKind::NoSupport`] instead of `SsidNotFound` so the
