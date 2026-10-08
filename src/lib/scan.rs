@@ -1004,7 +1004,88 @@ fn security_from_rsne(body: &[u8]) -> (SecurityType, Option<String>) {
     }
 }
 
+/// Convert a kernel scan dump (the raw `NL80211_CMD_GET_SCAN` BSS list)
+/// into `(BssInfo, raw IE buffer)` entries, one per BSS.
+pub(crate) fn scan_results_from_bss_list(
+    bss_list: &[Vec<Nl80211BssInfo>],
+) -> Vec<(BssInfo, Vec<u8>)> {
+    // A hidden AP answers directed probe requests with its SSID while its
+    // beacons carry none; remember which BSSes had a beacon SSID so the
+    // caller can tell a hidden network from a visible one.
+    let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
+    for bss in bss_list {
+        let Some(bssid) = extract_bssid(bss) else {
+            continue;
+        };
+        for info in bss {
+            if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info {
+                let ssid = extract_ssid_from_ies(ies);
+                beacon_has_ssid
+                    .insert(bssid, ssid.is_some_and(|s| !s.is_empty()));
+            }
+        }
+    }
+    let mut results = Vec::new();
+    let mut seen_bssids = HashSet::new();
+    for bss in bss_list {
+        let Some(ies) = extract_ies(bss) else {
+            continue;
+        };
+        let Some(ssid) = extract_ssid_from_ies(ies) else {
+            continue;
+        };
+        if ssid.is_empty() {
+            continue;
+        }
+        let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
+            extract_bssid(bss),
+            extract_freq(bss),
+            extract_signal_dbm(bss),
+        ) else {
+            continue;
+        };
+        let bss_security = detect_security(ies);
+        let info = BssInfo {
+            bssid,
+            freq_mhz,
+            signal_dbm,
+            security: bss_security.security,
+            ap_rsne: bss_security.ap_rsne,
+            ap_rsnxe: bss_security.ap_rsnxe,
+            group_mgmt_cipher: bss_security.group_mgmt_cipher,
+            mdie: bss_security.mdie,
+            hidden: beacon_has_ssid.get(&bssid) == Some(&false),
+            btm_support: ap_supports_btm(ies),
+            rm_neighbor_report: ap_supports_rm_neighbor_report(ies),
+        };
+        if seen_bssids.insert(bssid) {
+            results.push((info, ies.to_vec()));
+        }
+    }
+    results
+}
+
 impl WifiClient {
+    /// Dump the scan results the kernel already has for `iface_name`
+    /// without triggering a new scan - the
+    /// `iw dev <iface> scan dump` equivalent.
+    ///
+    /// The returned entries carry the same `(BssInfo, raw IE buffer)`
+    /// shape as [`WifiClient::scan()`]. Hidden networks appear only when
+    /// the kernel cache holds their SSID (e.g. from an earlier probe or
+    /// association).
+    pub async fn get_scan_result(
+        iface_name: &str,
+    ) -> Result<Vec<(BssInfo, Vec<u8>)>, WifiError> {
+        let mut nl_conn = ShuliNl80211Connection::new(iface_name).await?;
+        let bss_list = nl_conn.get_scan_results().await?;
+        log::trace!(
+            "scan dump on {iface_name} returned {} BSS entries",
+            bss_list.len()
+        );
+        Ok(scan_results_from_bss_list(&bss_list))
+    }
+
     /// Standalone scan: create a nl80211 handle, trigger a scan on the
     /// given interface, wait, and return all discovered BSSes with their
     /// raw IE buffers (for generation detection by the caller). Hidden
@@ -1069,58 +1150,7 @@ impl WifiClient {
         }
 
         let bss_list = nl_conn.get_scan_results().await?;
-        let mut beacon_has_ssid: HashMap<[u8; ETH_ALEN], bool> = HashMap::new();
-        for bss in &bss_list {
-            let Some(bssid) = extract_bssid(bss) else {
-                continue;
-            };
-            for info in bss {
-                if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info
-                {
-                    let ssid = extract_ssid_from_ies(ies);
-                    beacon_has_ssid
-                        .insert(bssid, ssid.is_some_and(|s| !s.is_empty()));
-                }
-            }
-        }
-        let mut results = Vec::new();
-        let mut seen_bssids = HashSet::new();
-        for bss in &bss_list {
-            let Some(ies) = extract_ies(bss) else {
-                continue;
-            };
-            let Some(ssid) = extract_ssid_from_ies(ies) else {
-                continue;
-            };
-            if ssid.is_empty() {
-                continue;
-            }
-            let (Some(bssid), Some(freq_mhz), Some(signal_dbm)) = (
-                extract_bssid(bss),
-                extract_freq(bss),
-                extract_signal_dbm(bss),
-            ) else {
-                continue;
-            };
-            let bss_security = detect_security(ies);
-            let info = BssInfo {
-                bssid,
-                freq_mhz,
-                signal_dbm,
-                security: bss_security.security,
-                ap_rsne: bss_security.ap_rsne,
-                ap_rsnxe: bss_security.ap_rsnxe,
-                group_mgmt_cipher: bss_security.group_mgmt_cipher,
-                mdie: bss_security.mdie,
-                hidden: beacon_has_ssid.get(&bssid) == Some(&false),
-                btm_support: ap_supports_btm(ies),
-                rm_neighbor_report: ap_supports_rm_neighbor_report(ies),
-            };
-            if seen_bssids.insert(bssid) {
-                results.push((info, ies.to_vec()));
-            }
-        }
-        Ok(results)
+        Ok(scan_results_from_bss_list(&bss_list))
     }
 }
 

@@ -10,8 +10,91 @@ use wl_nl80211::{
 
 use crate::{
     nl80211::extract_signal_dbm,
-    scan::{SecurityType, detect_security, negotiate_group_mgmt_cipher},
+    scan::{
+        SecurityType, detect_security, negotiate_group_mgmt_cipher,
+        scan_results_from_bss_list,
+    },
 };
+
+/// SSID information element (ID 0) carrying `ssid`.
+fn ssid_ie(ssid: &str) -> Vec<u8> {
+    let mut ie = vec![0x00, ssid.len() as u8];
+    ie.extend_from_slice(ssid.as_bytes());
+    ie
+}
+
+/// A kernel scan-dump BSS entry.
+fn bss_entry(
+    bssid: [u8; 6],
+    freq_mhz: u32,
+    signal_mbm: i32,
+    ies: Vec<u8>,
+) -> Vec<Nl80211BssInfo> {
+    vec![
+        Nl80211BssInfo::Bssid(bssid),
+        Nl80211BssInfo::Frequency(freq_mhz),
+        Nl80211BssInfo::SignalMbm(signal_mbm),
+        Nl80211BssInfo::RawInformationElements(ies.clone()),
+        Nl80211BssInfo::RawBeaconInformationElements(ies),
+    ]
+}
+
+#[test]
+fn test_scan_dump_bss_list_parsing() {
+    // `WifiClient::get_scan_result()` returns the parsed kernel dump
+    // entries with the signal converted to dBm.
+    let ies = ssid_ie("Home");
+    let bss = bss_entry([0x02, 0x00, 0x00, 0x00, 0x00, 0x01], 2412, -5500, ies);
+    let results = scan_results_from_bss_list(&[bss]);
+    assert_eq!(results.len(), 1);
+    let (info, raw_ies) = &results[0];
+    assert_eq!(info.bssid, [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    assert_eq!(info.freq_mhz, 2412);
+    assert_eq!(info.signal_dbm, -55);
+    assert!(!info.hidden);
+    assert_eq!(info.security, SecurityType::Open);
+    assert_eq!(raw_ies, &ssid_ie("Home"));
+}
+
+#[test]
+fn test_scan_dump_marks_hidden_bss() {
+    // The cached probe response carries the SSID while the beacon has a
+    // zero-length SSID: the entry must be flagged hidden.
+    let mut bss = bss_entry(
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+        5180,
+        -6000,
+        ssid_ie("Hidden"),
+    );
+    for info in bss.iter_mut() {
+        if let Nl80211BssInfo::RawBeaconInformationElements(ies) = info {
+            *ies = vec![0x00, 0x00];
+        }
+    }
+    let results = scan_results_from_bss_list(&[bss]);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0.hidden);
+}
+
+#[test]
+fn test_scan_dump_skips_incomplete_bss_entries() {
+    // Missing BSSID, frequency or signal: the entry is skipped instead
+    // of reported with bogus values.
+    let without_signal = vec![
+        Nl80211BssInfo::Bssid([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]),
+        Nl80211BssInfo::Frequency(2412),
+        Nl80211BssInfo::RawInformationElements(ssid_ie("NoSignal")),
+    ];
+    let without_ssid = vec![
+        Nl80211BssInfo::Bssid([0x02, 0x00, 0x00, 0x00, 0x00, 0x04]),
+        Nl80211BssInfo::Frequency(2412),
+        Nl80211BssInfo::SignalMbm(-5500),
+        Nl80211BssInfo::RawInformationElements(vec![0x00, 0x00]),
+    ];
+    assert!(
+        scan_results_from_bss_list(&[without_signal, without_ssid]).is_empty()
+    );
+}
 
 /// Build an RSNE element (ID 48 + length + body) advertising a single
 /// AKM suite 00-0F-AC:`akm`, CCMP group + pairwise ciphers.
