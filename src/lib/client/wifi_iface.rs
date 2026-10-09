@@ -729,6 +729,17 @@ impl WifiIface {
                                     &self.auth.sae_commit_auth_data.clone(),
                                 )
                                 .await;
+                                // The retransmission latches
+                                // `WifiState::Failed` when the kernel rejects
+                                // the frame, e.g. `-ENOENT` because mac80211
+                                // removed the BSS after the authentication
+                                // timeout. Retransmitting would keep failing
+                                // until the auth timeout: abort the attempt
+                                // now so the retry loop rescans and
+                                // re-discovers the BSS.
+                                if self.state != WifiState::Authenticating {
+                                    break;
+                                }
                                 continue;
                             }
                             // Some APs silently drop the H2E commit
@@ -747,6 +758,13 @@ impl WifiIface {
                                      hunting-and-pecking"
                                 );
                                 self.restart_sae_with_hnp().await;
+                                // `restart_sae_with_hnp()` fails the
+                                // attempt when generating or sending the
+                                // HnP commit fails: abort now instead of
+                                // waiting out the authentication timeout.
+                                if self.state != WifiState::Authenticating {
+                                    break;
+                                }
                                 continue;
                             }
                             if self.is_psk_4way_in_progress()
