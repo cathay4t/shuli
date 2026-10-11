@@ -23,6 +23,18 @@ where
     Ok(())
 }
 
+/// Whether the netlink error is `-EALREADY` ("Operation already in
+/// progress"), which `NL80211_CMD_AUTHENTICATE` returns while cfg80211
+/// still holds a connection state for the interface. Netlink NACK codes
+/// carry the negated errno.
+fn is_ealready(e: &Nl80211Error) -> bool {
+    matches!(
+        e,
+        Nl80211Error::NetlinkError(err)
+            if err.code == std::num::NonZeroI32::new(-114)
+    )
+}
+
 /// One nl80211 connection plus the interface/wiphy metadata shuli
 /// resolved from it.
 ///
@@ -157,12 +169,48 @@ impl ShuliNl80211Connection {
         Ok(dump.try_next().await?.is_some())
     }
 
+    /// Send a `CMD_AUTHENTICATE`, recovering from a stale kernel
+    /// association.
+    ///
+    /// cfg80211 rejects `CMD_AUTHENTICATE` with `-EALREADY` while it
+    /// still holds a connection state for the interface (e.g. a previous
+    /// daemon died without disconnecting, or a network update dropped
+    /// the current SSID without a clean `CMD_DISCONNECT`). Disconnect to
+    /// clear that state and retry once instead of letting the caller
+    /// spin in an authenticate -> `-EALREADY` retry loop.
     pub(crate) async fn authenticate(
         &mut self,
         attrs: Vec<Nl80211Attr>,
     ) -> Result<(), WifiError> {
-        drain_request(self.conn_handle.authenticate(attrs).execute().await)
-            .await
+        match self.authenticate_raw(attrs.clone()).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_ealready(&e) => {
+                log::warn!(
+                    "AUTHENTICATE rejected with -EALREADY (stale kernel \
+                     association); disconnecting and retrying"
+                );
+                if let Err(e) = self.disconnect().await {
+                    log::debug!(
+                        "disconnect before the -EALREADY retry failed: {e}"
+                    );
+                }
+                self.authenticate_raw(attrs).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Send a `CMD_AUTHENTICATE` and return the raw nl80211 error so
+    /// callers can tell `-EALREADY` (a stale kernel association) from
+    /// transient failures.
+    pub(crate) async fn authenticate_raw(
+        &mut self,
+        attrs: Vec<Nl80211Attr>,
+    ) -> Result<(), Nl80211Error> {
+        let mut stream = self.conn_handle.authenticate(attrs).execute().await;
+        while let Some(_msg) = stream.try_next().await? {}
+        Ok(())
     }
 
     pub(crate) async fn associate(
