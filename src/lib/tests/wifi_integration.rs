@@ -319,6 +319,32 @@ rrm_neighbor_report=1
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Two different SSIDs on one radio: the preferred `Test-WIFI-PSK`
+/// (primary BSS) with `Test-WIFI-OTHER` (secondary BSS) as the next
+/// best configured SSID. Neither BSS advertises managed-roaming
+/// support, so connecting does not arm a post-connect roam scan.
+const TWO_SSID_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PSK
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+
+bss=wifi_ap_2
+bssid=02:00:00:00:03:00
+ssid=Test-WIFI-OTHER
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 /// WPA2-PSK with a TKIP group cipher - the WPA/WPA2 hybrid layout many
 /// consumer routers (e.g. the Realtek RTL8671 `空蝉` AP) still ship.
 /// shuli does not implement TKIP and must report `NoSupport` with the
@@ -2325,6 +2351,164 @@ async fn wifi_client_same_bss_retry_falls_back_to_scan() {
     assert!(
         saw_scan,
         "a failed same-BSS retry must fall back to an immediate scan"
+    );
+    client.shutdown().await;
+}
+
+/// When a connection attempt fails and the target ESS has no untried
+/// BSS left, the client must not wait out the scan-retry backoff: it
+/// scans every channel immediately and connects to the next best
+/// configured SSID.
+#[tokio::test]
+async fn wifi_client_exhausted_ssid_scans_for_next_ssid_immediately() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_exhausted_ssid_scans_for_next_ssid_immediately: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(TWO_SSID_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    config.add_network("Test-WIFI-OTHER", Some("12345678"));
+    config.networks[0].set_prefered(true);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-PSK"),
+        "the preferred SSID must win the initial selection"
+    );
+    drain_pending_events(&mut client).await;
+
+    // Simulate the state right after the only BSS of the preferred SSID
+    // rejected the connection attempt: the kernel association is gone,
+    // the state machine is in Authenticating, and no untried BSS of the
+    // SSID is left.
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        // The failed attempt already cleaned up the kernel association
+        // (`retry_with_next_bss()` disconnects before authenticating);
+        // a scan while still associated is much slower than the one the
+        // failover runs.
+        iface.core.nl.disconnect().await.expect("disconnect");
+        iface.state = WifiState::Authenticating;
+        let started = std::time::Instant::now();
+        assert!(
+            !iface.retry_with_next_bss().await.expect("retry"),
+            "another BSS of the ESS does not exist; the fallback scan must \
+             start"
+        );
+        assert_eq!(
+            iface.state,
+            WifiState::Scanning,
+            "an exhausted ESS must trigger an immediate scan, not a backoff"
+        );
+        assert!(iface.scan.retry_scan);
+        assert!(!iface.scan.hint_scan, "the fallback must be a full scan");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the fallback scan must start immediately"
+        );
+    }
+
+    // Drive the scan to completion: the ignored preferred BSS must be
+    // skipped and the other configured SSID selected without waiting
+    // out the 10 s scan-retry backoff.
+    let started = std::time::Instant::now();
+    let state = run_until_connected(&mut client, 20)
+        .await
+        .expect("failover");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "the failover took {:?}; it must not wait the 10 s retry backoff",
+        started.elapsed()
+    );
+    assert_eq!(
+        client.current_ssid(TEST_NIC),
+        Some("Test-WIFI-OTHER"),
+        "the next best configured SSID must be selected"
+    );
+    client.shutdown().await;
+}
+
+/// When the immediate fallback scan finds no joinable BSS either (the
+/// only configured SSID is the one that just failed, and it is off the
+/// air), the client must resume the normal retry-backoff cadence: end
+/// in `Failed`, not surface a scan error and not hand over to the
+/// firmware scheduled scan.
+#[tokio::test]
+async fn wifi_client_exhausted_ssid_fallback_scan_keeps_retry_backoff() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_exhausted_ssid_fallback_scan_keeps_retry_backoff: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    // Every AP goes off the air.
+    hostapd_cli("DISABLE");
+
+    // Simulate the state right after the only BSS of the configured
+    // SSID rejected the connection attempt: the kernel association is
+    // gone, the state machine is in Authenticating, and no untried BSS
+    // of the SSID is left.
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        iface.core.nl.disconnect().await.expect("disconnect");
+        iface.state = WifiState::Authenticating;
+        assert!(!iface.retry_with_next_bss().await.expect("retry"));
+        assert_eq!(iface.state, WifiState::Scanning);
+        assert!(iface.scan.retry_scan);
+    }
+
+    // The fallback scan finds nothing joinable: the client must settle
+    // into `Failed` (backoff) instead of surfacing an error.
+    let step =
+        tokio::time::timeout(std::time::Duration::from_secs(30), client.run())
+            .await
+            .expect("fallback scan must finish")
+            .expect("fallback scan must not error");
+    assert_eq!(
+        step.state,
+        WifiState::Failed,
+        "a fruitless fallback scan must resume the retry backoff"
+    );
+    let iface = client.ifaces.values().next().unwrap();
+    assert!(
+        !iface.scan.retry_scan,
+        "the retry-scan flag must not leak into the next attempt"
     );
     client.shutdown().await;
 }

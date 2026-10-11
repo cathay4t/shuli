@@ -529,6 +529,16 @@ impl WifiIface {
     ) -> Result<(), WifiError> {
         self.collect_scan_candidates().await?;
 
+        // A retry scan (started after the target ESS ran out of untried
+        // BSSes, see `WifiIface::retry_with_next_bss()`) exists to find
+        // another configured SSID right away. Never select the BSSID that
+        // just failed in that case - not even after its ignore-list entry
+        // expired, which a slow scan can outlast - and never fall back to
+        // a BSSID on the ignore list: either would retry the rejecting AP
+        // with no backoff at all.
+        let retry_scan = self.scan.retry_scan;
+        let failed_bssid = self.link.bss_info.bssid;
+
         // A roam that fell back to full reconnection steers the retry
         // loop to its target BSSID. An explicitly preferred network
         // (`npt up <SSID>`) outranks every hint: while a hinted quick
@@ -595,10 +605,20 @@ impl WifiIface {
                     } else {
                         best_scan_candidate_filtered(
                             &self.roam.last_scan_candidates,
-                            |bss| !self.bssid_ignore.is_ignored(&bss.bssid),
+                            |bss| {
+                                !self.bssid_ignore.is_ignored(&bss.bssid)
+                                    && !(retry_scan
+                                        && bss.bssid == failed_bssid)
+                            },
                         )
                         .or_else(|| {
-                            best_scan_candidate(&self.roam.last_scan_candidates)
+                            if retry_scan {
+                                None
+                            } else {
+                                best_scan_candidate(
+                                    &self.roam.last_scan_candidates,
+                                )
+                            }
                         })
                     }
                 });

@@ -179,6 +179,7 @@ impl WifiIface {
             scan_ssid_cursor: 0,
             scan_wildcard_next: true,
             hint_scan: true,
+            retry_scan: false,
             startup_fast_retry: true,
             unsupported_security: None,
         };
@@ -285,11 +286,24 @@ impl WifiIface {
     }
 
     /// Record the failed BSSID and start authentication with the next
-    /// strongest untried BSS of the same SSID/security family. Returns
-    /// `Ok(true)` when another BSS was started, `Ok(false)` when every
-    /// candidate has been tried and the caller should keep the normal
-    /// retry path.
-    async fn retry_with_next_bss(&mut self) -> Result<bool, WifiError> {
+    /// strongest untried BSS of the same SSID/security family.
+    ///
+    /// Returns `Ok(true)` when another BSS of the ESS was started (the
+    /// state moved to `Authenticating`, invisible to the caller).
+    ///
+    /// When no BSS of the ESS is left, do not sit out the scan-retry
+    /// backoff: start a full scan right away so the next best configured
+    /// SSID can be picked up immediately (the previous scan may have
+    /// been restricted to hints, and the AP that just failed may have
+    /// disappeared). The state then moves to `Scanning`, which the
+    /// caller surfaces and drives like any other scan; the scan is
+    /// flagged so its result selection never falls back to a BSSID on
+    /// the ignore list. When the fallback scan cannot even start,
+    /// `Ok(false)` is returned with the state still `Failed`, so the
+    /// normal retry path applies.
+    pub(crate) async fn retry_with_next_bss(
+        &mut self,
+    ) -> Result<bool, WifiError> {
         let failed_bssid = self.link.bss_info.bssid;
         if failed_bssid == [0; ETH_ALEN] {
             return Ok(false);
@@ -327,10 +341,30 @@ impl WifiIface {
             )
         };
         let Some((bss_info, network)) = next else {
+            // Every BSS of this ESS has been tried and rejected.  Scan
+            // every channel immediately for the next best configured
+            // SSID instead of waiting out the scan-retry backoff; a
+            // fresh full scan is needed because the candidates behind
+            // the failed attempt may be stale or hint-restricted.  The
+            // scan is flagged so its result selection never falls back
+            // to a BSSID on the ignore list: that would hammer the AP
+            // that just rejected the attempt with no backoff.
             log::warn!(
-                "no untried BSS of SSID {} available; keeping retry backoff",
+                "no untried BSS of SSID {} available; scanning immediately \
+                 for another configured SSID",
                 self.link.network.ssid
             );
+            self.scan.retry_scan = true;
+            self.scan.hint_scan = false;
+            // Guarantee the wildcard probe on drivers accepting one
+            // SSID per scan, so every visible network is discovered.
+            self.scan.scan_wildcard_next = true;
+            if let Err(e) = self.send_out_scan_request().await {
+                log::warn!("immediate fallback scan failed to start: {e}");
+                self.scan.retry_scan = false;
+                return Ok(false);
+            }
+            self.state = WifiState::Scanning;
             return Ok(false);
         };
         log::info!(
@@ -480,6 +514,7 @@ impl WifiIface {
                     // disconnect during a roam scan) advanced the state
                     // machine; honor it instead of running the scan-results
                     // flow on top.
+                    self.scan.retry_scan = false;
                     return Ok(());
                 }
                 if self.roam.roam_scan {
@@ -509,6 +544,24 @@ impl WifiIface {
                     return Ok(());
                 }
                 if let Err(e) = self.process_scan_results().await {
+                    // This scan was started because a connection attempt
+                    // failed and the target ESS had no untried BSS left
+                    // (`retry_with_next_bss()`). When it cannot find any
+                    // joinable BSS either - the only visible candidate
+                    // is the BSSID on the ignore list that just failed -
+                    // resume the normal retry-backoff cadence instead of
+                    // entering scheduled scan or surfacing an error.
+                    if self.scan.retry_scan && e.kind == ErrorKind::SsidNotFound
+                    {
+                        self.scan.retry_scan = false;
+                        log::warn!(
+                            "no alternative configured SSID found; keeping \
+                             retry backoff"
+                        );
+                        self.state = WifiState::Failed;
+                        return Ok(());
+                    }
+                    self.scan.retry_scan = false;
                     // A hinted-frequency scan missed: retry once with a
                     // full scan before handing the periodic search over
                     // to PNO / host-side backoff. An unsupported-security
@@ -554,6 +607,7 @@ impl WifiIface {
                     }
                     return Err(e);
                 }
+                self.scan.retry_scan = false;
                 // SSID found - reset the scan-retry backoff.
                 self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
                 self.send_out_auth_request().await?;

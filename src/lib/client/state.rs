@@ -267,6 +267,16 @@ pub(crate) struct ScanEngine {
     /// the first host scan is restricted to hinted frequencies. Cleared
     /// once either path has been tried.
     pub(crate) hint_scan: bool,
+    /// The scan in flight is the immediate full scan started after a
+    /// connection attempt failed and the target ESS had no untried BSS
+    /// left (`WifiIface::retry_with_next_bss()`). Such a scan exists to
+    /// find the next best configured SSID right away instead of waiting
+    /// out the scan-retry backoff. `process_scan_results()` therefore
+    /// never falls back to a BSSID on the ignore list (the AP that just
+    /// rejected the attempt), since that would hammer it without any
+    /// backoff, and a scan finding nothing joinable resumes the normal
+    /// backoff instead of surfacing a scan error.
+    pub(crate) retry_scan: bool,
     /// One-shot shortcut armed at client start: the first connection
     /// failure retries after [`super::STARTUP_RETRY_SEC`] instead of the
     /// full scan-retry backoff, covering the driver/firmware
@@ -430,6 +440,7 @@ impl ScanEngine {
         self.sched_scan_interval_sec = SCHED_SCAN_INTERVAL_SEC;
         self.sched_scan_timeout_secs = SCHED_SCAN_WATCHDOG_SECS;
         self.hint_scan = true;
+        self.retry_scan = false;
         self.unsupported_security = None;
     }
 }
