@@ -15,9 +15,10 @@ use super::{
     SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
     SCHED_SCAN_WATCHDOG_SECS, STARTUP_RETRY_SEC, ScanEngine,
     ShuliNl80211Connection, WifiConfig, WifiError, WifiIface, WifiState,
-    WiphyCaps, WowlanState, best_retry_candidate, drain_request, format_ssids,
-    is_eopnotsupp, network_update_action, next_sched_scan_ssids, resume_action,
-    wiphy_sched_scan_caps, wiphy_wowlan_support,
+    WiphyCaps, WowlanState, best_retry_candidate, connection_is_live,
+    drain_request, format_ssids, is_eopnotsupp, network_update_action,
+    next_sched_scan_ssids, resume_action, wiphy_sched_scan_caps,
+    wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
 
@@ -1396,11 +1397,12 @@ impl WifiIface {
         }
 
         let old_ssid = self.link.network.ssid.clone();
-        let connected = matches!(
-            self.state,
-            WifiState::ConnectedWithoutOffloadRekey
-                | WifiState::ConnectedWithOffloadRekey
-        );
+        // A roam scan in flight does not end the association: treat it
+        // as connected so dropping the current SSID disconnects the
+        // kernel state instead of leaving a stale association that
+        // rejects the next AUTHENTICATE with -EALREADY.
+        let connected =
+            connection_is_live(self.state, self.roam.pre_roam_state);
         let connected_network_kept = connected
             && networks.iter().any(|network| network.ssid == old_ssid);
 

@@ -122,7 +122,7 @@ pub use state::WifiState;
 pub(crate) use state::{
     AuthSession, BssidIgnoreList, FastReconnect, IfaceCore, Link,
     NetworkUpdate, ResumeAction, RoamEngine, ScanEngine, WifiIface, WiphyCaps,
-    WowlanState, network_update_action, resume_action,
+    WowlanState, connection_is_live, network_update_action, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]

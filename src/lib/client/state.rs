@@ -146,6 +146,29 @@ pub(crate) fn network_update_action(
     NetworkUpdate::Restart
 }
 
+/// Whether the client still holds a live association.
+///
+/// Besides the connected states this includes a roam scan that is in
+/// flight from the connected state (`pre_roam_state`): the station is
+/// still associated while the scan runs. [`WifiIface::update_networks`]
+/// must treat that case as connected, otherwise dropping the current
+/// SSID resets the state machine without sending `CMD_DISCONNECT`, and
+/// every later `CMD_AUTHENTICATE` fails with `-EALREADY` while cfg80211
+/// keeps its connection state.
+pub(crate) fn connection_is_live(
+    state: WifiState,
+    pre_roam_state: Option<WifiState>,
+) -> bool {
+    let connected = |state: WifiState| {
+        matches!(
+            state,
+            WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        )
+    };
+    connected(state) || pre_roam_state.is_some_and(connected)
+}
+
 /// Decide how to react to a system resume without touching the kernel.
 ///
 /// `kernel_associated` is `Some(true)` when the kernel still has a
@@ -556,12 +579,32 @@ pub(crate) struct WifiIface {
 mod tests {
     use super::{
         BssidIgnoreList, NetworkUpdate, ResumeAction, WifiState,
-        bssid_ignore_timeout_secs, network_update_action, resume_action,
+        bssid_ignore_timeout_secs, connection_is_live, network_update_action,
+        resume_action,
     };
     use crate::NetworkConfig;
 
     fn network(ssid: &str) -> NetworkConfig {
         NetworkConfig::new(ssid)
+    }
+
+    #[test]
+    fn connection_is_live_covers_the_roam_scan_window() {
+        for state in [
+            WifiState::ConnectedWithoutOffloadRekey,
+            WifiState::ConnectedWithOffloadRekey,
+        ] {
+            assert!(connection_is_live(state, None));
+            // A roam scan in flight (`Scanning` + pre-roam state) keeps
+            // the association: dropping the SSID must disconnect.
+            assert!(connection_is_live(WifiState::Scanning, Some(state)));
+        }
+        assert!(!connection_is_live(WifiState::Scanning, None));
+        assert!(!connection_is_live(WifiState::Init, None));
+        assert!(!connection_is_live(
+            WifiState::Scanning,
+            Some(WifiState::Init)
+        ));
     }
 
     #[test]
@@ -583,7 +626,12 @@ mod tests {
         );
         // A different content (add/remove/change) is a real change.
         assert_eq!(
-            network_update_action(&current, &[a.clone()], WifiState::Init, &a),
+            network_update_action(
+                &current,
+                std::slice::from_ref(&a),
+                WifiState::Init,
+                &a
+            ),
             NetworkUpdate::Restart
         );
         assert_eq!(
@@ -617,7 +665,7 @@ mod tests {
             assert_eq!(
                 network_update_action(
                     &current,
-                    &[target.clone()],
+                    std::slice::from_ref(&target),
                     state,
                     &target,
                 ),
@@ -645,7 +693,7 @@ mod tests {
             assert_eq!(
                 network_update_action(
                     &current,
-                    &[other.clone()],
+                    std::slice::from_ref(&other),
                     state,
                     &target,
                 ),
