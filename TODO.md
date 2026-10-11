@@ -2,3 +2,6 @@
   capability
 - Only when `NL80211_CMD_AUTHENTICATE` is not supported, we use
   `NL80211_CMD_CONNECT` for open, WPA2-PSK, WPA2/3-Enterprise and OWE
+- BSSID pinning: let `NetworkConfig`/`NetworkConfigHints` restrict
+  a network to one BSSID (no failover to other BSSes of the same
+  SSID) so nipart can honor `WifiConfig.bssid`.

@@ -66,6 +66,12 @@ const CQM_RSSI_HYST_DBM: u32 = 5;
 /// short interval.
 pub(crate) const BACKGROUND_SCAN_SECS: u64 = 300;
 
+/// Delay (seconds) after a fresh connection before the one-shot
+/// post-connect best-BSS scan runs, so the scan does not race the DHCP
+/// exchange and the first traffic. Matches the "connect fast now,
+/// optimize slightly later" goal of the quick-start hints.
+pub(crate) const POST_CONNECT_SCAN_DELAY_SECS: u64 = 5;
+
 /// Upper bound on the known-frequency set of a quick roam scan. A few
 /// ESS channels are enough; bounding the list keeps the quick scan fast
 /// even with many configured networks.
@@ -116,6 +122,36 @@ fn ft_reassoc_uses_rsnxe(
 ) -> bool {
     matches!(security, SecurityType::FtSae | SecurityType::FtSaeExtKey)
         && (sae_password_id.is_some() || sae_pwe.starts_h2e(ap_supports_h2e))
+}
+
+/// Duration to wait in the connected state before the next housekeeping
+/// event, or `None` for an unbounded (event-driven) wait.
+///
+/// The base wait is the CQM/background-scan cadence when the AP supports
+/// managed roaming; an armed one-shot post-connect scan bounds the wait
+/// so it fires on time.
+pub(crate) fn connected_wait_duration(
+    now: std::time::Instant,
+    ap_supports_roam: bool,
+    cqm_armed: bool,
+    post_connect_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Duration> {
+    let background_wait = if ap_supports_roam {
+        Some(std::time::Duration::from_secs(if cqm_armed {
+            BACKGROUND_SCAN_SECS
+        } else {
+            crate::client::ROAM_SIGNAL_CHECK_SECS
+        }))
+    } else {
+        None
+    };
+    match post_connect_deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(now);
+            Some(background_wait.map_or(remaining, |wait| wait.min(remaining)))
+        }
+        None => background_wait,
+    }
 }
 
 impl WifiIface {
@@ -336,6 +372,55 @@ impl WifiIface {
         self.trigger_roam_scan(true).await;
     }
 
+    /// Arm the one-shot post-connect best-BSS scan.
+    ///
+    /// Called when a fresh connection is established. Only a network
+    /// with roaming enabled whose BSS advertises managed-roaming
+    /// support (802.11v BTM or 802.11k neighbor report) qualifies; the
+    /// scan then runs once per client run, shortly after the link is up.
+    pub(crate) fn arm_post_connect_scan(&mut self) {
+        if self.roam.post_connect_scan_done
+            || self.roam.post_connect_scan_at.is_some()
+        {
+            return;
+        }
+        if !self.link.network.roaming
+            || !self.link.bss_info.ap_supports_signal_roam()
+        {
+            return;
+        }
+        self.roam.post_connect_scan_at = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(POST_CONNECT_SCAN_DELAY_SECS),
+        );
+    }
+
+    /// Run the one-shot post-connect best-BSS scan.
+    ///
+    /// A full scan is used because the connect scan already covered the
+    /// hinted channels; only a strictly stronger BSS of the same ESS is
+    /// selected (`background_scan` strict comparison), and a different
+    /// configured SSID only when the current link is critical.
+    pub(crate) async fn post_connect_best_bss_scan(&mut self) {
+        self.roam.post_connect_scan_at = None;
+        self.roam.post_connect_scan_done = true;
+        if self.roam.ft_roam.is_some() || self.roam.roam_scan {
+            return;
+        }
+        self.roam.post_connect_scan = true;
+        self.roam.background_scan = true;
+        log::info!(
+            "post-connect scan: looking for a better BSS of SSID {}",
+            self.link.network.ssid
+        );
+        self.trigger_roam_scan(true).await;
+    }
+
+    /// Disarm a pending post-connect scan (link lost before it ran).
+    pub(crate) fn disarm_post_connect_scan(&mut self) {
+        self.roam.post_connect_scan_at = None;
+    }
+
     /// A `NL80211_CMD_NOTIFY_CQM` event from the kernel. On a LOW
     /// crossing (the connected AP's signal dropped below the armed roam
     /// threshold) start a roam scan, honoring the same gates as the
@@ -465,6 +550,10 @@ impl WifiIface {
     /// records the pre-scan state so a scan that decides to stay put can
     /// restore the connection.
     pub(crate) async fn trigger_roam_scan(&mut self, full: bool) {
+        // Any roam scan (signal-triggered, background or the post-connect
+        // one itself) supersedes a still-pending post-connect scan: the
+        // episode already looks for a better BSS.
+        self.roam.post_connect_scan_at = None;
         // Before the quick scan, ask the connected AP for its neighbor
         // list (802.11k) so the scan covers the channels the AP itself
         // considers part of the ESS. Bounded by a 3-second timeout; the
@@ -494,6 +583,7 @@ impl WifiIface {
             }
             let prev = self.roam.pre_roam_state.take();
             self.roam.roam_scan = false;
+            self.roam.post_connect_scan = false;
             if let Some(prev) = prev {
                 self.state = prev;
             }
@@ -833,6 +923,10 @@ impl WifiIface {
         target: BssInfo,
         target_network: NetworkConfig,
     ) {
+        // A roam already selects the best known BSS; no further
+        // post-connect scan is needed for this client run.
+        self.roam.post_connect_scan_at = None;
+        self.roam.post_connect_scan_done = true;
         // An FT roam only applies within the connected network (the FT
         // context is bound to the current SSID); a different configured
         // SSID always goes through a full reconnection.
@@ -1538,6 +1632,45 @@ impl WifiIface {
 mod tests {
     use super::*;
     use crate::config::SaePwe;
+
+    #[test]
+    fn connected_wait_is_bounded_by_the_post_connect_deadline() {
+        let now = std::time::Instant::now();
+        let delay =
+            std::time::Duration::from_secs(POST_CONNECT_SCAN_DELAY_SECS);
+
+        // A post-connect deadline sooner than the background cadence
+        // bounds the wait.
+        assert_eq!(
+            connected_wait_duration(now, true, true, Some(now + delay)),
+            Some(delay)
+        );
+        // The signal poll (no CQM) is shorter than the deadline: the
+        // poll still wins.
+        assert_eq!(
+            connected_wait_duration(
+                now,
+                true,
+                false,
+                Some(now + std::time::Duration::from_secs(60))
+            ),
+            Some(std::time::Duration::from_secs(
+                crate::client::ROAM_SIGNAL_CHECK_SECS
+            ))
+        );
+        // A deadline in the past fires immediately.
+        assert_eq!(
+            connected_wait_duration(
+                now,
+                true,
+                true,
+                Some(now - std::time::Duration::from_secs(1))
+            ),
+            Some(std::time::Duration::ZERO)
+        );
+        // No post-connect scan and no managed roaming: event-driven.
+        assert_eq!(connected_wait_duration(now, false, false, None), None);
+    }
 
     #[test]
     fn ft_reassoc_rsnxe_follows_sae_pwe_mode() {

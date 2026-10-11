@@ -245,13 +245,22 @@ impl PartialOrd for BssInfo {
     }
 }
 
-/// Union of the frequency hints configured for every network, sorted
-/// and de-duplicated. Zero is dropped because it means "unknown" in
+/// Union of the frequency hints configured for every network
+/// (`frequencies_mhz` plus every known-BSS frequency), sorted and
+/// de-duplicated. Zero is dropped because it means "unknown" in
 /// shuli's BSS bookkeeping.
 fn configured_hint_frequencies(networks: &[NetworkConfig]) -> Vec<u32> {
     let mut freqs: Vec<u32> = networks
         .iter()
-        .flat_map(|network| network.hints.frequencies_mhz.iter().copied())
+        .flat_map(|network| {
+            network.hints.frequencies_mhz.iter().copied().chain(
+                network
+                    .hints
+                    .known_bss
+                    .iter()
+                    .map(|known| known.frequency_mhz),
+            )
+        })
         .filter(|freq| *freq != 0)
         .collect();
     freqs.sort_unstable();
@@ -297,6 +306,23 @@ fn best_scan_candidate_filtered(
                 .max_by(|a, b| a.0.cmp(&b.0))
         })
         .cloned()
+}
+
+/// Best candidate among the BSSes the configured networks already know
+/// (`NetworkConfigHints::known_bss`), applying the same preferred /
+/// strongest-signal ordering as [`best_scan_candidate_filtered`].
+///
+/// Returns `None` when no scan result matches a known BSS.
+fn best_hinted_candidate_filtered(
+    candidates: &[(BssInfo, NetworkConfig)],
+    include: impl Fn(&BssInfo) -> bool,
+) -> Option<(BssInfo, NetworkConfig)> {
+    let hinted: Vec<(BssInfo, NetworkConfig)> = candidates
+        .iter()
+        .filter(|(bss, network)| network.hints.knows_bssid(&bss.bssid))
+        .cloned()
+        .collect();
+    best_scan_candidate_filtered(&hinted, include)
 }
 
 /// Best untried BSS of the same ESS after a connection attempt to
@@ -482,23 +508,47 @@ impl WifiIface {
         self.collect_scan_candidates().await?;
 
         // A roam that fell back to full reconnection steers the retry
-        // loop to its target BSSID; otherwise a preferred SSID wins when
-        // found, and only then does raw signal strength decide.
-        let hinted = self.roam.roam_target.take().and_then(|hint| {
+        // loop to its target BSSID; while a hinted quick scan runs, a
+        // BSS the client already knows from the hints wins; only then
+        // does the normal preferred / strongest-signal selection decide.
+        let hinted_roam = self.roam.roam_target.take().and_then(|hint| {
             self.roam
                 .last_scan_candidates
                 .iter()
                 .find(|(bss, _)| bss.bssid == hint)
                 .cloned()
         });
-        let best = hinted
-            .or_else(|| {
+        let hinted_known = if self.scan.hint_scan {
+            best_hinted_candidate_filtered(
+                &self.roam.last_scan_candidates,
+                |bss| !self.bssid_ignore.is_ignored(&bss.bssid),
+            )
+        } else {
+            None
+        };
+        // When the hints carry known BSSes but none is visible on the
+        // hinted channels, report "not found" so the caller retries
+        // once with a full scan (moved AP / another BSS of the ESS)
+        // instead of settling for an unknown BSS of the same SSID.
+        let known_bss_configured = self
+            .core
+            .config
+            .networks
+            .iter()
+            .any(|network| !network.hints.known_bss.is_empty());
+        let best = hinted_roam.or(hinted_known).or_else(|| {
+            if self.scan.hint_scan && known_bss_configured {
+                None
+            } else {
                 best_scan_candidate_filtered(
                     &self.roam.last_scan_candidates,
                     |bss| !self.bssid_ignore.is_ignored(&bss.bssid),
                 )
-            })
-            .or_else(|| best_scan_candidate(&self.roam.last_scan_candidates));
+                .or_else(|| {
+                    best_scan_candidate(&self.roam.last_scan_candidates)
+                })
+            }
+        });
         let Some((bss_info, network)) = best else {
             // The scan saw a configured SSID encrypted in a way shuli
             // cannot join (e.g. the AP's group cipher is TKIP): report
@@ -550,6 +600,10 @@ impl WifiIface {
     /// well-signalled BSS of a *different* configured SSID also qualifies
     /// - switching SSIDs terminates the current session.
     pub(crate) async fn process_roam_scan_results(&mut self) {
+        // The post-connect best-BSS scan is one shot; clear its flag
+        // before any early return so it cannot steer a later roam scan.
+        let post_connect = self.roam.post_connect_scan;
+        self.roam.post_connect_scan = false;
         if let Err(e) = self.collect_scan_candidates().await {
             log::warn!("roam scan failed: {e}");
             return;
@@ -577,8 +631,12 @@ impl WifiIface {
         let current_signal = match self.current_signal_dbm().await {
             Ok(Some(live)) => {
                 // The current link is healthy again - stay instead of
-                // roaming to a possibly weaker BSS.
-                if let Some(threshold) = self.roam_threshold()
+                // roaming to a possibly weaker BSS. The post-connect
+                // best-BSS scan deliberately ignores a healthy signal:
+                // it exists to move to a strictly stronger BSS even when
+                // the current one is perfectly usable.
+                if !post_connect
+                    && let Some(threshold) = self.roam_threshold()
                     && live >= threshold
                 {
                     return;
@@ -1224,10 +1282,11 @@ pub(crate) fn format_ssids(ssids: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BssInfo, MAX_SCAN_SSIDS, SecurityType, best_retry_candidate,
-        best_scan_candidate, configured_hint_frequencies, next_scan_ssids,
+        BssInfo, MAX_SCAN_SSIDS, SecurityType, best_hinted_candidate_filtered,
+        best_retry_candidate, best_scan_candidate, configured_hint_frequencies,
+        next_scan_ssids,
     };
-    use crate::NetworkConfig;
+    use crate::{KnownBss, NetworkConfig};
 
     fn ssids(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -1319,11 +1378,16 @@ mod tests {
         a.hints.frequencies_mhz = vec![5765, 5180, 0, 5765];
         let mut b = NetworkConfig::new("B");
         b.hints.frequencies_mhz = vec![2412];
-        let c = NetworkConfig::new("C");
+        // Known-BSS frequencies participate in the union even when no
+        // explicit frequency hint is set.
+        let mut c = NetworkConfig::new("C");
+        c.hints.known_bss =
+            vec![KnownBss::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x0c], 5745)];
+        let d = NetworkConfig::new("D");
 
         assert_eq!(
-            configured_hint_frequencies(&[a, b, c]),
-            vec![2412, 5180, 5765]
+            configured_hint_frequencies(&[a, b, c, d]),
+            vec![2412, 5180, 5745, 5765]
         );
     }
 
@@ -1355,6 +1419,68 @@ mod tests {
             best_scan_candidate(&candidates).expect("candidate selected");
         assert_eq!(network.ssid, "Preferred");
         assert_eq!(bss.signal_dbm, -70);
+    }
+
+    /// Like [`candidate`], with the BSSID also recorded in the
+    /// network's known-BSS hints.
+    fn known_candidate(
+        ssid: &str,
+        signal_dbm: i32,
+        bssid_last: u8,
+        prefered: bool,
+    ) -> (BssInfo, NetworkConfig) {
+        let (bss, mut network) =
+            candidate(ssid, signal_dbm, bssid_last, prefered);
+        network.hints.known_bss = vec![KnownBss::new(bss.bssid, 2412)];
+        (bss, network)
+    }
+
+    #[test]
+    fn hinted_selection_prefers_a_known_bss_over_a_stronger_unknown() {
+        let candidates = vec![
+            candidate("Home-SSID", -40, 2, false),
+            known_candidate("Home-SSID", -60, 1, false),
+        ];
+        let (bss, _) = best_hinted_candidate_filtered(&candidates, |_| true)
+            .expect("the known BSS must be selected");
+        assert_eq!(bss.bssid, [0x02, 0x00, 0x00, 0x00, 0x01, 1]);
+        assert_eq!(bss.signal_dbm, -60);
+    }
+
+    #[test]
+    fn hinted_selection_picks_the_strongest_known_bss() {
+        let candidates = vec![
+            known_candidate("Home-SSID", -70, 1, false),
+            known_candidate("Office-SSID", -50, 2, false),
+            candidate("Other-SSID", -30, 3, false),
+        ];
+        let (bss, network) =
+            best_hinted_candidate_filtered(&candidates, |_| true)
+                .expect("a known BSS must be selected");
+        assert_eq!(network.ssid, "Office-SSID");
+        assert_eq!(bss.signal_dbm, -50);
+    }
+
+    #[test]
+    fn hinted_selection_honors_prefered_within_known_bss() {
+        let candidates = vec![
+            known_candidate("Home-SSID", -50, 1, false),
+            known_candidate("Office-SSID", -70, 2, true),
+        ];
+        let (bss, network) =
+            best_hinted_candidate_filtered(&candidates, |_| true)
+                .expect("a known BSS must be selected");
+        assert_eq!(network.ssid, "Office-SSID");
+        assert_eq!(bss.signal_dbm, -70);
+    }
+
+    #[test]
+    fn hinted_selection_returns_none_without_a_visible_known_bss() {
+        let candidates = vec![candidate("Home-SSID", -40, 1, false)];
+        assert!(
+            best_hinted_candidate_filtered(&candidates, |_| true).is_none(),
+            "an unknown BSS must not be selected as a hinted candidate"
+        );
     }
 
     #[test]

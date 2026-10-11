@@ -54,6 +54,32 @@ impl SaePwe {
     }
 }
 
+/// A BSS a network has successfully connected to before.
+///
+/// Part of [`NetworkConfigHints`]: a non-empty known-BSS list makes the
+/// hinted quick scan prefer the strongest visible entry over a
+/// non-hinted BSS of the same SSID. It carries no security/credential
+/// data and does not enable the scan-free path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct KnownBss {
+    /// BSSID (MAC address) of the BSS.
+    pub bssid: [u8; 6],
+    /// Frequency (MHz) the BSS was last seen on.
+    pub frequency_mhz: u32,
+}
+
+impl KnownBss {
+    /// Create one known-BSS entry.
+    pub fn new(bssid: [u8; 6], frequency_mhz: u32) -> Self {
+        Self {
+            bssid,
+            frequency_mhz,
+        }
+    }
+}
+
 /// Optional user-provided hints that let shuli find a network faster.
 ///
 /// Hints are guesses, not hard constraints: shuli tries them first and
@@ -62,8 +88,11 @@ impl SaePwe {
 /// When every scan-free field is set (`bssid`, `frequency_mhz`,
 /// `security`, `ap_rsne`, `ap_rsnxe` and `group_mgmt_cipher`), shuli
 /// skips the scan and authenticates directly. When any of them is
-/// `None`, the set fields are used as a best-effort quick scan and the
-/// old scan flow is the fallback.
+/// `None`, the scan is restricted to `frequencies_mhz` (plus every
+/// [`KnownBss::frequency_mhz`]) and the normal scan flow is the
+/// fallback. A non-empty `known_bss` list additionally makes the
+/// selection prefer the strongest visible BSS the client already knows
+/// over a non-hinted BSS of the same SSID.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -72,6 +101,12 @@ pub struct NetworkConfigHints {
     /// The first host scan is restricted to these channels; if no
     /// configured SSID is found, shuli falls back to a full scan.
     pub frequencies_mhz: Vec<u32>,
+    /// BSSes this network has successfully connected to before (e.g.
+    /// loaded from a quick-boot hint file). The hinted quick scan
+    /// restricts the first scan to the known frequencies and connects
+    /// to the strongest visible BSS from this list. Does not enable the
+    /// scan-free path.
+    pub known_bss: Vec<KnownBss>,
     /// BSSID of the AP this hint refers to. Required for the scan-free
     /// path.
     pub bssid: Option<[u8; 6]>,
@@ -115,6 +150,17 @@ impl NetworkConfigHints {
     pub fn with_frequencies_mhz(mut self, frequencies_mhz: Vec<u32>) -> Self {
         self.frequencies_mhz = frequencies_mhz;
         self
+    }
+
+    /// Replace the known-BSS hint list.
+    pub fn with_known_bss(mut self, known_bss: Vec<KnownBss>) -> Self {
+        self.known_bss = known_bss;
+        self
+    }
+
+    /// Whether `bssid` is one of the remembered BSSes of this network.
+    pub(crate) fn knows_bssid(&self, bssid: &[u8; 6]) -> bool {
+        self.known_bss.iter().any(|known| known.bssid == *bssid)
     }
 
     /// Rebuild the BSS information required by the scan-free path.

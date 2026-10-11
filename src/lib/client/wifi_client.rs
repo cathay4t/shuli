@@ -9,7 +9,7 @@ use wl_nl80211::{Nl80211Attr, Nl80211Message, Nl80211MulticastGroup};
 
 use super::{Nl80211EventMsg, Nl80211EventSender, WifiIface};
 use crate::{
-    ETH_ALEN, ErrorKind, NetworkConfig, NetworkConfigHints,
+    ETH_ALEN, ErrorKind, KnownBss, NetworkConfig, NetworkConfigHints,
     ShuliNl80211Connection, WifiConfig, WifiError, WifiState,
 };
 
@@ -168,6 +168,11 @@ impl WifiClient {
     /// toward (or connected to), so the caller can feed them back into
     /// a future [`NetworkConfig`] to enable the scan-free path.
     ///
+    /// The current BSS is also emitted as the single `known_bss` entry,
+    /// so the caller can accumulate a known-BSS list across connections
+    /// and the hinted quick scan prefers it over a non-hinted BSS of
+    /// the same SSID.
+    ///
     /// Returns `None` when no BSS has been selected yet.
     pub fn export_hints(&self, iface_name: &str) -> Option<NetworkConfigHints> {
         let iface = self.ifaces.get(iface_name)?;
@@ -177,6 +182,7 @@ impl WifiClient {
         }
         Some(NetworkConfigHints {
             frequencies_mhz: vec![bss.freq_mhz],
+            known_bss: vec![KnownBss::new(bss.bssid, bss.freq_mhz)],
             bssid: Some(bss.bssid),
             frequency_mhz: Some(bss.freq_mhz),
             security: Some(bss.security),

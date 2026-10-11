@@ -901,6 +901,9 @@ impl WifiIface {
     /// Clean up the kernel connection state, then enter the retry path
     /// with a one-shot fast reconnect action.
     pub(crate) async fn mark_link_lost(&mut self, fast: FastReconnect) {
+        // The connection is gone: disarm a pending one-shot
+        // post-connect scan so the next connection arms a fresh one.
+        self.disarm_post_connect_scan();
         // For a socket-owned connection the kernel keeps its connection
         // state (wdev->connected) until userspace cleans up, and rejects
         // the next ASSOCIATE with -EALREADY otherwise. wpa_supplicant

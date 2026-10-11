@@ -24,7 +24,8 @@ pub use self::{
     client::{WifiClient, WifiIfaceState, WifiState},
     config::{
         DEFAULT_ROAM_THRESHOLD_DBM, DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
-        EapConfig, NetworkConfig, NetworkConfigHints, SaePwe, WifiConfig,
+        EapConfig, KnownBss, NetworkConfig, NetworkConfigHints, SaePwe,
+        WifiConfig,
     },
     error::{ErrorKind, WifiError},
     scan::{BssInfo, SecurityType},

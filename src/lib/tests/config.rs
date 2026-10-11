@@ -2,7 +2,9 @@
 
 use crate::{
     Ieee80211CipherSuite, SecurityType,
-    config::{EapConfig, NetworkConfig, NetworkConfigHints, WifiConfig},
+    config::{
+        EapConfig, KnownBss, NetworkConfig, NetworkConfigHints, WifiConfig,
+    },
 };
 
 #[test]
@@ -109,9 +111,42 @@ fn network_hints_default_to_empty_and_can_be_set() {
     assert_eq!(network.hints.frequencies_mhz, vec![5180, 5765]);
 }
 
+#[test]
+fn known_bss_hints_are_opt_in_and_do_not_enable_scan_free() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(network.hints.known_bss.is_empty());
+    assert!(
+        !network
+            .hints
+            .knows_bssid(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+    );
+
+    let bssid = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    network.set_hints(
+        NetworkConfigHints::new()
+            .with_known_bss(vec![KnownBss::new(bssid, 2412)]),
+    );
+
+    assert_eq!(network.hints.known_bss.len(), 1);
+    assert!(network.hints.knows_bssid(&bssid));
+    assert!(
+        !network
+            .hints
+            .knows_bssid(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02])
+    );
+    assert!(
+        network.hints.bss_info().is_none(),
+        "a known-BSS list alone must not enable the scan-free path"
+    );
+}
+
 fn complete_hints() -> NetworkConfigHints {
     NetworkConfigHints {
         frequencies_mhz: vec![5765],
+        known_bss: vec![KnownBss::new(
+            [0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4],
+            5765,
+        )],
         bssid: Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]),
         frequency_mhz: Some(5765),
         security: Some(SecurityType::Wpa2Psk),

@@ -370,6 +370,17 @@ pub(crate) struct RoamEngine {
     /// accepts an equal-signal peer. The background scan may also switch
     /// to a different configured SSID when the current link is critical.
     pub(crate) background_scan: bool,
+    /// When the one-shot post-connect best-BSS scan is due. Armed when a
+    /// fresh connection to a BSS that advertises managed-roaming support
+    /// (802.11v BTM / 802.11k neighbor report) is established.
+    pub(crate) post_connect_scan_at: Option<std::time::Instant>,
+    /// Whether the roam scan currently being processed is the
+    /// post-connect best-BSS scan: a healthy live signal must not cancel
+    /// it (only a strictly stronger BSS of the same ESS is selected).
+    pub(crate) post_connect_scan: bool,
+    /// Whether the one-shot post-connect scan already ran for this
+    /// client run, so a later reconnect does not scan again.
+    pub(crate) post_connect_scan_done: bool,
     /// Number of roam scans whose candidate dump was collected. Used by
     /// the integration tests to observe scans that `run()` now keeps
     /// internal (no `Scanning` state is surfaced when the scan stays).

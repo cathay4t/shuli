@@ -11,13 +11,12 @@ use super::{
     Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
     Nl80211SchedScanPlanAttr, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
     PmksaCache, RETRY_AUTH_SEC, RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC,
-    ROAM_SIGNAL_CHECK_SECS, ResumeAction, RoamEngine,
-    SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX, SCHED_SCAN_INTERVAL_SEC,
-    SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS, SCHED_SCAN_WATCHDOG_SECS,
-    STARTUP_RETRY_SEC, ScanEngine, ShuliNl80211Connection, WifiConfig,
-    WifiError, WifiIface, WifiState, WiphyCaps, WowlanState,
-    best_retry_candidate, drain_request, format_ssids, is_eopnotsupp,
-    network_update_action, next_sched_scan_ssids, resume_action,
+    ResumeAction, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
+    SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
+    SCHED_SCAN_WATCHDOG_SECS, STARTUP_RETRY_SEC, ScanEngine,
+    ShuliNl80211Connection, WifiConfig, WifiError, WifiIface, WifiState,
+    WiphyCaps, WowlanState, best_retry_candidate, drain_request, format_ssids,
+    is_eopnotsupp, network_update_action, next_sched_scan_ssids, resume_action,
     wiphy_sched_scan_caps, wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
@@ -264,6 +263,10 @@ impl WifiIface {
                     // use the normal retry backoff.
                     self.bssid_ignore.clear();
                     self.scan.startup_fast_retry = false;
+                    // Connect fast first, optimize slightly later: when
+                    // the BSS supports managed roaming, arm the one-shot
+                    // best-BSS scan.
+                    self.arm_post_connect_scan();
                 }
                 if prev_state == WifiState::Authenticating
                     && self.state == WifiState::Failed
@@ -827,20 +830,19 @@ impl WifiIface {
                 if !self.roam.cqm_armed && ap_roams {
                     self.roam.cqm_armed = self.arm_cqm().await;
                 }
-                let wait_secs = if ap_roams {
-                    if self.roam.cqm_armed {
-                        crate::roam::BACKGROUND_SCAN_SECS
-                    } else {
-                        ROAM_SIGNAL_CHECK_SECS
-                    }
-                } else {
-                    0
-                };
+                // The armed one-shot post-connect best-BSS scan bounds
+                // the wait so it fires shortly after the link is up.
+                let wait = crate::roam::connected_wait_duration(
+                    std::time::Instant::now(),
+                    ap_roams,
+                    self.roam.cqm_armed,
+                    self.roam.post_connect_scan_at,
+                );
                 let mut resumed = false;
-                let next = if wait_secs > 0 {
+                let next = if let Some(wait) = wait {
                     tokio::select! {
                         result = tokio::time::timeout(
-                            std::time::Duration::from_secs(wait_secs),
+                            wait,
                             self.core.event_receiver.next(),
                         ) => result,
                         changed = self.resume_rx.changed() => {
@@ -881,10 +883,20 @@ impl WifiIface {
                             "event channel closed",
                         ));
                     }
-                    // Roam engine tick: the low-frequency background scan
-                    // (CQM armed) or, without CQM support, the signal poll.
+                    // Roam engine tick: the one-shot post-connect
+                    // best-BSS scan when its deadline is reached, else
+                    // the low-frequency background scan (CQM armed) or,
+                    // without CQM support, the signal poll.
                     Err(_) => {
-                        if self.roam.cqm_armed {
+                        let post_connect_due = self
+                            .roam
+                            .post_connect_scan_at
+                            .is_some_and(|deadline| {
+                                std::time::Instant::now() >= deadline
+                            });
+                        if post_connect_due {
+                            self.post_connect_best_bss_scan().await;
+                        } else if self.roam.cqm_armed {
                             self.check_background_roam().await;
                         } else {
                             self.check_roam_conditions().await;
