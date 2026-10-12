@@ -191,7 +191,7 @@ lacking of user request:
 
 ## Contact
 
- * Crate github issue
+ * Create github issue
  * Use Matrix room: [`#rust-netlink:fedora.im`][matrix_room_url]
 
 ## License
