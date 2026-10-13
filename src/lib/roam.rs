@@ -851,7 +851,8 @@ impl WifiIface {
 
     /// Choose a roam target from a BTM candidate list: candidates are in
     /// preference order; each must match the last scan results and the
-    /// network's security family, and differ from the current BSS.
+    /// network's security family, differ from the current BSS, and
+    /// satisfy the network's BSSID pin.
     fn pick_btm_target(
         &mut self,
         btm: &Ieee80211BtmRequest,
@@ -860,11 +861,11 @@ impl WifiIface {
             if candidate.bssid == self.link.bss_info.bssid {
                 continue;
             }
-            let Some((bss, _)) = self
-                .roam
-                .last_scan_candidates
-                .iter()
-                .find(|(b, _)| b.bssid == candidate.bssid)
+            let Some((bss, _)) =
+                self.roam.last_scan_candidates.iter().find(|(b, network)| {
+                    b.bssid == candidate.bssid
+                        && network.matches_bssid(&b.bssid)
+                })
             else {
                 log::debug!(
                     "BTM candidate {:02x?} not in scan results",

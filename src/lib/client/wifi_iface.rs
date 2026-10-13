@@ -24,10 +24,11 @@ use crate::{BssInfo, ETH_ALEN};
 
 impl WifiIface {
     /// Pick the first configured network whose hints are complete
-    /// enough for a scan-free connection attempt.
+    /// enough for a scan-free connection attempt (and, when the network
+    /// is pinned to a BSSID, describe that pinned BSS).
     fn scan_free_target(&self) -> Option<(NetworkConfig, BssInfo)> {
         self.core.config.networks.iter().find_map(|network| {
-            let bss_info = network.hints.bss_info()?;
+            let bss_info = network.scan_free_bss_info()?;
             Some((network.clone(), bss_info))
         })
     }
@@ -1392,8 +1393,10 @@ impl WifiIface {
     ///   scan for the new SSIDs.
     /// * If the list changes while not connected, the same reset makes the next
     ///   `run()` probe the new SSIDs immediately.
-    /// * If the connected network is still in the new list, the connection is
-    ///   kept; only the scan/match list changes.
+    /// * If the connected network is still in the new list and still allows the
+    ///   connected BSSID (a pinned network only allows its pinned BSSID), the
+    ///   connection is kept; only the scan/match list changes. Otherwise the
+    ///   client disconnects and reselects.
     pub async fn update_networks(
         &mut self,
         networks: Vec<NetworkConfig>,
@@ -1458,7 +1461,10 @@ impl WifiIface {
         let connected =
             connection_is_live(self.state, self.roam.pre_roam_state);
         let connected_network_kept = connected
-            && networks.iter().any(|network| network.ssid == old_ssid);
+            && networks.iter().any(|network| {
+                network.ssid == old_ssid
+                    && network.matches_bssid(&self.link.bss_info.bssid)
+            });
 
         if connected && connected_network_kept {
             self.core.config.networks = networks;

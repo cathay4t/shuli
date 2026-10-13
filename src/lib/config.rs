@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use wl_nl80211::Ieee80211CipherSuite;
+use wl_nl80211::{ETH_ALEN, Ieee80211CipherSuite};
 
 use crate::scan::{BssInfo, MdieInfo, SecurityType};
 
@@ -275,6 +275,13 @@ pub struct WifiConfig {
 pub struct NetworkConfig {
     pub ssid: String,
     pub password: Option<String>,
+    /// When set, the network is pinned to this BSSID: only that BSS
+    /// may be selected, the failed-BSS retry path never fails over to
+    /// another BSS of the SSID, and roaming (802.11v BTM, scan based)
+    /// never targets one. `None` (the default) accepts any BSS of
+    /// `ssid`. Unlike [`NetworkConfigHints::bssid`], which is only a
+    /// speed-up hint, this is a hard constraint.
+    pub bssid: Option<[u8; ETH_ALEN]>,
     /// Optional hints that speed up the initial connection attempt.
     /// Complete hints enable a scan-free connect; partial hints (e.g.
     /// frequencies) enable a best-effort quick scan with the normal
@@ -343,6 +350,7 @@ impl NetworkConfig {
         Self {
             ssid: ssid.to_string(),
             password: None,
+            bssid: None,
             hints: NetworkConfigHints::default(),
             prefered: false,
             roaming: true,
@@ -360,6 +368,16 @@ impl NetworkConfig {
 
     pub fn set_password(&mut self, password: &str) -> &mut Self {
         self.password = Some(password.to_string());
+        self
+    }
+
+    /// Pin the network to `bssid`, or remove the pin with `None`.
+    ///
+    /// A pinned network only ever connects to the given BSS, never
+    /// fails over to another BSS of the same SSID and never roams to
+    /// one. `None` (the default) accepts any BSS of the SSID.
+    pub fn set_bssid(&mut self, bssid: Option<[u8; ETH_ALEN]>) -> &mut Self {
+        self.bssid = bssid;
         self
     }
 
@@ -418,6 +436,23 @@ impl NetworkConfig {
     pub fn set_ext_key_id(&mut self, enabled: bool) -> &mut Self {
         self.ext_key_id = enabled;
         self
+    }
+
+    /// Whether a BSS with `bssid` is eligible for this network. A
+    /// pinned network only accepts its pinned BSSID; an unpinned one
+    /// accepts every BSS of its SSID.
+    pub(crate) fn matches_bssid(&self, bssid: &[u8; ETH_ALEN]) -> bool {
+        self.bssid.is_none_or(|pin| pin == *bssid)
+    }
+
+    /// Rebuild the BSS information for the scan-free path, rejecting
+    /// hints that describe another BSS than the pinned one. Returns
+    /// `None` when any scan-free property is missing, unsupported, or
+    /// conflicts with the pin; the caller then falls back to a normal
+    /// scan.
+    pub(crate) fn scan_free_bss_info(&self) -> Option<BssInfo> {
+        let bss = self.hints.bss_info()?;
+        self.matches_bssid(&bss.bssid).then_some(bss)
     }
 
     /// Whether a cross-SSID roam may land on a BSS advertising

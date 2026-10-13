@@ -98,6 +98,54 @@ fn prefered_defaults_to_false_and_can_be_set() {
 }
 
 #[test]
+fn bssid_pin_defaults_to_none_and_can_be_set() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    assert!(network.bssid.is_none(), "the BSSID pin must be opt-in");
+
+    let bssid = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    network.set_bssid(Some(bssid));
+    assert_eq!(network.bssid, Some(bssid));
+
+    network.set_bssid(None);
+    assert!(network.bssid.is_none());
+}
+
+#[test]
+fn bssid_pin_only_matches_the_pinned_bssid() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    let pinned = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let other = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+    // Without a pin every BSS of the SSID is eligible.
+    assert!(network.matches_bssid(&pinned));
+    assert!(network.matches_bssid(&other));
+
+    network.set_bssid(Some(pinned));
+    assert!(network.matches_bssid(&pinned));
+    assert!(
+        !network.matches_bssid(&other),
+        "a pinned network must reject its SSID's other BSSes"
+    );
+}
+
+#[test]
+fn scan_free_hints_respect_the_bssid_pin() {
+    let mut network = NetworkConfig::new("Home-WIFI");
+    network.set_hints(complete_hints());
+    assert!(network.scan_free_bss_info().is_some());
+
+    // Pinned to the BSS the hints describe: the scan-free path stays
+    // usable.
+    network.set_bssid(Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe4]));
+    assert!(network.scan_free_bss_info().is_some());
+
+    // Pinned to another BSS: the hints must not short-circuit the scan
+    // to an AP the user did not pin.
+    network.set_bssid(Some([0x52, 0xc3, 0xa2, 0x3a, 0x61, 0xe5]));
+    assert!(network.scan_free_bss_info().is_none());
+}
+
+#[test]
 fn network_hints_default_to_empty_and_can_be_set() {
     let mut network = NetworkConfig::new("Home-WIFI");
     assert!(

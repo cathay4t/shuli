@@ -446,6 +446,7 @@ mod tests {
         config::WifiEntry {
             ssid: ssid.to_string(),
             password: None,
+            bssid: None,
             hidden: false,
             prefered: false,
             roaming: true,

@@ -19,6 +19,8 @@ wifis:
   # key, Test-WIFI-OPEN spells it out.
   - ssid: Test-WIFI
     password: "12345678"
+    # bssid: 02:00:00:00:00:11 # pin to one AP (no failover to other
+    #                          # BSSes of the same SSID)
     # sae_password_id: corp-id # optional SAE password identifier (H2E-only)
     # ocv: true # operating channel validation
     # ext_key_id: true # extended key id (driver must support it)

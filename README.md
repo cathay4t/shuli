@@ -46,6 +46,8 @@ wifis:
       auto: true
   - ssid: Test-WIFI
     password: "12345678"
+    # bssid: 02:00:00:00:00:11 # pin to one AP (no failover to other
+    #                          # BSSes of the same SSID)
     # hidden: true # AP hides its SSID; probe for it by name
     # prefered: true # pick this SSID before stronger BSSes of other
     #                # configured SSIDs while it is found

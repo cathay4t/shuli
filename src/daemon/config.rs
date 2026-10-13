@@ -58,6 +58,12 @@ pub(crate) struct WifiEntry {
     pub ssid: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// BSSID (AP MAC address) this network is pinned to. When set, the
+    /// client only connects to that AP: it never fails over to another
+    /// BSS of the same SSID and never roams to one. Absent (the
+    /// default) allows any BSS of the SSID.
+    #[serde(default, deserialize_with = "deserialize_bssid")]
+    pub bssid: Option<[u8; 6]>,
     /// Hidden SSID: probe for this network with an SSID-specific probe
     /// request (wpa_supplicant's `scan_ssid=1`). Visible networks
     /// (default) are found by the wildcard probe every scan carries.
@@ -217,6 +223,7 @@ impl ShuliConfig {
             if let Some(password) = entry.password.as_deref() {
                 network.set_password(password);
             }
+            network.bssid = entry.bssid;
             network.hidden = entry.hidden;
             network.prefered = entry.prefered;
             network.roaming = entry.roaming;
@@ -247,6 +254,43 @@ fn default_roam_threshold() -> i32 {
 
 fn default_roam_critical_threshold() -> i32 {
     shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
+}
+
+/// Deserialize an optional colon-separated MAC address
+/// (`aa:bb:cc:dd:ee:ff`), rejecting malformed values at config-load time.
+fn deserialize_bssid<'de, D>(
+    deserializer: D,
+) -> Result<Option<[u8; 6]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| parse_mac(&value).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+/// Parse a colon-separated MAC address into its six octets. Each octet
+/// must be exactly two hex digits so a truncated value (e.g.
+/// `aa:bb:cc:dd:ee:0`) cannot accidentally match.
+fn parse_mac(value: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() != 6 {
+        return Err(format!(
+            "invalid BSSID {value:?}: expected six colon-separated octets"
+        ));
+    }
+    let mut mac = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        if part.len() != 2 {
+            return Err(format!(
+                "invalid BSSID octet {part:?} in {value:?}: expected exactly \
+                 two hex digits"
+            ));
+        }
+        mac[index] = u8::from_str_radix(part, 16)
+            .map_err(|e| format!("invalid BSSID octet {part:?}: {e}"))?;
+    }
+    Ok(mac)
 }
 
 #[cfg(test)]
@@ -391,6 +435,55 @@ wifis:
         );
         let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
         assert!(wifi.networks[0].prefered);
+    }
+
+    #[test]
+    fn bssid_pin_parses_and_maps_to_network() {
+        let config = parse(
+            "\
+---
+version: 1
+wifis:
+  - ssid: Home
+    bssid: 02:00:00:00:00:01
+",
+        );
+        assert_eq!(
+            config.wifis[0].bssid,
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+        );
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert_eq!(
+            wifi.networks[0].bssid,
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn absent_bssid_means_no_pin() {
+        let config = parse(MINIMAL_YAML);
+        assert_eq!(config.wifis[0].bssid, None);
+        let wifi = ShuliConfig::wifi_config_for_entries("wlan0", &config.wifis);
+        assert_eq!(wifi.networks[0].bssid, None);
+    }
+
+    #[test]
+    fn malformed_bssid_is_rejected() {
+        for bad in [
+            "not-a-mac",
+            "02:00:00:00:00",
+            "02:00:00:00:00:0",
+            "02:00:00:00:00:0g",
+            "02:00:00:00:00:00:01",
+        ] {
+            let yaml = format!(
+                "---\nversion: 1\nwifis:\n  - ssid: Home\n    bssid: {bad}\n"
+            );
+            assert!(
+                rmsd_yaml::from_str::<ShuliConfig>(&yaml).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -286,7 +286,8 @@ fn best_scan_candidate(
 /// [`best_scan_candidate`] with an `include` predicate applied before the
 /// strongest-BSS ordering. Used to skip BSSIDs on the temporary ignore
 /// list (wpa_supplicant's `bssid_ignore` ordering rule) while keeping the
-/// preferred-SSID logic intact.
+/// preferred-SSID logic intact. A network pinned to a BSSID only ever
+/// matches that BSS, whatever the predicate says.
 fn best_scan_candidate_filtered(
     candidates: &[(BssInfo, NetworkConfig)],
     include: impl Fn(&BssInfo) -> bool,
@@ -295,6 +296,7 @@ fn best_scan_candidate_filtered(
         .iter()
         .filter(|(bss, network)| {
             include(bss)
+                && network.matches_bssid(&bss.bssid)
                 && network.prefered
                 && bss.signal_dbm >= DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
         })
@@ -302,7 +304,9 @@ fn best_scan_candidate_filtered(
         .or_else(|| {
             candidates
                 .iter()
-                .filter(|(bss, _)| include(bss))
+                .filter(|(bss, network)| {
+                    include(bss) && network.matches_bssid(&bss.bssid)
+                })
                 .max_by(|a, b| a.0.cmp(&b.0))
         })
         .cloned()
@@ -349,9 +353,10 @@ fn best_prefered_candidate_filtered(
 
 /// Best untried BSS of the same ESS after a connection attempt to
 /// `failed_bssid` failed. Only BSSes carrying the same SSID and the same
-/// security family as the failed attempt qualify, and ignored BSSIDs are
+/// security family as the failed attempt qualify, ignored BSSIDs are
 /// skipped so every other AP is tried before one that just rejected us
-/// (wpa_supplicant's fast-associate behavior).
+/// (wpa_supplicant's fast-associate behavior), and a network pinned to a
+/// BSSID never falls over to another BSS of the SSID.
 pub(crate) fn best_retry_candidate(
     candidates: &[(BssInfo, NetworkConfig)],
     failed_bssid: [u8; ETH_ALEN],
@@ -364,6 +369,7 @@ pub(crate) fn best_retry_candidate(
         .filter(|(bss, network)| {
             bss.bssid != failed_bssid
                 && network.ssid == ssid
+                && network.matches_bssid(&bss.bssid)
                 && bss.security.base() == security_base
                 && !is_ignored(&bss.bssid)
         })
@@ -553,7 +559,9 @@ impl WifiIface {
             self.roam
                 .last_scan_candidates
                 .iter()
-                .find(|(bss, _)| bss.bssid == hint)
+                .find(|(bss, network)| {
+                    bss.bssid == hint && network.matches_bssid(&bss.bssid)
+                })
                 .cloned()
         });
         let prefered_configured = self
@@ -734,6 +742,7 @@ impl WifiIface {
             .filter(|(bss, network)| {
                 bss.bssid != self.link.bss_info.bssid
                     && network.ssid == current_ssid
+                    && network.matches_bssid(&bss.bssid)
                     && bss.security.base() == current_base
                     && if strict {
                         bss.signal_dbm > current_signal
@@ -761,6 +770,7 @@ impl WifiIface {
                 .filter(|(bss, network)| {
                     bss.bssid != self.link.bss_info.bssid
                         && network.ssid != current_ssid
+                        && network.matches_bssid(&bss.bssid)
                         && bss.signal_dbm >= good_signal
                         && network.can_roam_to_security(bss.security)
                 })
@@ -1671,6 +1681,52 @@ mod tests {
     #[test]
     fn best_scan_candidate_returns_none_for_empty_results() {
         assert!(best_scan_candidate(&[]).is_none());
+    }
+
+    #[test]
+    fn pinned_network_selects_only_the_pinned_bss() {
+        let (strong, _) = candidate("Home-SSID", -40, 2, false);
+        let (weak, mut network) = candidate("Home-SSID", -60, 1, false);
+        let pinned_bssid = weak.bssid;
+        network.set_bssid(Some(pinned_bssid));
+        let candidates =
+            vec![(strong.clone(), network.clone()), (weak, network.clone())];
+
+        // The pinned (weaker) BSS wins over the stronger one of the
+        // same network even when `prefered` would not.
+        let (bss, _) = best_scan_candidate(&candidates)
+            .expect("the pinned BSS must be selected");
+        assert_eq!(bss.bssid, pinned_bssid);
+        assert_eq!(bss.signal_dbm, -60);
+
+        // Pinned to a BSS missing from the scan: the network
+        // contributes no candidate at all, however strong the visible
+        // BSS of the same SSID is.
+        let mut missing = NetworkConfig::new("Home-SSID");
+        missing.set_bssid(Some([0x02, 0x00, 0x00, 0x00, 0x01, 9]));
+        let candidates = vec![(strong, missing)];
+        assert!(best_scan_candidate(&candidates).is_none());
+    }
+
+    #[test]
+    fn pinned_network_never_fails_over_to_another_bss() {
+        let (failed, mut network) = candidate("Home-SSID", -40, 1, false);
+        let failed_bssid = failed.bssid;
+        network.set_bssid(Some(failed_bssid));
+        let (other, _) = candidate("Home-SSID", -50, 2, false);
+        let candidates = vec![(failed, network.clone()), (other, network)];
+
+        assert!(
+            best_retry_candidate(
+                &candidates,
+                failed_bssid,
+                "Home-SSID",
+                SecurityType::Open,
+                |_| false,
+            )
+            .is_none(),
+            "a pinned network must not fail over to another BSS of the SSID"
+        );
     }
 
     #[test]

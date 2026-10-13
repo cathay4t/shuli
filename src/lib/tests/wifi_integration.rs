@@ -345,6 +345,33 @@ wpa_passphrase=12345678
 ctrl_interface=/var/run/hostapd
 ";
 
+/// Two BSSes of the *same* SSID on one radio, same channel and
+/// security, with different BSSIDs. The strongest-signal / BSSID
+/// tie-break ordering would pick the secondary (`...:03:02`); the
+/// primary (`...:01:00`, the radio's MAC) only wins when a BSSID pin
+/// forces it.
+const SAME_SSID_TWO_BSS_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-PSK
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+
+bss=wifi_ap_2
+bssid=02:00:00:00:03:02
+ssid=Test-WIFI-PSK
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=12345678
+ctrl_interface=/var/run/hostapd
+";
+
 /// WPA2-PSK with a TKIP group cipher - the WPA/WPA2 hybrid layout many
 /// consumer routers (e.g. the Realtek RTL8671 `空蝉` AP) still ship.
 /// shuli does not implement TKIP and must report `NoSupport` with the
@@ -2443,6 +2470,85 @@ async fn wifi_client_exhausted_ssid_scans_for_next_ssid_immediately() {
         client.current_ssid(TEST_NIC),
         Some("Test-WIFI-OTHER"),
         "the next best configured SSID must be selected"
+    );
+    client.shutdown().await;
+}
+
+/// `NetworkConfig::set_bssid` pins the network to one AP: with two
+/// BSSes of the same SSID on air, the client must connect to the pinned
+/// one even though the strongest-signal / BSSID ordering would pick the
+/// other.
+#[tokio::test]
+async fn wifi_client_bssid_pin_connects_to_the_pinned_bss() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_bssid_pin_connects_to_the_pinned_bss: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAME_SSID_TWO_BSS_HOSTAPD_CONF);
+
+    let pinned_bssid = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    config.networks[0].set_bssid(Some(pinned_bssid));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    assert_eq!(
+        client.current_bssid(TEST_NIC),
+        Some(pinned_bssid),
+        "the client must connect to the pinned BSS, not the other BSS of the \
+         same SSID"
+    );
+    client.shutdown().await;
+}
+
+/// A BSSID pin is a hard constraint: when the pinned BSS is not on air,
+/// the client must not fall back to another BSS of the same SSID, even
+/// though both are visible and joinable.
+#[tokio::test]
+async fn wifi_client_bssid_pin_does_not_fail_over_to_another_bss() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_bssid_pin_does_not_fail_over_to_another_\
+             bss: test binary not running as root (`.cargo/config.toml` runs \
+             tests via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAME_SSID_TWO_BSS_HOSTAPD_CONF);
+
+    let absent_bssid = [0x02, 0x00, 0x00, 0x00, 0x03, 0x99];
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    config.networks[0].set_bssid(Some(absent_bssid));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    run_until_scan_started(&mut client, 3).await;
+
+    // Run the scan-result selection directly: both BSSes of the SSID
+    // are visible, but neither matches the pin, so no candidate may be
+    // selected - the connection attempt fails instead of failing over.
+    let iface = client.ifaces.get_mut(TEST_NIC).expect("iface");
+    iface.wait_scan_finish().await;
+    let err = iface
+        .process_scan_results()
+        .await
+        .expect_err("no BSS matches the pinned BSSID");
+    assert_eq!(err.kind, ErrorKind::SsidNotFound, "unexpected error: {err}");
+    assert_eq!(
+        iface.link.bss_info.bssid, [0x00; 6],
+        "no BSS may have been selected for a pinned network"
     );
     client.shutdown().await;
 }
