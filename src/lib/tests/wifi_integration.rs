@@ -4,7 +4,8 @@
 //! mac80211_hwsim radios + hostapd.
 //!
 //! These tests are fully self-contained: [`WifiTestEnv::setup`] provisions
-//! the virtual radios (`modprobe mac80211_hwsim radios=2`), moves one radio
+//! the virtual radios (`modprobe mac80211_hwsim radios=2`, or 3 via
+//! `setup_with_radios`), moves one radio
 //! into a dedicated network namespace, starts `hostapd` there, and [`Drop`]
 //! tears everything down again afterwards (hostapd, netns, module). No
 //! manual environment preparation is needed.
@@ -61,6 +62,10 @@ const HWSIM0_PERM_MAC: &str = "02:00:00:00:00:00";
 const HWSIM1_PERM_MAC: &str = "02:00:00:00:01:00";
 const HWSIM2_PERM_MAC: &str = "02:00:00:00:02:00";
 const TEST_NIC: &str = "test-wlan0";
+/// Third hwsim radio, left in the default netns by
+/// [`WifiTestEnv::setup_with_radios`] for the dynamic
+/// [`WifiClient::add_iface`] test.
+const TEST_NIC2: &str = "test-wlan1";
 const AP_NIC: &str = "wifi_ap";
 const AP_NIC2: &str = "wifi_ap2";
 const TEST_NS: &str = "shuli_test";
@@ -69,6 +74,10 @@ const AP_IP2: &str = "192.0.2.2";
 
 struct WifiTestEnv {
     hostapd_pid: Option<String>,
+    /// Extra hwsim interfaces in the default netns (the radios beyond
+    /// the STA/AP pair). `Drop` deletes them so `modprobe -r` can
+    /// unload the module.
+    extra_nics: Vec<String>,
 }
 
 impl WifiTestEnv {
@@ -78,7 +87,15 @@ impl WifiTestEnv {
     /// [`provision`](Self::provision) + [`start_hostapd`](Self::start_hostapd)
     /// instead.
     fn setup(hostapd_conf: &str) -> Self {
-        let mut env = Self::provision();
+        Self::setup_with_radios(hostapd_conf, 2)
+    }
+
+    /// Like [`setup`](Self::setup), but provisions `radios` hwsim radios
+    /// (currently up to 3). The third radio is named `TEST_NIC2` and
+    /// stays in the default netns, so a test can hand a second wifi-phy
+    /// to a running client.
+    fn setup_with_radios(hostapd_conf: &str, radios: u32) -> Self {
+        let mut env = Self::provision_with_radios(radios);
         env.start_hostapd(hostapd_conf);
         env
     }
@@ -87,12 +104,20 @@ impl WifiTestEnv {
     /// so the client's background scan can be observed while no AP is on
     /// air. Start the AP later with [`start_hostapd`](Self::start_hostapd).
     fn provision() -> Self {
+        Self::provision_with_radios(2)
+    }
+
+    fn provision_with_radios(radios: u32) -> Self {
+        assert!(
+            (2..=3).contains(&radios),
+            "WifiTestEnv supports 2 or 3 hwsim radios, got {radios}"
+        );
         // Pre-clean leftovers from a previous crashed run.
         sh_allow_fail("modprobe -r mac80211_hwsim");
         sh_allow_fail(&format!("ip netns del {TEST_NS}"));
 
         sh_ok(&format!("ip netns add {TEST_NS}"));
-        sh_ok("modprobe mac80211_hwsim radios=2");
+        sh_ok(&format!("modprobe mac80211_hwsim radios={radios}"));
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         let nic0 = find_nic_by_mac(HWSIM0_PERM_MAC).expect("hwsim NIC 0");
@@ -103,6 +128,14 @@ impl WifiTestEnv {
         if nic1 != AP_NIC {
             sh_ok(&format!("ip link set {nic1} name {AP_NIC}"));
         }
+        let mut extra_nics = Vec::new();
+        if radios >= 3 {
+            let nic2 = find_nic_by_mac(HWSIM2_PERM_MAC).expect("hwsim NIC 2");
+            if nic2 != TEST_NIC2 {
+                sh_ok(&format!("ip link set {nic2} name {TEST_NIC2}"));
+            }
+            extra_nics.push(TEST_NIC2.to_string());
+        }
 
         let phy = get_phy_id(AP_NIC);
         sh_ok(&format!("iw phy#{phy} set netns name {TEST_NS}"));
@@ -112,7 +145,10 @@ impl WifiTestEnv {
             "ip netns exec {TEST_NS} ip addr add {AP_IP}/24 dev {AP_NIC}"
         ));
 
-        Self { hostapd_pid: None }
+        Self {
+            hostapd_pid: None,
+            extra_nics,
+        }
     }
 
     /// Start hostapd with `hostapd_conf` in the test netns. Idempotent
@@ -146,6 +182,9 @@ impl Drop for WifiTestEnv {
         // The STA radio stays in the default netns and would pin the module
         // (rmmod fails with "resource busy" while it exists), so remove it
         // before unloading.
+        for nic in &self.extra_nics {
+            sh_allow_fail(&format!("ip link del {nic}"));
+        }
         sh_allow_fail(&format!("ip link del {TEST_NIC}"));
         sh_allow_fail("modprobe -r mac80211_hwsim");
         let _ = std::fs::remove_file("/tmp/shuli_rs_test_hostapd.conf");
@@ -1611,6 +1650,107 @@ async fn wifi_client_wpa2_psk_connect() {
         ponged,
         "ICMP echo through the WPA2-PSK data path never succeeded:\n{last_err}"
     );
+    client.shutdown().await;
+}
+
+/// Adding a wifi-phy to a running client must not disturb the
+/// already-connected interface, and the dynamically added interface
+/// must be driven by the shared client (dynamic event routing).
+#[tokio::test]
+async fn wifi_client_add_iface_keeps_existing_connection() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_add_iface_keeps_existing_connection: test \
+             binary not running as root (`.cargo/config.toml` runs tests via \
+             `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup_with_radios(WPA2_PSK_HOSTAPD_CONF, 3);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    // A second wifi-phy is handed to the running client.
+    sh_ok(&format!("ip link set {TEST_NIC2} up"));
+    let mut config2 = WifiConfig::new(TEST_NIC2);
+    config2.add_network("Test-WIFI-PSK", Some("12345678"));
+    client.add_iface(config2).await.expect("add_iface");
+
+    // The existing interface is still associated with the kernel: the
+    // new interface must not have triggered a disconnect/reconnect.
+    {
+        let iface = client.ifaces.get_mut(TEST_NIC).expect("first iface");
+        assert!(
+            iface.core.nl.is_associated().await.expect("query"),
+            "adding an interface must not disconnect the connected one"
+        );
+    }
+
+    // The added interface is now driven by the client until connected.
+    let mut connected2 = false;
+    for _ in 0..30 {
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.run(),
+        )
+        .await;
+        match step {
+            Ok(Ok(iface_state)) => {
+                if iface_state.iface_name == TEST_NIC2
+                    && matches!(
+                        iface_state.state,
+                        WifiState::ConnectedWithoutOffloadRekey
+                            | WifiState::ConnectedWithOffloadRekey
+                    )
+                {
+                    connected2 = true;
+                    break;
+                }
+            }
+            Ok(Err(e)) => {
+                panic!("client error while connecting the added iface: {e}")
+            }
+            Err(_) => panic!("client.run() made no progress within 20 s"),
+        }
+    }
+    assert!(connected2, "the added interface never reached connected");
+    {
+        let iface = client.ifaces.get_mut(TEST_NIC).expect("first iface");
+        assert!(
+            iface.core.nl.is_associated().await.expect("query"),
+            "the first interface must stay associated while the second \
+             connects"
+        );
+    }
+
+    // Removing the added interface disconnects only that one.
+    client.remove_iface(TEST_NIC2).await.expect("remove_iface");
+    let out = std::process::Command::new("iw")
+        .args(["dev", TEST_NIC2, "link"])
+        .output()
+        .expect("iw dev link");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("Connected to"),
+        "remove_iface must disconnect the removed interface: {text}"
+    );
+    let iface = client.ifaces.get_mut(TEST_NIC).expect("first iface");
+    assert!(
+        iface.core.nl.is_associated().await.expect("query"),
+        "removing one interface must not disconnect the others"
+    );
+
     client.shutdown().await;
 }
 

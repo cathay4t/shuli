@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use netlink_packet_core::NetlinkPayload;
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
-use wl_nl80211::{Nl80211Attr, Nl80211Message, Nl80211MulticastGroup};
+use wl_nl80211::{
+    Nl80211Attr, Nl80211Handle, Nl80211Message, Nl80211MulticastGroup,
+};
 
 use super::{Nl80211EventMsg, Nl80211EventSender, WifiIface};
 use crate::{
@@ -26,9 +31,21 @@ pub struct WifiIfaceState {
 /// subscription. The event dispatcher routes each kernel event to the
 /// interface it belongs to, so concurrent interfaces do not see each
 /// other's scan/auth/disconnect/CQM events.
+///
+/// The managed interface set is not fixed at [`WifiClient::init`]:
+/// [`WifiClient::add_iface`] and [`WifiClient::remove_iface`] change it
+/// on the running client without touching the live connections of the
+/// interfaces that stay.
 #[non_exhaustive]
 pub struct WifiClient {
     pub(crate) ifaces: HashMap<String, WifiIface>,
+    /// The shared nl80211 handle every interface (including the ones
+    /// added later by [`WifiClient::add_iface`]) is created from.
+    handle: Nl80211Handle,
+    /// Event queue per kernel `if_index`, shared with the dispatcher
+    /// task: `add_iface`/`remove_iface` (un)register routes on the fly
+    /// while the dispatcher keeps routing the other interfaces.
+    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, Nl80211EventSender>>>,
     dispatcher_shutdown_tx: UnboundedSender<()>,
     /// Generation counter bumped by [`WifiClient::notify_resume`].
     resume_tx: tokio::sync::watch::Sender<u64>,
@@ -69,8 +86,9 @@ impl WifiClient {
         tokio::spawn(conn);
 
         let mut ifaces = HashMap::new();
-        let mut iface_tx_by_if_index: HashMap<u32, Nl80211EventSender> =
-            HashMap::new();
+        let iface_tx_by_if_index: Arc<
+            RwLock<HashMap<u32, Nl80211EventSender>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
         let (resume_tx, resume_rx) = tokio::sync::watch::channel(0u64);
         for config in configs {
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
@@ -82,7 +100,10 @@ impl WifiClient {
             let iface =
                 WifiIface::init(nl, event_rx, resume_rx.clone(), config)
                     .await?;
-            iface_tx_by_if_index.insert(iface.core.nl.if_index, event_tx);
+            iface_tx_by_if_index
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(iface.core.nl.if_index, event_tx);
             ifaces.insert(iface.core.config.iface_name.clone(), iface);
         }
 
@@ -90,15 +111,96 @@ impl WifiClient {
             tokio::sync::mpsc::unbounded_channel();
         let _dispatcher = run_event_dispatcher(
             event_receiver,
-            iface_tx_by_if_index,
+            Arc::clone(&iface_tx_by_if_index),
             dispatcher_shutdown_rx,
         );
 
         Ok(Self {
             ifaces,
+            handle,
+            iface_tx_by_if_index,
             dispatcher_shutdown_tx,
             resume_tx,
         })
+    }
+
+    /// Start managing one more wifi-phy on the running client.
+    ///
+    /// The nl80211 socket and the multicast event subscription are
+    /// shared with the interfaces already managed, so adding an
+    /// interface never disturbs their live connections: no reconnect,
+    /// no rescan and no event flood. The new interface is driven by the
+    /// same [`WifiClient::run`] call as the others.
+    ///
+    /// Fails with [`ErrorKind::InvalidConfig`] when the interface is
+    /// already managed, and with [`ErrorKind::InterfaceNotFound`] when
+    /// the kernel interface does not exist.
+    pub async fn add_iface(
+        &mut self,
+        config: WifiConfig,
+    ) -> Result<(), WifiError> {
+        if self.ifaces.contains_key(&config.iface_name) {
+            return Err(WifiError::new(
+                ErrorKind::InvalidConfig,
+                format!(
+                    "WifiClient::add_iface(): interface {} is already managed",
+                    config.iface_name
+                ),
+            ));
+        }
+        let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
+        let nl = ShuliNl80211Connection::from_handle(
+            self.handle.clone(),
+            &config.iface_name,
+        )
+        .await?;
+        let if_index = nl.if_index;
+        // Register the event route before the interface initializes so
+        // the events arriving during setup are not dropped.
+        self.iface_tx_by_if_index
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(if_index, event_tx);
+        let iface_name = config.iface_name.clone();
+        match WifiIface::init(nl, event_rx, self.resume_tx.subscribe(), config)
+            .await
+        {
+            Ok(iface) => {
+                self.ifaces.insert(iface_name, iface);
+                Ok(())
+            }
+            Err(e) => {
+                self.iface_tx_by_if_index
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&if_index);
+                Err(e)
+            }
+        }
+    }
+
+    /// Stop managing one interface and cleanly disconnect it.
+    ///
+    /// Only the named interface is affected: the other interfaces keep
+    /// their live connection and the shared event dispatcher keeps
+    /// running. Fails with [`ErrorKind::InterfaceNotFound`] when the
+    /// interface is not managed by this client.
+    pub async fn remove_iface(
+        &mut self,
+        iface_name: &str,
+    ) -> Result<(), WifiError> {
+        let mut iface = self.ifaces.remove(iface_name).ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InterfaceNotFound,
+                format!("wifi interface {iface_name} not found"),
+            )
+        })?;
+        self.iface_tx_by_if_index
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&iface.core.nl.if_index);
+        iface.shutdown().await;
+        Ok(())
     }
 
     /// Notify every managed interface that the host resumed from
@@ -247,6 +349,10 @@ impl WifiClient {
     /// dispatcher. Call this before dropping the client.
     pub async fn shutdown(&mut self) {
         let _ = self.dispatcher_shutdown_tx.send(());
+        self.iface_tx_by_if_index
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         for iface in self.ifaces.values_mut() {
             iface.shutdown().await;
         }
@@ -264,7 +370,7 @@ fn run_event_dispatcher(
         Nl80211EventMsg,
         netlink_sys::SocketAddr,
     )>,
-    iface_tx_by_if_index: HashMap<u32, Nl80211EventSender>,
+    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, Nl80211EventSender>>>,
     mut shutdown_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -276,17 +382,20 @@ fn run_event_dispatcher(
                     let Some((raw_msg, _addr)) = event else {
                         break;
                     };
+                    let routes = iface_tx_by_if_index
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     let Some(if_index) = event_if_index(&raw_msg) else {
                         // A few events may lack IFINDEX; keep the old
                         // broadcast behaviour for those rare messages.
-                        for tx in iface_tx_by_if_index.values() {
+                        for tx in routes.values() {
                             if tx.unbounded_send(raw_msg.clone()).is_err() {
                                 log::debug!("wifi event queue closed");
                             }
                         }
                         continue;
                     };
-                    if let Some(tx) = iface_tx_by_if_index.get(&if_index)
+                    if let Some(tx) = routes.get(&if_index)
                         && tx.unbounded_send(raw_msg).is_err()
                     {
                         log::debug!(
