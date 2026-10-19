@@ -23,7 +23,9 @@ use shuli_core::{
 
 use crate::{
     MacsecConfig, WiredAuth, WiredClient, WiredState,
-    eap::{open_eapol_socket, recv_eapol_frame, send_eapol_frame},
+    eap::{
+        PAE_GROUP_ADDR, open_eapol_socket, recv_eapol_frame, send_eapol_frame,
+    },
 };
 
 const CERT_DIR: &str = "/tmp/shuli_rs_wired_certs";
@@ -388,6 +390,29 @@ async fn wired_macsec_mka_connect() {
         recv_raw_frame(&raw_a, 0x88b5, reply, Duration::from_secs(5)),
         "MACsec B->A data path never delivered the frame"
     );
+
+    // An MKPDU with a bad ICV (another CA or an attacker on the
+    // segment) must be ignored, not tear the session down.
+    let raw_peer = open_raw_socket("mka1");
+    let peer_ifindex = iface_index("mka1");
+    let peer_mac = read_iface_mac("mka1");
+    let mut bad_mkpdu = vec![0x03u8, 0x05, 0x00, 0x20];
+    bad_mkpdu.extend_from_slice(&[0u8; 28]);
+    send_raw_frame(
+        &raw_peer,
+        peer_ifindex,
+        &peer_mac,
+        &PAE_GROUP_ADDR,
+        0x888e,
+        &bad_mkpdu,
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..3 {
+        assert!(
+            a.run().await.is_ok(),
+            "invalid MKPDU must not abort the MKA session"
+        );
+    }
 }
 
 fn read_iface_mac(iface: &str) -> [u8; 6] {

@@ -849,10 +849,21 @@ impl MkaSession {
         if frame.payload.len() < 4 || frame.payload[1] != EAPOL_TYPE_MKA {
             return Ok(());
         }
-        let Some(pdu) =
-            MkaPdu::parse(&frame.payload, &frame.dst, &frame.src, &self.ick)?
-        else {
-            return Ok(());
+        let pdu = match MkaPdu::parse(
+            &frame.payload,
+            &frame.dst,
+            &frame.src,
+            &self.ick,
+        ) {
+            Ok(Some(pdu)) => pdu,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Another CA or an attacker can send EAPOL-MKA on
+                // the same segment; a bad ICV must not tear down
+                // the session.
+                log::debug!("ignoring invalid MKPDU: {e}");
+                return Ok(());
+            }
         };
         if pdu.basic.ckn != self.ckn {
             return Ok(());
@@ -994,12 +1005,19 @@ impl MkaSession {
                 kn: dist.kn,
             };
             if self.lki != Some(ki) {
-                let sak = unwrap_key(&self.kek, &dist.wrapped_sak)?;
+                let sak = match unwrap_key(&self.kek, &dist.wrapped_sak) {
+                    Ok(sak) => sak,
+                    Err(e) => {
+                        log::warn!("ignoring invalid distributed SAK: {e}");
+                        return Ok(());
+                    }
+                };
                 if sak.len() != 16 {
-                    return Err(mka_err(format!(
-                        "MKA distributed SAK has length {}",
+                    log::warn!(
+                        "ignoring distributed SAK with unsupported length {}",
                         sak.len()
-                    )));
+                    );
+                    return Ok(());
                 }
                 self.oki = self.lki;
                 self.oan = self.lan;
