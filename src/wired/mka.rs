@@ -38,6 +38,8 @@ pub(crate) const MKA_HELLO_SECS: u64 = 2;
 pub(crate) const MKA_LIFE_SECS: u64 = 6;
 pub(crate) const ALGO_AGILITY: [u8; 4] = [0x00, 0x80, 0xc2, 0x01];
 pub(crate) const MACSEC_CAP_INTEGRITY_CONFIDENTIALITY: u8 = 2;
+/// PendingPNExhaustion for 32-bit packet numbers (802.1X-2020 9.8).
+pub(crate) const PN_EXHAUSTION: u32 = 0xC000_0000;
 
 /// Key Identifier: the Key Server's MI plus its Key Number.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -709,7 +711,18 @@ pub(crate) struct MkaSession {
     dist_sak: Option<DistSak>,
     next_kn: u32,
     last_hello: Instant,
+    last_sak_time: Option<Instant>,
     need_send: bool,
+    need_new_sak: bool,
+}
+
+/// SCIs of all live peers that have advertised one.
+fn live_peer_scis(peers: &[Peer]) -> Vec<[u8; 8]> {
+    peers
+        .iter()
+        .filter(|peer| peer.live && peer.sci != [0u8; 8])
+        .map(|peer| peer.sci)
+        .collect()
 }
 
 impl MkaSession {
@@ -764,7 +777,9 @@ impl MkaSession {
             last_hello: Instant::now()
                 .checked_sub(Duration::from_secs(MKA_HELLO_SECS))
                 .unwrap_or_else(Instant::now),
+            last_sak_time: None,
             need_send: true,
+            need_new_sak: false,
         };
         session.elect_key_server();
         Ok(session)
@@ -816,6 +831,9 @@ impl MkaSession {
 
         self.expire_peers();
         self.drop_unsecure_sak().await?;
+        if self.is_key_server {
+            self.ensure_sak().await?;
+        }
         if self.need_send {
             self.send_mkpdu().await?;
         }
@@ -941,6 +959,11 @@ impl MkaSession {
             self.peers[idx].live = true;
             self.peers[idx].last_seen = now;
             self.need_send = true;
+            if self.is_key_server && self.lki.is_some() {
+                // A member joined the CA: distribute a fresh SAK once
+                // MKA Life Time allows it.
+                self.need_new_sak = true;
+            }
             log::debug!("MKA peer {:02x?} is live", self.peers[idx].mi);
         }
         if self.peers[idx].live {
@@ -975,6 +998,10 @@ impl MkaSession {
         {
             if self.is_key_server && sender_is_live {
                 self.peers[idx].rx_ready = use_.latest_rx;
+                if use_.latest_llpn >= PN_EXHAUSTION {
+                    log::warn!("MKA: peer LPN exhausted; scheduling rekey");
+                    self.need_new_sak = true;
+                }
                 if self.peers.iter().filter(|p| p.live).all(|p| p.rx_ready)
                     && !self.ltx
                 {
@@ -1030,14 +1057,23 @@ impl MkaSession {
                 self.lrx = true;
                 self.ltx = false;
                 self.sak = Some(sak);
+                // Every participant transmits with its own SCI, so
+                // install an RX SA for every live group member, not
+                // just the key server.
+                let mut scis = live_peer_scis(&self.peers);
+                if !scis.contains(&sender_sci) {
+                    scis.push(sender_sci);
+                }
                 if let Some(dev) = self.macsec.as_mut() {
-                    dev.install_rx_sa(
-                        &sender_sci,
-                        dist.an,
-                        &ki,
-                        self.sak.as_ref().unwrap(),
-                    )
-                    .await?;
+                    for sci in &scis {
+                        dev.install_rx_sa(
+                            sci,
+                            dist.an,
+                            &ki,
+                            self.sak.as_ref().unwrap(),
+                        )
+                        .await?;
+                    }
                     dev.install_tx_sa(
                         dist.an,
                         &ki,
@@ -1075,8 +1111,10 @@ impl MkaSession {
         self.oki = None;
         self.sak = None;
         self.dist_sak = None;
+        self.last_sak_time = None;
         self.ltx = false;
         self.lrx = false;
+        self.need_new_sak = false;
     }
 
     fn expire_peers(&mut self) {
@@ -1087,6 +1125,11 @@ impl MkaSession {
         });
         if self.peers.len() != before {
             self.need_send = true;
+            if self.is_key_server && self.lki.is_some() && self.has_live_peer()
+            {
+                // Membership changed: distribute a fresh SAK.
+                self.need_new_sak = true;
+            }
             self.elect_key_server();
         }
     }
@@ -1115,6 +1158,8 @@ impl MkaSession {
         self.orx = false;
         self.sak = None;
         self.dist_sak = None;
+        self.last_sak_time = None;
+        self.need_new_sak = false;
         for peer in &mut self.peers {
             peer.rx_ready = false;
         }
@@ -1131,6 +1176,7 @@ impl MkaSession {
     }
 
     fn elect_key_server(&mut self) {
+        let was_key_server = self.is_key_server;
         let self_sci = self.actor_sci();
         let mut best: Option<(u8, [u8; 8], bool)> = None;
         if self.can_be_key_server {
@@ -1172,17 +1218,36 @@ impl MkaSession {
                 self.key_server_sci = [0u8; 8];
             }
         }
+        if self.is_key_server != was_key_server {
+            self.need_send = true;
+            if self.is_key_server {
+                // A new Key Server must distribute its own SAK.
+                self.need_new_sak = true;
+            } else {
+                self.need_new_sak = false;
+                self.dist_sak = None;
+            }
+        }
     }
 
     async fn ensure_sak(&mut self) -> Result<(), WifiError> {
-        if !self.is_key_server {
+        if !self.is_key_server || !self.has_live_peer() {
             return Ok(());
         }
-        if self.peers.iter().all(|p| !p.live) {
+        let current_is_ours = self.lki.is_some_and(|ki| ki.mi == self.mi);
+        if current_is_ours && !self.need_new_sak {
             return Ok(());
         }
-        if self.lki.is_some() {
-            return Ok(());
+        if current_is_ours {
+            // IEEE 802.1X-2020 9.8: a fresh SAK is not distributed
+            // until MKA Life Time has elapsed since the previous one.
+            let elapsed = self
+                .last_sak_time
+                .map(|time| time.elapsed())
+                .unwrap_or(Duration::MAX);
+            if elapsed < Duration::from_secs(MKA_LIFE_SECS) {
+                return Ok(());
+            }
         }
         let mut sak = vec![0u8; 16];
         SystemRandom::new()
@@ -1202,6 +1267,11 @@ impl MkaSession {
         self.ltx = false;
         self.lrx = true;
         self.sak = Some(sak.clone());
+        self.last_sak_time = Some(Instant::now());
+        self.need_new_sak = false;
+        for peer in &mut self.peers {
+            peer.rx_ready = false;
+        }
         self.dist_sak = Some(DistSak {
             an,
             confidentiality_offset: 0,
@@ -1209,12 +1279,7 @@ impl MkaSession {
             wrapped_sak: wrapped,
         });
 
-        let peer_scis: Vec<[u8; 8]> = self
-            .peers
-            .iter()
-            .filter(|p| p.live && p.sci != [0u8; 8])
-            .map(|p| p.sci)
-            .collect();
+        let peer_scis = live_peer_scis(&self.peers);
         if let Some(dev) = self.macsec.as_mut() {
             dev.install_tx_sa(an, &ki, &sak, false).await?;
             for sci in peer_scis {
@@ -1227,8 +1292,7 @@ impl MkaSession {
     }
 
     async fn activate_tx_sa(&mut self) -> Result<(), WifiError> {
-        if let (Some(dev), Some(ki)) = (self.macsec.as_mut(), self.lki) {
-            let _ = ki;
+        if let Some(dev) = self.macsec.as_mut() {
             dev.set_tx_sa_active(self.lan).await?;
         }
         Ok(())
@@ -1318,6 +1382,72 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    fn live_peer(mi: u8, sci: [u8; 8]) -> Peer {
+        Peer {
+            mi: [mi; MI_LEN],
+            mn: 1,
+            sci,
+            priority: 0xff,
+            key_server: false,
+            live: true,
+            last_seen: Instant::now(),
+            rx_ready: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_key_server_rekeys_on_life_time_and_takeover() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        session.is_key_server = true;
+        session
+            .peers
+            .push(live_peer(0x33, [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0, 1]));
+
+        session.ensure_sak().await.unwrap();
+        let ki1 = session.lki.expect("initial SAK");
+        assert_eq!(ki1.mi, session.mi);
+        assert!(session.last_sak_time.is_some());
+        assert!(!session.need_new_sak);
+
+        // A membership change requests a rekey but must wait MKA Life
+        // Time since the previous SAK.
+        session.need_new_sak = true;
+        session.ensure_sak().await.unwrap();
+        assert_eq!(session.lki.unwrap().kn, ki1.kn);
+
+        session.last_sak_time =
+            Some(Instant::now() - Duration::from_secs(MKA_LIFE_SECS + 1));
+        session.ensure_sak().await.unwrap();
+        let ki2 = session.lki.unwrap();
+        assert_eq!(ki2.kn, ki1.kn + 1);
+        assert_eq!(ki2.mi, session.mi);
+
+        // A SAK distributed by a previous Key Server is replaced
+        // immediately after taking over.
+        session.lki = Some(KeyId {
+            mi: [0x99; MI_LEN],
+            kn: 7,
+        });
+        session.last_sak_time = Some(Instant::now());
+        session.need_new_sak = false;
+        session.ensure_sak().await.unwrap();
+        let ki3 = session.lki.unwrap();
+        assert_eq!(ki3.mi, session.mi);
+        assert_eq!(ki3.kn, ki2.kn + 1);
+    }
+
+    #[test]
+    fn test_live_peer_scis_includes_group_members() {
+        let sci_a = [1, 0, 0, 0, 0, 1, 0, 1];
+        let sci_b = [2, 0, 0, 0, 0, 1, 0, 1];
+        let mut dead = live_peer(3, [3, 0, 0, 0, 0, 1, 0, 1]);
+        dead.live = false;
+        let peers = vec![live_peer(1, sci_a), live_peer(2, sci_b), dead];
+        let scis = live_peer_scis(&peers);
+        assert_eq!(scis, vec![sci_a, sci_b]);
     }
 
     #[test]

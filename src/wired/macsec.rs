@@ -169,12 +169,45 @@ impl MacsecDevice {
         sak: &[u8],
         active: bool,
     ) -> Result<(), WifiError> {
+        let key_id = keyid_bytes(ki);
+        let mut replace = false;
+        let same_key = {
+            let tx_sa = self.desired.tx_sa.get_or_insert_with(Vec::new);
+            match tx_sa.iter().position(|sa| sa.an == an) {
+                Some(pos) if tx_sa[pos].key_id == key_id => true,
+                Some(pos) => {
+                    tx_sa.remove(pos);
+                    replace = true;
+                    false
+                }
+                None => false,
+            }
+        };
+        if same_key {
+            // Same KI: only the active state can change; never reset
+            // the packet number of an existing SA.
+            if active {
+                let tx_sa = self.desired.tx_sa.get_or_insert_with(Vec::new);
+                if let Some(sa) = tx_sa.iter_mut().find(|sa| sa.an == an) {
+                    sa.active = Some(true);
+                }
+            }
+            self.apply().await?;
+            if active {
+                self.set_encoding_sa(an).await?;
+            }
+            return Ok(());
+        }
+        if replace {
+            // The kernel updates an existing AN in place, so delete the
+            // old SA first before installing a new key for this AN.
+            self.apply().await?;
+        }
         let tx_sa = self.desired.tx_sa.get_or_insert_with(Vec::new);
-        tx_sa.retain(|sa| sa.an != an);
         let mut sa = MacsecSaConfig::new(an);
         sa.pn = Some(1);
         sa.active = Some(active);
-        sa.key_id = keyid_bytes(ki);
+        sa.key_id = key_id;
         sa.key = Some(sak.to_vec());
         tx_sa.push(sa);
         self.apply().await?;
@@ -207,22 +240,46 @@ impl MacsecDevice {
         sak: &[u8],
     ) -> Result<(), WifiError> {
         let sci = sci_be(peer_sci);
-        let rx_scs = self.desired.rx_sc.get_or_insert_with(Vec::new);
-        let index = match rx_scs.iter().position(|sc| sc.sci == sci) {
-            Some(index) => index,
-            None => {
-                rx_scs.push(MacsecRxScConfig::new(sci));
-                rx_scs.len() - 1
+        let key_id = keyid_bytes(ki);
+        let index = {
+            let rx_scs = self.desired.rx_sc.get_or_insert_with(Vec::new);
+            match rx_scs.iter().position(|sc| sc.sci == sci) {
+                Some(index) => index,
+                None => {
+                    rx_scs.push(MacsecRxScConfig::new(sci));
+                    rx_scs.len() - 1
+                }
             }
         };
-        let rx_sc = &mut rx_scs[index];
-        rx_sc.active = Some(true);
-        let sa_list = rx_sc.sa_list.get_or_insert_with(Vec::new);
-        sa_list.retain(|sa| sa.an != an);
+        let mut replace = false;
+        let same_key = {
+            let rx_scs = self.desired.rx_sc.get_or_insert_with(Vec::new);
+            rx_scs[index].active = Some(true);
+            let sa_list = rx_scs[index].sa_list.get_or_insert_with(Vec::new);
+            match sa_list.iter().position(|sa| sa.an == an) {
+                Some(pos) if sa_list[pos].key_id == key_id => true,
+                Some(pos) => {
+                    sa_list.remove(pos);
+                    replace = true;
+                    false
+                }
+                None => false,
+            }
+        };
+        if same_key {
+            return self.apply().await;
+        }
+        if replace {
+            // The kernel updates an existing AN in place, so delete the
+            // old SA first before installing a new key for this AN.
+            self.apply().await?;
+        }
+        let rx_scs = self.desired.rx_sc.get_or_insert_with(Vec::new);
+        let sa_list = rx_scs[index].sa_list.get_or_insert_with(Vec::new);
         let mut sa = MacsecSaConfig::new(an);
         sa.pn = Some(1);
         sa.active = Some(true);
-        sa.key_id = keyid_bytes(ki);
+        sa.key_id = key_id;
         sa.key = Some(sak.to_vec());
         sa_list.push(sa);
         self.apply().await
