@@ -725,6 +725,28 @@ fn live_peer_scis(peers: &[Peer]) -> Vec<[u8; 8]> {
         .collect()
 }
 
+/// Live Peer List entries ordered as MKA version 3 requires: the MI
+/// with the numerically greatest SCI first.
+fn ordered_live_peers(peers: &[Peer]) -> Vec<PeerId> {
+    let mut live: Vec<(PeerId, [u8; 8])> = peers
+        .iter()
+        .filter(|peer| peer.live)
+        .map(|peer| {
+            (
+                PeerId {
+                    mi: peer.mi,
+                    mn: peer.mn,
+                },
+                peer.sci,
+            )
+        })
+        .collect();
+    live.sort_by_key(|(peer, sci)| {
+        (std::cmp::Reverse(*sci), std::cmp::Reverse(peer.mi))
+    });
+    live.into_iter().map(|(peer, _)| peer).collect()
+}
+
 impl MkaSession {
     pub(crate) fn new(
         iface_name: &str,
@@ -1305,13 +1327,7 @@ impl MkaSession {
     }
 
     async fn send_mkpdu(&mut self) -> Result<(), WifiError> {
-        let mut live_peers: Vec<PeerId> = self
-            .peers
-            .iter()
-            .filter(|p| p.live)
-            .map(|p| PeerId { mi: p.mi, mn: p.mn })
-            .collect();
-        live_peers.sort_by_key(|a| std::cmp::Reverse(a.mi));
+        let live_peers = ordered_live_peers(&self.peers);
         let mut potential_peers: Vec<PeerId> = self
             .peers
             .iter()
@@ -1453,6 +1469,20 @@ mod tests {
         session.key_server_sci = [1; 8];
         assert!(session.is_elected_key_server(&[1; 8]));
         assert!(!session.is_elected_key_server(&[2; 8]));
+    }
+
+    #[test]
+    fn test_live_peers_ordered_by_sci() {
+        let peers = vec![
+            live_peer(1, [0x01, 0, 0, 0, 0, 1, 0, 1]),
+            live_peer(2, [0x03, 0, 0, 0, 0, 1, 0, 1]),
+            live_peer(3, [0x02, 0, 0, 0, 0, 1, 0, 1]),
+        ];
+        let ordered = ordered_live_peers(&peers);
+        assert_eq!(
+            ordered.iter().map(|peer| peer.mi[0]).collect::<Vec<_>>(),
+            [2, 3, 1]
+        );
     }
 
     #[test]
