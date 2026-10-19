@@ -1,0 +1,46 @@
+# shulid native IKEv2/IPsec configuration.
+#
+# shulid negotiates IKE/Child SAs, creates the XFRM interface, installs
+# XFRM state, assigns host addresses, and adds routes to the remote
+# selectors.  The shuli-ipsec library itself never touches addresses,
+# routes, or DNS.
+---
+version: 1
+ipsecs:
+  - name: office
+    topology: site-to-site
+    local:
+      # Underlay address used for IKE.  Omit it to let the kernel select
+      # the source address.
+      address: 192.0.2.10
+      identity: gw.example.org
+      port: 500
+      nat_t: true
+    peers:
+      - remote:
+          address: 198.51.100.1
+          identity: office-gw.example.org
+          port: 500
+        selectors:
+          local:
+            - 10.10.0.0/24
+          remote:
+            - 10.20.0.0/24
+        auth:
+          psk: "replace-with-a-long-random-secret"
+    # tunnel (default) or transport; route-based XFRM is used for tunnel.
+    child_mode: tunnel
+    child_lifetime: 3600
+    xfrm:
+      # Optional; defaults to xfrm<if_id>.
+      interface: ipsec-office
+      # Optional; allocated automatically when omitted.
+      # if_id: 42
+      # reqid: 42
+      # underlay_interface: eth0
+      priority: 1000
+    dpd:
+      enabled: true
+      interval: 30
+      timeout: 10
+      retries: 3

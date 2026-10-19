@@ -158,6 +158,69 @@ The kernel MACsec netdev is created on top of the physical interface.
 MKA elects a key server, distributes SAKs, installs them into the
 kernel, and keeps the association alive; IP configuration is applied
 once the data path is secured.
+.SH IPSEC
+Native IKEv2/IPsec connections are configured in a top-level
+.B ipsecs
+section.  shulid negotiates the IKE and Child SAs, creates the XFRM
+interface, installs SAs and policies, and applies addresses, routes, and
+DNS from the resulting lease.  The
+.B shuli-ipsec
+library never installs ordinary routes or addresses:
+.PP
+.RS
+.nf
+ipsecs:
+  - name: office
+    topology: site-to-site
+    local:
+      address: 192.0.2.10
+      identity: gw.example.org
+      port: 500
+      nat_t: true
+    peers:
+      - remote:
+          address: 198.51.100.1
+          identity: office-gw.example.org
+        selectors:
+          local: [10.10.0.0/24]
+          remote: [10.20.0.0/24]
+        auth:
+          psk: "replace-with-a-long-random-secret"
+    child_mode: tunnel
+    xfrm:
+      interface: ipsec-office
+    dpd:
+      enabled: true
+.fi
+.RE
+.TP
+.B topology
+\fBpoint-to-point\fR, \fBad-hoc\fR (a static peer mesh), or
+\fBsite-to-site\fR.
+.TP
+.B local / remote
+Underlay address, IKE identity, and UDP port.  A remote address may be
+omitted for a responder that only accepts inbound IKE.
+.B request_inner_address
+and
+.B request_dns
+request an inner address and DNS servers through the IKEv2
+Configuration Payload (road-warrior mode).
+.TP
+.B selectors
+Local and remote traffic selectors as CIDR prefixes.
+.TP
+.B auth
+Exactly one of \fBpsk\fR, \fBcertificate\fR (PEM CA, certificate, and
+private-key paths), or \fBeap_tls\fR (client EAP-TLS credentials).
+.TP
+.B child_mode
+\fBtunnel\fR (default, route-based XFRM interface) or
+\fBtransport\fR (policy-based host-to-host).
+.TP
+.B xfrm
+Optional interface name, explicit \fBif_id\fR/\fBreqid\fR, policy
+priority, marks, and underlay interface used as the XFRM link base.
 .SH SYSTEMD
 The package ships
 .I packaging/shulid.service

@@ -272,7 +272,7 @@ async fn current_default_routes(
     Ok(result)
 }
 
-fn write_resolv_conf(dns: &DnsConfig) -> Result<(), WifiError> {
+pub(crate) fn write_resolv_conf(dns: &DnsConfig) -> Result<(), WifiError> {
     let mut content = String::new();
     for search in &dns.searches {
         content.push_str(&format!("search {search}\n"));

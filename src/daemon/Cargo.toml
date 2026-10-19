@@ -16,6 +16,7 @@ path = "main.rs"
 shuli-core.workspace = true
 shuli-wifi.workspace = true
 shuli-wired.workspace = true
+shuli-ipsec.workspace = true
 tokio.workspace = true
 log.workspace = true
 env_logger.workspace = true

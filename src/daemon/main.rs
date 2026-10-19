@@ -3,6 +3,7 @@
 mod config;
 mod dhcp;
 mod ip;
+mod ipsec;
 
 use std::{collections::HashMap, path::Path, process::ExitCode};
 
@@ -37,44 +38,63 @@ async fn main() -> ExitCode {
 async fn run(config_path: &Path) -> Result<(), shuli_core::WifiError> {
     let shuli_config = config::ShuliConfig::load(config_path)?;
     let wifis = &shuli_config.wifis;
-    if wifis.is_empty() && shuli_config.ethernets.is_empty() {
+    let ipsec_configs = shuli_config.ipsec_configs()?;
+    if wifis.is_empty()
+        && shuli_config.ethernets.is_empty()
+        && ipsec_configs.is_empty()
+    {
         return Err(shuli_core::WifiError::new(
             shuli_core::ErrorKind::InvalidConfig,
-            "no wifis or ethernets in config",
+            "no wifis, ethernets, or ipsecs in config",
         ));
     }
 
     // Entries with `interface: any` (or absent) all bind to the first
     // WiFi NIC found; entries with an explicit interface bind to that
     // one. All interfaces share a single WifiClient.
-    let needs_any = wifis
-        .iter()
-        .any(|entry| entry.interface.as_deref().is_none_or(|i| i == "any"));
-    let any_iface = if needs_any {
-        resolve_iface_name(None).await?
+    let (groups, client) = if wifis.is_empty() {
+        (Vec::new(), None)
     } else {
-        String::new()
-    };
-    let groups = group_by_interface(wifis, &any_iface);
-    log::info!(
-        "shulid: {} interface(s): {}",
-        groups.len(),
-        groups
+        let needs_any = wifis
             .iter()
-            .map(|(iface, entries)| format!("{iface} ({} ssid)", entries.len()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .any(|entry| entry.interface.as_deref().is_none_or(|i| i == "any"));
+        let any_iface = if needs_any {
+            resolve_iface_name(None).await?
+        } else {
+            String::new()
+        };
+        let groups = group_by_interface(wifis, &any_iface);
+        log::info!(
+            "shulid: {} interface(s): {}",
+            groups.len(),
+            groups
+                .iter()
+                .map(|(iface, entries)| format!(
+                    "{iface} ({} ssid)",
+                    entries.len()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
-    // Init the single client up front so an invalid interface fails
-    // fast instead of only part of the daemon running.
-    let wifi_configs: Vec<shuli_wifi::WifiConfig> = groups
-        .iter()
-        .map(|(iface_name, entries)| {
-            config::ShuliConfig::wifi_config_for_entries(iface_name, entries)
-        })
-        .collect();
-    let client = shuli_wifi::WifiClient::init(wifi_configs).await?;
+        // Init the single client up front so an invalid interface fails
+        // fast instead of only part of the daemon running.
+        let wifi_configs: Vec<shuli_wifi::WifiConfig> = groups
+            .iter()
+            .map(|(iface_name, entries)| {
+                config::ShuliConfig::wifi_config_for_entries(
+                    iface_name, entries,
+                )
+            })
+            .collect();
+        (
+            groups,
+            Some(shuli_wifi::WifiClient::init(wifi_configs).await?),
+        )
+    };
+    if !ipsec_configs.is_empty() {
+        log::info!("shulid: {} IPsec connection(s)", ipsec_configs.len());
+    }
 
     // A watch channel broadcasts shutdown.
     // `tasks` is polled in the select so the daemon also exits when
@@ -89,12 +109,21 @@ async fn run(config_path: &Path) -> Result<(), shuli_core::WifiError> {
     })?;
 
     let mut tasks = futures::stream::FuturesUnordered::new();
-    let wifi_shutdown_rx = shutdown_rx.clone();
-    tasks.push(tokio::spawn(run_wifi_interfaces(
-        client,
-        groups,
-        wifi_shutdown_rx,
-    )));
+    if let Some(client) = client {
+        let wifi_shutdown_rx = shutdown_rx.clone();
+        tasks.push(tokio::spawn(run_wifi_interfaces(
+            client,
+            groups,
+            wifi_shutdown_rx,
+        )));
+    }
+    if !ipsec_configs.is_empty() {
+        let ipsec_shutdown_rx = shutdown_rx.clone();
+        tasks.push(tokio::spawn(ipsec::run_ipsec(
+            ipsec_configs,
+            ipsec_shutdown_rx,
+        )));
+    }
     // one wired 802.1X task per configured Ethernet port.
     for entry in &shuli_config.ethernets {
         let shutdown_rx = shutdown_rx.clone();

@@ -1,0 +1,46 @@
+[package]
+name = "shuli-ipsec"
+description = "Native IKEv2 and Linux XFRM library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+# Tests are declared as `mod tests` in lib.rs or as integration test
+# binaries in tests/.
+autotests = false
+
+[lib]
+name = "shuli_ipsec"
+path = "lib.rs"
+
+[dependencies]
+shuli-core.workspace = true
+aws-lc-rs.workspace = true
+getrandom.workspace = true
+tokio.workspace = true
+futures.workspace = true
+log.workspace = true
+libc.workspace = true
+netlink-packet-core.workspace = true
+netlink-packet-xfrm = { path = "/home/fge/Source/netlink/netlink-packet-xfrm" }
+netlink-proto.workspace = true
+netlink-sys.workspace = true
+rtnetlink.workspace = true
+rustls.workspace = true
+rustls-webpki = "0.103"
+zeroize = { version = "1", features = ["derive"] }
+num-bigint = "0.4"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies.serde]
+workspace = true
+optional = true
+
+[dev-dependencies]
+env_logger.workspace = true
+serde_json.workspace = true

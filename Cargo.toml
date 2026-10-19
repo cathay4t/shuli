@@ -4,6 +4,7 @@ members = [
     "src/core",
     "src/wifi",
     "src/wired",
+    "src/ipsec",
     "src/daemon",
 ]
 
@@ -19,6 +20,7 @@ repository = "https://github.com/cathay4t/shuli"
 shuli-core = { path = "src/core" }
 shuli-wifi = { path = "src/wifi" }
 shuli-wired = { path = "src/wired" }
+shuli-ipsec = { path = "src/ipsec" }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

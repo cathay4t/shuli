@@ -1,4 +1,17 @@
 # Changelog
+## [Unreleased]
+### New features
+ - Add `shuli-ipsec`: a native IKEv2 client and Linux XFRM manager with
+   PSK, X.509, and EAP-TLS client authentication, traffic-selector
+   narrowing, Child SA rekeying, NAT-T, DPD, and ownership-scoped XFRM
+   cleanup.
+ - Add `ipsecs` configuration to `shulid`: IKE/Child SA negotiation,
+   XFRM interface creation, address and route application for route-based
+   tunnels, and the same `shuli-ipsec` API used by nipart plugins.
+ - Add an `examples/nipart_flow` consumer that demonstrates the complete
+   public-API flow: negotiate, ensure the XFRM interface, install SAs and
+   policies, refresh on rekey, and clean up on exit.
+
 ## [0.3.0] - 2026-10-01
 ### Breaking changes
  - `WifiClient` now manages all wifi-phy interfaces in one object; use

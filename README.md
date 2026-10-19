@@ -1,9 +1,10 @@
 # 书立 (shuli)
 
-**Linux WiFi authentication library and daemon in Rust**
+**Linux WiFi, wired 802.1X, and IPsec library and daemon in Rust**
 
-The `shuli-wifi` and `shuli-wired` crates and the `shulid` daemon authenticate
-a Linux station (client) to modern WiFi and wired 802.1X networks, written
+The `shuli-wifi`, `shuli-wired`, and `shuli-ipsec` crates and the `shulid`
+daemon authenticate a Linux station (client) to modern WiFi and wired
+802.1X networks and terminate native IKEv2/IPsec tunnels, written
 entirely in Rust.
 
 ## Features
@@ -20,6 +21,9 @@ entirely in Rust.
 * **Wired 802.1X** - EAP-TLS over Ethernet (raw AF_PACKET EAPOL).
 * **MACsec** - 802.1X/MKA key agreement with a pre-shared CAK, kernel
   MACsec SA installation, and automatic liveness/SAK rotation.
+* **IPsec** - native IKEv2 (PSK, X.509, EAP-TLS client), route-based XFRM
+  interfaces, Child SA rekeying, NAT-T, DPD, and ownership-scoped XFRM
+  cleanup.  No libreswan or strongSwan runtime dependency.
 * **Hardening** - WoWLAN (opt-in), OCV, Extended Key ID, Transition
   Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
   CMAC-128).
@@ -33,6 +37,7 @@ entirely in Rust.
 * `shuli-core` - shared errors, EAP/EAP-TLS, EAPOL framing, and `EapConfig`.
 * `shuli-wifi` - WiFi/WPA client.
 * `shuli-wired` - wired 802.1X/EAP and MACsec/MKA client.
+* `shuli-ipsec` - native IKEv2 engine and `XfrmManager` (usable by nipart).
 * `shulid` - the daemon.
 
 ## Using the daemon for simple WiFi configuration
@@ -40,7 +45,8 @@ entirely in Rust.
 Full configuration examples are stored in
 [`examples/wifi_config.yml`](examples/wifi_config.yml),
 [`examples/eap_config.yml`](examples/eap_config.yml), and
-[`examples/macsec_config.yml`](examples/macsec_config.yml).
+[`examples/macsec_config.yml`](examples/macsec_config.yml), and
+[`examples/ipsec_config.yml`](examples/ipsec_config.yml).
 
 `shulid` reads YAML from `/etc/shuli/config.yml` (or a path given on the
 command line).  It targets small systems that don't run nipart: each WiFi
@@ -84,6 +90,28 @@ wifis:
         - ip: 2001:db8:1::1
           prefix-length: 64
       gateway: 2001:db8:1::254
+```
+
+IPsec point-to-point or site-to-site tunnel:
+
+```yaml
+ipsecs:
+  - name: office
+    topology: site-to-site
+    local:
+      address: 192.0.2.10
+      identity: gw.example.org
+    peers:
+      - remote:
+          address: 198.51.100.1
+          identity: office-gw.example.org
+        selectors:
+          local: [10.10.0.0/24]
+          remote: [10.20.0.0/24]
+        auth:
+          psk: "replace-with-a-long-random-secret"
+    xfrm:
+      interface: ipsec-office
 ```
 
 Wired 802.1X authentication:

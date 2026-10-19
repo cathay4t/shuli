@@ -25,6 +25,11 @@ pub(crate) struct ShuliConfig {
     /// with 802.1X/EAP or MACsec/MKA and then applies its IP config.
     #[serde(default)]
     pub ethernets: Vec<EthernetEntry>,
+    /// Native IKEv2/IPsec connections.  shulid creates the XFRM
+    /// interfaces and applies addresses and routes; the shuli-ipsec
+    /// library only negotiates SAs and installs XFRM state.
+    #[serde(default)]
+    pub ipsecs: Vec<IpsecEntry>,
 }
 
 /// SAE PWE derivation mode as configured in the YAML file. Kept as its
@@ -287,6 +292,476 @@ pub(crate) struct IpAddress {
     pub prefix_length: u8,
 }
 
+/// One IKEv2/IPsec connection from the daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecEntry {
+    pub name: String,
+    /// `point-to-point`, `ad-hoc`, or `site-to-site`.
+    #[serde(default = "default_ipsec_topology")]
+    pub topology: String,
+    pub local: IpsecLocalEntry,
+    #[serde(default)]
+    pub peers: Vec<IpsecPeerEntry>,
+    /// Child SA mode: `tunnel` (default) or `transport`.
+    #[serde(default = "default_ipsec_child_mode")]
+    pub child_mode: String,
+    /// Child SA lifetime in seconds (default 3600).
+    #[serde(default = "default_ipsec_child_lifetime")]
+    pub child_lifetime: u64,
+    #[serde(default)]
+    pub xfrm: IpsecXfrmEntry,
+    #[serde(default)]
+    pub dpd: IpsecDpdEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecLocalEntry {
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default = "default_ipsec_port")]
+    pub port: u16,
+    #[serde(default = "default_true")]
+    pub nat_t: bool,
+    /// Request an inner address and DNS servers through IKEv2
+    /// Configuration Payload (road-warrior).
+    #[serde(default)]
+    pub request_inner_address: bool,
+    #[serde(default)]
+    pub request_dns: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecPeerEntry {
+    pub remote: IpsecRemoteEntry,
+    #[serde(default)]
+    pub selectors: IpsecSelectorPairEntry,
+    pub auth: IpsecAuthEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecRemoteEntry {
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default = "default_ipsec_port")]
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct IpsecSelectorPairEntry {
+    #[serde(default)]
+    pub local: Vec<String>,
+    #[serde(default)]
+    pub remote: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct IpsecAuthEntry {
+    #[serde(default)]
+    pub psk: Option<String>,
+    #[serde(default)]
+    pub certificate: Option<IpsecCertificateEntry>,
+    #[serde(default)]
+    pub eap_tls: Option<EapEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecCertificateEntry {
+    /// PEM CA certificate paths.
+    #[serde(default)]
+    pub ca_certificates: Vec<String>,
+    /// PEM local certificate chain paths.
+    pub certificates: Vec<String>,
+    /// PEM private key path.
+    pub private_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecXfrmEntry {
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub underlay_interface: Option<String>,
+    #[serde(default)]
+    pub if_id: Option<u32>,
+    #[serde(default)]
+    pub reqid: Option<u32>,
+    #[serde(default = "default_ipsec_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub mark: Option<u32>,
+    #[serde(default)]
+    pub mark_mask: u32,
+}
+
+impl Default for IpsecXfrmEntry {
+    fn default() -> Self {
+        Self {
+            interface: None,
+            underlay_interface: None,
+            if_id: None,
+            reqid: None,
+            priority: default_ipsec_priority(),
+            mark: None,
+            mark_mask: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IpsecDpdEntry {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_dpd_interval")]
+    pub interval: u64,
+    #[serde(default = "default_dpd_timeout")]
+    pub timeout: u64,
+    #[serde(default = "default_dpd_retries")]
+    pub retries: u8,
+}
+
+impl Default for IpsecDpdEntry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: default_dpd_interval(),
+            timeout: default_dpd_timeout(),
+            retries: default_dpd_retries(),
+        }
+    }
+}
+
+fn default_ipsec_topology() -> String {
+    "point-to-point".to_string()
+}
+
+fn default_ipsec_child_mode() -> String {
+    "tunnel".to_string()
+}
+
+fn default_ipsec_child_lifetime() -> u64 {
+    3600
+}
+
+fn default_ipsec_port() -> u16 {
+    500
+}
+
+fn default_ipsec_priority() -> u32 {
+    1000
+}
+
+fn default_dpd_interval() -> u64 {
+    30
+}
+
+fn default_dpd_timeout() -> u64 {
+    10
+}
+
+fn default_dpd_retries() -> u8 {
+    3
+}
+
+impl IpsecEntry {
+    fn validate_entry(&self) -> Result<(), WifiError> {
+        if self.name.trim().is_empty() {
+            return Err(ipsec_config_error("ipsec name is required"));
+        }
+        if self.peers.is_empty() {
+            return Err(ipsec_config_error(format!(
+                "ipsec {}: at least one peer is required",
+                self.name
+            )));
+        }
+        let topology = parse_topology(&self.topology)?;
+        if topology == shuli_ipsec::Topology::PointToPoint
+            && self.peers.len() != 1
+        {
+            return Err(ipsec_config_error(format!(
+                "ipsec {}: point-to-point requires exactly one peer",
+                self.name
+            )));
+        }
+        self.local_ip()?;
+        self.child_mode()?;
+        parse_child_lifetime(self.child_lifetime)?;
+        for peer in &self.peers {
+            peer.remote_ip()?;
+            peer.auth.validate()?;
+            peer.selector_pair()?;
+        }
+        Ok(())
+    }
+
+    fn local_ip(&self) -> Result<Option<std::net::IpAddr>, WifiError> {
+        parse_optional_ip("ipsec.local.address", self.local.address.as_deref())
+    }
+
+    fn child_mode(&self) -> Result<shuli_ipsec::ChildMode, WifiError> {
+        match self.child_mode.as_str() {
+            "tunnel" => Ok(shuli_ipsec::ChildMode::Tunnel),
+            "transport" => Ok(shuli_ipsec::ChildMode::Transport),
+            other => Err(ipsec_config_error(format!(
+                "ipsec {}: invalid child mode {other:?}",
+                self.name
+            ))),
+        }
+    }
+
+    pub(crate) fn to_lib(&self) -> Result<shuli_ipsec::IpsecConfig, WifiError> {
+        self.validate_entry()?;
+        let local_ip = self.local_ip()?;
+        let local_identity = match self.local.identity.as_deref() {
+            Some(identity) => identity.parse().map_err(ipsec_error)?,
+            None => match local_ip {
+                Some(address) => shuli_ipsec::Identity::Ip(address),
+                None => shuli_ipsec::Identity::Fqdn("localhost".to_string()),
+            },
+        };
+        let peers = self
+            .peers
+            .iter()
+            .map(|peer| peer.to_lib(local_ip))
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = shuli_ipsec::IpsecConfig {
+            name: self.name.clone(),
+            topology: parse_topology(&self.topology)?,
+            local: shuli_ipsec::LocalConfig {
+                address: local_ip,
+                interface: self.local.interface.clone(),
+                identity: local_identity,
+                port: self.local.port,
+                nat_t: self.local.nat_t,
+                request_inner_address: self.local.request_inner_address,
+                request_dns: self.local.request_dns,
+            },
+            peers,
+            ike: shuli_ipsec::IkeConfig::default(),
+            child: shuli_ipsec::ChildConfig {
+                mode: self.child_mode()?,
+                lifetime: std::time::Duration::from_secs(self.child_lifetime),
+                ..shuli_ipsec::ChildConfig::default()
+            },
+            xfrm: shuli_ipsec::XfrmConfig {
+                interface: self.xfrm.interface.clone(),
+                if_id: self.xfrm.if_id,
+                reqid: self.xfrm.reqid,
+                priority: self.xfrm.priority,
+                mark: self.xfrm.mark,
+                mark_mask: self.xfrm.mark_mask,
+                underlay_interface: self.xfrm.underlay_interface.clone(),
+                esn: false,
+            },
+            rekey: shuli_ipsec::RekeyConfig::default(),
+            dpd: shuli_ipsec::DpdConfig {
+                interval: std::time::Duration::from_secs(self.dpd.interval),
+                timeout: std::time::Duration::from_secs(self.dpd.timeout),
+                retries: self.dpd.retries,
+                enabled: self.dpd.enabled,
+            },
+        };
+        config.validate().map_err(ipsec_error)?;
+        Ok(config)
+    }
+}
+
+impl IpsecPeerEntry {
+    fn remote_ip(&self) -> Result<Option<std::net::IpAddr>, WifiError> {
+        parse_optional_ip(
+            "ipsec.remote.address",
+            self.remote.address.as_deref(),
+        )
+    }
+
+    fn selector_pair(
+        &self,
+    ) -> Result<shuli_ipsec::TrafficSelectorPair, WifiError> {
+        let local = self
+            .selectors
+            .local
+            .iter()
+            .map(|value| parse_selector(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let remote = self
+            .selectors
+            .remote
+            .iter()
+            .map(|value| parse_selector(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        if local.is_empty() || remote.is_empty() {
+            return Err(ipsec_config_error(
+                "ipsec peer requires local and remote selectors",
+            ));
+        }
+        Ok(shuli_ipsec::TrafficSelectorPair::new(local, remote))
+    }
+
+    fn to_lib(
+        &self,
+        _local_ip: Option<std::net::IpAddr>,
+    ) -> Result<shuli_ipsec::PeerConfig, WifiError> {
+        let remote_ip = self.remote_ip()?;
+        let remote_identity = match self.remote.identity.as_deref() {
+            Some(identity) => identity.parse().map_err(ipsec_error)?,
+            None => match remote_ip {
+                Some(address) => shuli_ipsec::Identity::Ip(address),
+                None => shuli_ipsec::Identity::Any,
+            },
+        };
+        Ok(shuli_ipsec::PeerConfig {
+            remote: shuli_ipsec::RemoteConfig {
+                address: remote_ip,
+                identity: remote_identity,
+                port: self.remote.port,
+            },
+            selectors: self.selector_pair()?,
+            auth: self.auth.to_lib()?,
+        })
+    }
+}
+
+impl IpsecAuthEntry {
+    fn validate(&self) -> Result<(), WifiError> {
+        let count = usize::from(self.psk.is_some())
+            + usize::from(self.certificate.is_some())
+            + usize::from(self.eap_tls.is_some());
+        if count != 1 {
+            return Err(ipsec_config_error(
+                "ipsec auth must specify exactly one of psk, certificate, or \
+                 eap_tls",
+            ));
+        }
+        if let Some(psk) = &self.psk
+            && psk.is_empty()
+        {
+            return Err(ipsec_config_error("ipsec psk must not be empty"));
+        }
+        if let Some(eap) = &self.eap_tls
+            && eap.identity.is_empty()
+        {
+            return Err(ipsec_config_error(
+                "ipsec eap_tls identity is required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_lib(&self) -> Result<shuli_ipsec::AuthConfig, WifiError> {
+        self.validate()?;
+        if let Some(psk) = &self.psk {
+            return Ok(shuli_ipsec::AuthConfig::Psk(
+                shuli_ipsec::Secret::from(psk.as_str()),
+            ));
+        }
+        if let Some(eap) = &self.eap_tls {
+            return Ok(shuli_ipsec::AuthConfig::EapTls(
+                shuli_ipsec::EapTlsConfig {
+                    identity: eap.identity.clone(),
+                    ca_cert: eap.ca_cert.as_ref().map(PathBuf::from),
+                    client_cert: eap.client_cert.as_ref().map(PathBuf::from),
+                    client_key: eap.client_key.as_ref().map(PathBuf::from),
+                    server_name: eap.server_name.clone(),
+                },
+            ));
+        }
+        let certificate = self.certificate.as_ref().unwrap();
+        let read = |path: &str| {
+            fs::read(path)
+                .map_err(|e| ipsec_config_error(format!("read {path}: {e}")))
+        };
+        let mut ca_certificates = Vec::new();
+        for path in &certificate.ca_certificates {
+            ca_certificates.push(read(path)?);
+        }
+        let mut certificates = Vec::new();
+        for path in &certificate.certificates {
+            certificates.push(read(path)?);
+        }
+        let private_key = read(&certificate.private_key)?;
+        Ok(shuli_ipsec::AuthConfig::Certificate(
+            shuli_ipsec::CertificateConfig::new(
+                ca_certificates,
+                certificates,
+                private_key,
+            ),
+        ))
+    }
+}
+
+fn parse_topology(value: &str) -> Result<shuli_ipsec::Topology, WifiError> {
+    match value {
+        "point-to-point" => Ok(shuli_ipsec::Topology::PointToPoint),
+        "ad-hoc" => Ok(shuli_ipsec::Topology::AdHoc),
+        "site-to-site" => Ok(shuli_ipsec::Topology::SiteToSite),
+        other => Err(ipsec_config_error(format!(
+            "invalid ipsec topology {other:?}"
+        ))),
+    }
+}
+
+fn parse_child_lifetime(value: u64) -> Result<std::time::Duration, WifiError> {
+    if value == 0 {
+        return Err(ipsec_config_error(
+            "ipsec child_lifetime must be greater than zero",
+        ));
+    }
+    Ok(std::time::Duration::from_secs(value))
+}
+
+fn parse_optional_ip(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<std::net::IpAddr>, WifiError> {
+    value
+        .map(|value| {
+            value.parse().map_err(|e| {
+                ipsec_config_error(format!("invalid {field} {value:?}: {e}"))
+            })
+        })
+        .transpose()
+}
+
+fn parse_selector(
+    value: &str,
+) -> Result<shuli_ipsec::TrafficSelector, WifiError> {
+    let value = value.trim();
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => {
+            let address: std::net::IpAddr = address.parse().map_err(|e| {
+                ipsec_config_error(format!("invalid selector {value:?}: {e}"))
+            })?;
+            let prefix: u8 = prefix.parse().map_err(|e| {
+                ipsec_config_error(format!("invalid selector {value:?}: {e}"))
+            })?;
+            (address, prefix)
+        }
+        None => {
+            let address: std::net::IpAddr = value.parse().map_err(|e| {
+                ipsec_config_error(format!("invalid selector {value:?}: {e}"))
+            })?;
+            let prefix = if address.is_ipv4() { 32 } else { 128 };
+            (address, prefix)
+        }
+    };
+    let network =
+        shuli_ipsec::IpNet::new(address, prefix).map_err(ipsec_error)?;
+    Ok(shuli_ipsec::TrafficSelector::net(network))
+}
+
+fn ipsec_config_error(message: impl Into<String>) -> WifiError {
+    WifiError::new(ErrorKind::InvalidConfig, message.into())
+}
+
+fn ipsec_error(error: shuli_ipsec::IpsecError) -> WifiError {
+    WifiError::new(ErrorKind::InvalidConfig, error.to_string())
+}
+
 impl ShuliConfig {
     pub(crate) fn load(path: &Path) -> Result<Self, WifiError> {
         if !path.exists() {
@@ -307,6 +782,9 @@ impl ShuliConfig {
     /// Reject invalid wired configuration at load time instead of
     /// failing every reconnect attempt.
     fn validate(&self) -> Result<(), WifiError> {
+        for entry in &self.ipsecs {
+            entry.validate_entry()?;
+        }
         for entry in &self.ethernets {
             match (&entry.eap, &entry.macsec) {
                 (Some(_), Some(_)) => {
@@ -335,6 +813,13 @@ impl ShuliConfig {
             }
         }
         Ok(())
+    }
+
+    /// Build the library configuration for all IPsec connections.
+    pub(crate) fn ipsec_configs(
+        &self,
+    ) -> Result<Vec<shuli_ipsec::IpsecConfig>, WifiError> {
+        self.ipsecs.iter().map(IpsecEntry::to_lib).collect()
     }
 
     /// Convert `entries` - the configured networks bound to
@@ -706,6 +1191,10 @@ ethernets:
                 "macsec_config.yml",
                 include_str!("../../examples/macsec_config.yml"),
             ),
+            (
+                "ipsec_config.yml",
+                include_str!("../../examples/ipsec_config.yml"),
+            ),
         ] {
             let config = parse(text);
             config.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -715,6 +1204,57 @@ ethernets:
                 }
             }
         }
+    }
+
+    #[test]
+    fn ipsec_entry_maps_to_library_config() {
+        let config = parse(include_str!("../../examples/ipsec_config.yml"));
+        let configs = config.ipsec_configs().expect("valid ipsec config");
+        assert_eq!(configs.len(), 1);
+        let entry = &configs[0];
+        assert_eq!(entry.name, "office");
+        assert_eq!(entry.topology, shuli_ipsec::Topology::SiteToSite);
+        assert_eq!(entry.local.port, 500);
+        assert_eq!(entry.peers.len(), 1);
+        assert_eq!(entry.peers[0].remote.port, 500);
+        assert_eq!(entry.peers[0].selectors.local.len(), 1);
+        assert_eq!(
+            entry.peers[0].selectors.local[0].start,
+            "10.10.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            entry.peers[0].selectors.local[0].end,
+            "10.10.0.255".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(entry.child.mode, shuli_ipsec::ChildMode::Tunnel);
+        assert!(matches!(
+            entry.peers[0].auth,
+            shuli_ipsec::AuthConfig::Psk(_)
+        ));
+    }
+
+    #[test]
+    fn ipsec_entry_rejects_ambiguous_auth() {
+        let config =
+            parse(
+                "---\nversion: 1\nipsecs:\n  - name: bad\n    local:\n      \
+                 address: 192.0.2.1\n    peers:\n      - remote:\n          \
+                 address: 192.0.2.2\n        selectors:\n          local: \
+                 [10.0.0.0/24]\n          remote: [10.1.0.0/24]\n        \
+                 auth:\n          psk: secret\n          eap_tls:\n            \
+                 identity: user\n",
+            );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn ipsec_selector_parsing() {
+        let config = parse(
+            "---\nversion: 1\nipsecs:\n  - name: p2p\n    local:\n      address: 192.0.2.1\n      identity: a.example\n    peers:\n      - remote:\n          address: 192.0.2.2\n          identity: b.example\n        selectors:\n          local: [10.0.0.1]\n          remote: [10.0.0.2]\n        auth:\n          psk: secret\n",
+        );
+        let configs = config.ipsec_configs().expect("valid config");
+        let selector = &configs[0].peers[0].selectors.local[0];
+        assert_eq!(selector.start, selector.end);
     }
 
     #[test]
