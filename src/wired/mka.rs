@@ -1014,6 +1014,7 @@ impl MkaSession {
                 }
             } else if !self.is_key_server
                 && sender_is_key_server
+                && self.is_elected_key_server(&sender_sci)
                 && use_.latest_tx
                 && !self.ltx
             {
@@ -1026,6 +1027,7 @@ impl MkaSession {
         if let Some(dist) = &pdu.dist_sak
             && sender_is_live
             && sender_is_key_server
+            && self.is_elected_key_server(&sender_sci)
             && !self.is_key_server
             && !dist.wrapped_sak.is_empty()
         {
@@ -1136,6 +1138,10 @@ impl MkaSession {
 
     fn has_live_peer(&self) -> bool {
         self.peers.iter().any(|p| p.live)
+    }
+
+    fn is_elected_key_server(&self, sci: &[u8; 8]) -> bool {
+        self.key_server_sci != [0u8; 8] && sci == &self.key_server_sci
     }
 
     /// Once the last live peer is gone the association is no longer
@@ -1437,6 +1443,16 @@ mod tests {
         let ki3 = session.lki.unwrap();
         assert_eq!(ki3.mi, session.mi);
         assert_eq!(ki3.kn, ki2.kn + 1);
+    }
+
+    #[tokio::test]
+    async fn test_elected_key_server_identity() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        assert!(!session.is_elected_key_server(&[1; 8]));
+        session.key_server_sci = [1; 8];
+        assert!(session.is_elected_key_server(&[1; 8]));
+        assert!(!session.is_elected_key_server(&[2; 8]));
     }
 
     #[test]
