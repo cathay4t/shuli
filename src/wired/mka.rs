@@ -891,6 +891,10 @@ impl MkaSession {
         if frame.payload.len() < 4 || frame.payload[1] != EAPOL_TYPE_MKA {
             return Ok(());
         }
+        // Packet sockets may echo our own transmitted frame back.
+        if frame.src == self.mac {
+            return Ok(());
+        }
         let pdu = match MkaPdu::parse(
             &frame.payload,
             &frame.dst,
@@ -911,6 +915,11 @@ impl MkaSession {
             return Ok(());
         }
         if pdu.basic.mi == self.mi {
+            // Another participant randomly selected our MI: choose a
+            // new one instead of ignoring each other forever.
+            log::warn!("MKA MI collision detected; choosing a new MI");
+            self.reset_mi();
+            self.need_send = true;
             return Ok(());
         }
         if pdu.basic.version > MKA_VERSION {
@@ -1459,6 +1468,45 @@ mod tests {
         let ki3 = session.lki.unwrap();
         assert_eq!(ki3.mi, session.mi);
         assert_eq!(ki3.kn, ki2.kn + 1);
+    }
+
+    #[tokio::test]
+    async fn test_mi_collision_picks_new_mi() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        let old_mi = session.mi;
+        let src = [0x02, 0, 0, 0, 0, 2];
+        let pdu = MkaPdu {
+            basic: MkaBasic {
+                version: MKA_VERSION,
+                priority: 0xff,
+                key_server: false,
+                macsec_desired: true,
+                macsec_capability: MACSEC_CAP_INTEGRITY_CONFIDENTIALITY,
+                sci: [0xde, 0xad, 0xbe, 0xef, 0, 1, 0, 1],
+                mi: old_mi,
+                mn: 5,
+                algo_agility: ALGO_AGILITY,
+                ckn: session.ckn.clone(),
+            },
+            live_peers: Vec::new(),
+            potential_peers: Vec::new(),
+            sak_use: None,
+            dist_sak: None,
+        };
+        let payload = pdu
+            .build_eapol(&PAE_GROUP_ADDR, &src, &session.ick)
+            .unwrap();
+        session
+            .handle_frame(crate::eap::EapolFrame {
+                src,
+                dst: PAE_GROUP_ADDR,
+                payload,
+            })
+            .await
+            .unwrap();
+        assert_ne!(session.mi, old_mi);
+        assert_eq!(session.mn, 1);
     }
 
     #[tokio::test]
