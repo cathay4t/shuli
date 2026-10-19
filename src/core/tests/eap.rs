@@ -3,8 +3,6 @@
 //! Unit tests for the EAP transport: EAP packet codec,
 //! EAPOL type-0 framing, and the peer state machine.
 
-use wl_nl80211::Ieee80211EapolEapFrame;
-
 use crate::{
     ErrorKind, WifiError,
     eap::{
@@ -12,6 +10,7 @@ use crate::{
         EapMethod, EapPacket, EapPeer, MSK_LEN, TYPE_IDENTITY, TYPE_NAK,
         TYPE_NOTIFICATION, TYPE_TLS,
     },
+    eapol::EapolEapFrame,
 };
 
 #[test]
@@ -61,15 +60,15 @@ fn test_eap_packet_parse_rejects_bad_input() {
 #[test]
 fn test_eapol_eap_frame_roundtrip() {
     let eap = EapPacket::build(CODE_REQUEST, 1, Some(TYPE_IDENTITY), b"");
-    let frame = Ieee80211EapolEapFrame::build(&eap);
+    let frame = EapolEapFrame::build(&eap);
     assert_eq!(frame[0], 2, "EAPOL version");
     assert_eq!(frame[1], 0, "EAPOL type 0 = EAP");
-    let parsed = Ieee80211EapolEapFrame::parse(&frame).expect("parse");
+    let parsed = EapolEapFrame::parse(&frame).expect("parse");
     assert_eq!(parsed.payload, eap);
 
     // Non-EAP EAPOL and truncated frames are rejected.
-    assert!(Ieee80211EapolEapFrame::parse(&[2, 3, 0, 0]).is_none());
-    assert!(Ieee80211EapolEapFrame::parse(&[2, 0, 0, 16, 1]).is_none());
+    assert!(EapolEapFrame::parse(&[2, 3, 0, 0]).is_none());
+    assert!(EapolEapFrame::parse(&[2, 0, 0, 16, 1]).is_none());
 }
 
 #[test]

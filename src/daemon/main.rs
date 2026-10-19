@@ -34,12 +34,12 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
+async fn run(config_path: &Path) -> Result<(), shuli_core::WifiError> {
     let shuli_config = config::ShuliConfig::load(config_path)?;
     let wifis = &shuli_config.wifis;
     if wifis.is_empty() && shuli_config.ethernets.is_empty() {
-        return Err(shuli::WifiError::new(
-            shuli::ErrorKind::InvalidConfig,
+        return Err(shuli_core::WifiError::new(
+            shuli_core::ErrorKind::InvalidConfig,
             "no wifis or ethernets in config",
         ));
     }
@@ -68,13 +68,13 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
 
     // Init the single client up front so an invalid interface fails
     // fast instead of only part of the daemon running.
-    let wifi_configs: Vec<shuli::WifiConfig> = groups
+    let wifi_configs: Vec<shuli_wifi::WifiConfig> = groups
         .iter()
         .map(|(iface_name, entries)| {
             config::ShuliConfig::wifi_config_for_entries(iface_name, entries)
         })
         .collect();
-    let client = shuli::WifiClient::init(wifi_configs).await?;
+    let client = shuli_wifi::WifiClient::init(wifi_configs).await?;
 
     // A watch channel broadcasts shutdown.
     // `tasks` is polled in the select so the daemon also exits when
@@ -82,8 +82,8 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     // closed) instead of idling with zero live tasks.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut sigterm = unix_signal(SignalKind::terminate()).map_err(|e| {
-        shuli::WifiError::new(
-            shuli::ErrorKind::ConnectFailed,
+        shuli_core::WifiError::new(
+            shuli_core::ErrorKind::ConnectFailed,
             format!("failed to register SIGTERM handler: {e}"),
         )
     })?;
@@ -140,7 +140,7 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
     }
 
     let mut any_connected = false;
-    let mut task_err: Option<shuli::WifiError> = None;
+    let mut task_err: Option<shuli_core::WifiError> = None;
     for result in results {
         match result {
             Ok(Ok(connected)) => any_connected |= connected,
@@ -158,8 +158,8 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
         Ok(())
     } else {
         Err(task_err.unwrap_or_else(|| {
-            shuli::WifiError::new(
-                shuli::ErrorKind::ConnectFailed,
+            shuli_core::WifiError::new(
+                shuli_core::ErrorKind::ConnectFailed,
                 "shutdown before connection established",
             )
         }))
@@ -171,10 +171,10 @@ async fn run(config_path: &Path) -> Result<(), shuli::WifiError> {
 /// retrying otherwise. Returns whether any connection was ever
 /// established.
 async fn run_wifi_interfaces(
-    mut client: shuli::WifiClient,
+    mut client: shuli_wifi::WifiClient,
     groups: Vec<(String, Vec<config::WifiEntry>)>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<bool, shuli::WifiError> {
+) -> Result<bool, shuli_core::WifiError> {
     // SSID whose IP config was last applied per interface; lets us
     // re-apply when a later connection lands on a different configured
     // network.
@@ -193,8 +193,8 @@ async fn run_wifi_interfaces(
                     Ok(run_result) => {
                         let iface_name = &run_result.iface_name;
                         match run_result.state {
-                        shuli::WifiState::ConnectedWithoutOffloadRekey
-                        | shuli::WifiState::ConnectedWithOffloadRekey => {
+                        shuli_wifi::WifiState::ConnectedWithoutOffloadRekey
+                        | shuli_wifi::WifiState::ConnectedWithOffloadRekey => {
                             connected = true;
                             let Some(ssid) =
                                 client.current_ssid(iface_name)
@@ -252,12 +252,12 @@ async fn run_wifi_interfaces(
                                 }
                             }
                         }
-                        shuli::WifiState::Failed => {
+                        shuli_wifi::WifiState::Failed => {
                             log::warn!(
                                 "connection failed on {iface_name} - retrying"
                             );
                         }
-                        shuli::WifiState::FailedAuthentication => {
+                        shuli_wifi::WifiState::FailedAuthentication => {
                             log::warn!(
                                 "authentication failed on {iface_name} - \
                                  retrying in 10 minutes"
@@ -277,7 +277,7 @@ async fn run_wifi_interfaces(
 /// available wifi interface via nispor.
 async fn resolve_iface_name(
     interface: Option<&str>,
-) -> Result<String, shuli::WifiError> {
+) -> Result<String, shuli_core::WifiError> {
     if let Some(name) = interface
         && name != "any"
     {
@@ -289,8 +289,8 @@ async fn resolve_iface_name(
     let np_state = nispor::NetState::retrieve_with_filter_async(&filter)
         .await
         .map_err(|e| {
-            shuli::WifiError::new(
-                shuli::ErrorKind::Nl80211,
+            shuli_core::WifiError::new(
+                shuli_core::ErrorKind::Nl80211,
                 format!("nispor: {e}"),
             )
         })?;
@@ -299,8 +299,8 @@ async fn resolve_iface_name(
             return Ok(np_iface.name.to_string());
         }
     }
-    Err(shuli::WifiError::new(
-        shuli::ErrorKind::InterfaceNotFound,
+    Err(shuli_core::WifiError::new(
+        shuli_core::ErrorKind::InterfaceNotFound,
         "no wifi interface found",
     ))
 }
@@ -313,7 +313,7 @@ async fn apply_network_config(
     dns_cfg: Option<&config::DnsConfig>,
     ipv4: Option<&config::IpConfig>,
     ipv6: Option<&config::IpConfig>,
-) -> Result<(), shuli::WifiError> {
+) -> Result<(), shuli_core::WifiError> {
     let mut dns = dns_cfg.cloned();
 
     // IPv4: static or DHCP.
@@ -343,11 +343,12 @@ async fn apply_network_config(
 async fn run_wired_interface(
     entry: &config::EthernetEntry,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<bool, shuli::WifiError> {
+) -> Result<bool, shuli_core::WifiError> {
     let eap = entry.eap.to_lib();
     let mut connected = false;
     loop {
-        let mut client = match shuli::WiredClient::init(&entry.name, &eap) {
+        let mut client = match shuli_wired::WiredClient::init(&entry.name, &eap)
+        {
             Ok(client) => client,
             Err(e) => {
                 log::warn!("wired 802.1X init {} failed: {e}", entry.name);
@@ -366,7 +367,7 @@ async fn run_wired_interface(
                 }
                 result = client.run() => {
                     match result {
-                        Ok(shuli::WiredState::Connected) => {
+                        Ok(shuli_wired::WiredState::Connected) => {
                             connected = true;
                             log::info!(
                                 "wired 802.1X authorized on {} - link up",
@@ -390,7 +391,7 @@ async fn run_wired_interface(
                             let _ = shutdown_rx.changed().await;
                             return Ok(connected);
                         }
-                        Ok(shuli::WiredState::Failed) => {
+                        Ok(shuli_wired::WiredState::Failed) => {
                             log::warn!(
                                 "wired 802.1X failed on {}; retrying",
                                 entry.name
@@ -450,9 +451,9 @@ mod tests {
             hidden: false,
             prefered: false,
             roaming: true,
-            roaming_threshold: shuli::DEFAULT_ROAM_THRESHOLD_DBM,
+            roaming_threshold: shuli_wifi::DEFAULT_ROAM_THRESHOLD_DBM,
             switch_ssid_lower_than_dbm:
-                shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
+                shuli_wifi::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
             wowlan: false,
             eap: None,
             sae_pwe: config::SaePweConfig::Auto,

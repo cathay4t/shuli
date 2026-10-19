@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "src/lib",
+    "src/core",
+    "src/wifi",
+    "src/wired",
     "src/daemon",
 ]
 
@@ -14,6 +16,9 @@ documentation = "https://github.com/cathay4t/shuli"
 repository = "https://github.com/cathay4t/shuli"
 
 [workspace.dependencies]
+shuli-core = { path = "src/core" }
+shuli-wifi = { path = "src/wifi" }
+shuli-wired = { path = "src/wired" }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

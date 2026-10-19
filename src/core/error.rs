@@ -108,6 +108,7 @@ impl fmt::Display for WifiError {
 
 impl std::error::Error for WifiError {}
 
+#[cfg(feature = "netlink")]
 impl From<wl_nl80211::Nl80211Error> for WifiError {
     fn from(e: wl_nl80211::Nl80211Error) -> Self {
         WifiError::new(ErrorKind::Nl80211, e.to_string())
@@ -120,6 +121,7 @@ impl From<std::io::Error> for WifiError {
     }
 }
 
+#[cfg(feature = "netlink")]
 impl From<netlink_packet_core::DecodeError> for WifiError {
     fn from(e: netlink_packet_core::DecodeError) -> Self {
         WifiError::new(ErrorKind::NetlinkDecode, e.to_string())

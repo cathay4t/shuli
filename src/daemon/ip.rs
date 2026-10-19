@@ -7,7 +7,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use shuli::{ErrorKind, WifiError};
+use shuli_core::{ErrorKind, WifiError};
 
 use crate::config::{DnsConfig, IpConfig};
 

@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! WiFi (WPA) authentication library.
+
 mod auth;
 mod client;
 mod config;
 mod crypto;
-mod eap;
-mod eap_tls;
-mod error;
 mod nl80211;
 mod pmksa;
 mod roam;
 mod scan;
-mod wired;
 
 #[cfg(test)]
 mod tests;
 
+pub use shuli_core::{EapConfig, ErrorKind, WifiError};
+pub(crate) use shuli_core::{eap, eap_tls};
 pub(crate) use wl_nl80211::ETH_ALEN;
 pub use wl_nl80211::Ieee80211CipherSuite;
 
@@ -24,10 +24,7 @@ pub use self::{
     client::{WifiClient, WifiIfaceState, WifiState},
     config::{
         DEFAULT_ROAM_THRESHOLD_DBM, DEFAULT_SWITCH_SSID_LOWER_THAN_DBM,
-        EapConfig, KnownBss, NetworkConfig, NetworkConfigHints, SaePwe,
-        WifiConfig,
+        KnownBss, NetworkConfig, NetworkConfigHints, SaePwe, WifiConfig,
     },
-    error::{ErrorKind, WifiError},
     scan::{BssInfo, SecurityType},
-    wired::{WiredClient, WiredState},
 };

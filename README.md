@@ -2,8 +2,9 @@
 
 **Linux WiFi authentication library and daemon in Rust**
 
-The `shuli` crate and `shulid` daemon authenticates a Linux station (client) to
-modern WiFi networks written entirely in Rust.
+The `shuli-wifi` and `shuli-wired` crates and the `shulid` daemon authenticate
+a Linux station (client) to modern WiFi and wired 802.1X networks, written
+entirely in Rust.
 
 ## Features
 
@@ -20,9 +21,17 @@ modern WiFi networks written entirely in Rust.
 * **Hardening** - WoWLAN (opt-in), OCV, Extended Key ID, Transition
   Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
   CMAC-128).
-* **Rust crate** - Async crate for WIFI authentication.
+* **Rust crates** - Async `shuli-wifi` and `shuli-wired` libraries with a
+  shared `shuli-core` EAP engine.
 * **shulid daemon** - YAML configuration, one client per network
   namespace, systemd unit, handling both WIFI and IP config.
+
+## Workspace layout
+
+* `shuli-core` - shared errors, EAP/EAP-TLS, EAPOL framing, and `EapConfig`.
+* `shuli-wifi` - WiFi/WPA client.
+* `shuli-wired` - wired 802.1X/EAP client (MACsec/MKA planned).
+* `shulid` - the daemon.
 
 ## Using the daemon for simple WiFi configuration
 

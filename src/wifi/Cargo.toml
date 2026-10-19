@@ -1,6 +1,6 @@
 [package]
-name = "shuli"
-description = "WiFi authentication library (WPA3-SAE, OWE, open)"
+name = "shuli-wifi"
+description = "WiFi authentication library (WPA3-SAE, OWE, WPA-Enterprise)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,12 +11,12 @@ repository.workspace = true
 # integration tests in the tests/ directory.
 autotests = false
 
-
 [lib]
-name = "shuli"
+name = "shuli_wifi"
 path = "lib.rs"
 
 [dependencies]
+shuli-core = { workspace = true, features = ["netlink"] }
 wl-nl80211.workspace = true
 tokio.workspace = true
 log.workspace = true
@@ -30,7 +30,6 @@ p256.workspace = true
 getrandom.workspace = true
 aws-lc-rs.workspace = true
 libc.workspace = true
-rustls.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

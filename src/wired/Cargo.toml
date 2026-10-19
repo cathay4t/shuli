@@ -1,0 +1,26 @@
+[package]
+name = "shuli-wired"
+description = "Wired 802.1X (EAPOL) and MACsec/MKA for shuli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+# Tests are unit tests declared as `mod tests` in lib.rs, not
+# integration tests in the tests/ directory.
+autotests = false
+
+[lib]
+name = "shuli_wired"
+path = "lib.rs"
+
+[dependencies]
+shuli-core.workspace = true
+tokio.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+env_logger.workspace = true

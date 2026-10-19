@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use netlink_packet_core::{NetlinkPayload, Nla};
+use shuli_core::eapol::EapolEapFrame;
 use wl_nl80211::{
     Ieee80211ActionFrame, Ieee80211AkmSuite, Ieee80211AuthFrame,
-    Ieee80211EapolEapFrame, Ieee80211EapolFrame, Ieee80211EapolKeyFrame,
-    Ieee80211Frame, Nl80211Attr, Nl80211AuthType, Nl80211Command,
-    Nl80211Message, Nl80211UseMfp, Nl80211WowlanWakeup, ft_psk_ie_cipher,
-    ft_sae_ext_key_ie_cipher, ft_sae_ie_cipher, owe_ie_cipher,
-    rsne_set_ext_key_id, rsne_set_ocvc, sae_ext_key_ie_cipher, sae_ie_cipher,
-    wpa2_ent_ie_cipher, wpa2_ent_sha256_ie_cipher, wpa2_psk_ie_cipher,
-    wpa2_psk_sha256_ie_cipher,
+    Ieee80211EapolFrame, Ieee80211EapolKeyFrame, Ieee80211Frame, Nl80211Attr,
+    Nl80211AuthType, Nl80211Command, Nl80211Message, Nl80211UseMfp,
+    Nl80211WowlanWakeup, ft_psk_ie_cipher, ft_sae_ext_key_ie_cipher,
+    ft_sae_ie_cipher, owe_ie_cipher, rsne_set_ext_key_id, rsne_set_ocvc,
+    sae_ext_key_ie_cipher, sae_ie_cipher, wpa2_ent_ie_cipher,
+    wpa2_ent_sha256_ie_cipher, wpa2_psk_ie_cipher, wpa2_psk_sha256_ie_cipher,
 };
 
 use super::{
@@ -1243,7 +1243,7 @@ impl WifiIface {
     pub(crate) async fn handle_control_port_frame(&mut self, frame: &[u8]) {
         // 802.1X EAP frames (EAPOL type 0) arrive on the
         // same control port as EAPOL-Key frames.
-        if let Some(eap) = Ieee80211EapolEapFrame::parse(frame) {
+        if let Some(eap) = EapolEapFrame::parse(frame) {
             self.handle_eap_frame(&eap.payload).await;
             return;
         }
@@ -1830,7 +1830,7 @@ impl WifiIface {
         };
         match peer.handle_packet(&packet) {
             Ok(EapAction::Respond(response)) => {
-                let frame = Ieee80211EapolEapFrame::build(&response);
+                let frame = EapolEapFrame::build(&response);
                 if let Err(e) = self
                     .core
                     .nl
@@ -1867,6 +1867,7 @@ impl WifiIface {
                 ));
             }
             Ok(EapAction::Wait) => {}
+            Ok(_) => {}
             Err(e) => {
                 log::warn!("EAP error: {e}");
                 self.fail_auth(WifiError::new(

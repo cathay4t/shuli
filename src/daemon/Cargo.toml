@@ -13,7 +13,9 @@ name = "shulid"
 path = "main.rs"
 
 [dependencies]
-shuli = { version = "0.3", path = "../lib" }
+shuli-core.workspace = true
+shuli-wifi.workspace = true
+shuli-wired.workspace = true
 tokio.workspace = true
 log.workspace = true
 env_logger.workspace = true

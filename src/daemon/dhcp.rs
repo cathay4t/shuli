@@ -10,7 +10,7 @@
 use std::net::IpAddr;
 
 use mozim::{DhcpV4Client, DhcpV4Config, DhcpV4Lease, DhcpV4State};
-use shuli::{ErrorKind, WifiError};
+use shuli_core::{ErrorKind, WifiError};
 
 use crate::config::DnsConfig;
 

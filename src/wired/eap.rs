@@ -13,15 +13,13 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use tokio::io::unix::AsyncFd;
-use wl_nl80211::Ieee80211EapolEapFrame;
-
-use crate::{
-    ErrorKind, WifiError,
-    config::EapConfig,
+use shuli_core::{
+    EapConfig, ErrorKind, WifiError,
     eap::{EapAction, EapPacket, EapPeer},
     eap_tls::EapTlsMethod,
+    eapol::EapolEapFrame,
 };
+use tokio::io::unix::AsyncFd;
 
 /// PAE group address used for EAPOL on wired links (802.1X-2010).
 const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x03];
@@ -138,7 +136,7 @@ impl WiredClient {
     /// Feed one received EAPOL frame into the EAP peer and send the
     /// response (if any).
     fn handle_eapol(&mut self, frame: &[u8]) -> Result<(), WifiError> {
-        let Some(eap) = Ieee80211EapolEapFrame::parse(frame) else {
+        let Some(eap) = EapolEapFrame::parse(frame) else {
             log::debug!("ignoring non-EAP EAPOL frame ({} bytes)", frame.len());
             return Ok(());
         };
@@ -152,7 +150,7 @@ impl WiredClient {
                     self.fd.as_raw_fd(),
                     self.if_index,
                     &self.mac,
-                    &Ieee80211EapolEapFrame::build(&response),
+                    &EapolEapFrame::build(&response),
                 )?;
             }
             EapAction::Success => {
@@ -170,6 +168,7 @@ impl WiredClient {
                 self.state = WiredState::Failed;
             }
             EapAction::Wait => {}
+            _ => {}
         }
         Ok(())
     }

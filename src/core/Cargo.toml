@@ -1,0 +1,25 @@
+[package]
+name = "shuli-core"
+description = "Shared 802.1X/EAP core for shuli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+# Tests are unit tests declared as `mod tests` in lib.rs.
+autotests = false
+
+[lib]
+name = "shuli_core"
+path = "lib.rs"
+
+[dependencies]
+log.workspace = true
+rustls.workspace = true
+wl-nl80211 = { workspace = true, optional = true }
+netlink-packet-core = { workspace = true, optional = true }
+
+[features]
+default = []
+netlink = ["dep:wl-nl80211", "dep:netlink-packet-core"]

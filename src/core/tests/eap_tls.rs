@@ -21,11 +21,11 @@ use crate::{
 
 /// Self-signed test CA / server / client certificates (test fixtures
 /// only - generated once with openssl, never used in production).
-const CA_PEM: &str = include_str!("certs/ca.pem");
-const SERVER_PEM: &str = include_str!("certs/server.pem");
-const SERVER_KEY_PEM: &str = include_str!("certs/server.key");
-const CLIENT_PEM: &str = include_str!("certs/client.pem");
-const CLIENT_KEY_PEM: &str = include_str!("certs/client.key");
+const CA_PEM: &str = include_str!("../../../testdata/certs/ca.pem");
+const SERVER_PEM: &str = include_str!("../../../testdata/certs/server.pem");
+const SERVER_KEY_PEM: &str = include_str!("../../../testdata/certs/server.key");
+const CLIENT_PEM: &str = include_str!("../../../testdata/certs/client.pem");
+const CLIENT_KEY_PEM: &str = include_str!("../../../testdata/certs/client.key");
 const SERVER_NAME: &str = "eap-tls.test";
 
 fn client_method() -> EapTlsMethod {

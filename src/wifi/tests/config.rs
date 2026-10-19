@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Ieee80211CipherSuite, SecurityType,
-    config::{
-        EapConfig, KnownBss, NetworkConfig, NetworkConfigHints, WifiConfig,
-    },
+    EapConfig, Ieee80211CipherSuite, SecurityType,
+    config::{KnownBss, NetworkConfig, NetworkConfigHints, WifiConfig},
 };
 
 #[test]
@@ -261,13 +259,12 @@ fn security_type_serde_uses_stable_names() {
 fn eap_config_defaults_to_none_and_can_be_set() {
     let mut network = NetworkConfig::new("Enterprise-WIFI");
     assert!(network.eap.is_none(), "EAP credentials must be opt-in");
-    let eap = EapConfig {
-        identity: "user@example.org".to_string(),
-        ca_cert: Some("/etc/shuli/ca.pem".into()),
-        client_cert: Some("/etc/shuli/client.pem".into()),
-        client_key: Some("/etc/shuli/client.key".into()),
-        server_name: Some("radius.example.org".to_string()),
-    };
+    let mut eap = EapConfig::default();
+    eap.identity = "user@example.org".to_string();
+    eap.ca_cert = Some("/etc/shuli/ca.pem".into());
+    eap.client_cert = Some("/etc/shuli/client.pem".into());
+    eap.client_key = Some("/etc/shuli/client.key".into());
+    eap.server_name = Some("radius.example.org".to_string());
     network.set_eap(eap);
     let eap = network.eap.as_ref().expect("EAP config set");
     assert_eq!(eap.identity, "user@example.org");

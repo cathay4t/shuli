@@ -24,12 +24,12 @@ use crate::{
 /// EAP-TLS flags (RFC 5216 §2.1).
 pub(crate) const EAP_TLS_FLAG_L: u8 = 0x80;
 pub(crate) const EAP_TLS_FLAG_M: u8 = 0x40;
-pub(crate) const EAP_TLS_FLAG_START: u8 = 0x20;
+pub const EAP_TLS_FLAG_START: u8 = 0x20;
 
 /// Build an EAP-TLS message body from TLS data.  Empty data produces
 /// the one-octet ACK (flags = 0, no TLS data; RFC 5216 §2.1,
 /// `eap_peer_tls_build_ack` in wpa_supplicant).
-pub(crate) fn build_tls_message(data: &[u8]) -> Vec<u8> {
+pub fn build_tls_message(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return vec![0];
     }
@@ -41,7 +41,7 @@ pub(crate) fn build_tls_message(data: &[u8]) -> Vec<u8> {
 }
 
 /// Parse an EAP-TLS message body into (flags, TLS data).
-pub(crate) fn parse_tls_message(body: &[u8]) -> Result<(u8, &[u8]), WifiError> {
+pub fn parse_tls_message(body: &[u8]) -> Result<(u8, &[u8]), WifiError> {
     if body.is_empty() {
         return Ok((0, &[]));
     }
@@ -81,16 +81,12 @@ pub(crate) fn client_config(
 }
 
 /// Parse a PEM certificate (first certificate in the file).
-pub(crate) fn cert_from_pem(
-    pem: &str,
-) -> Result<CertificateDer<'static>, WifiError> {
+pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>, WifiError> {
     CertificateDer::from_pem_slice(pem.as_bytes()).map_err(tls_err)
 }
 
 /// Parse a PEM private key.
-pub(crate) fn key_from_pem(
-    pem: &str,
-) -> Result<PrivateKeyDer<'static>, WifiError> {
+pub fn key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>, WifiError> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(tls_err)
 }
 
@@ -100,7 +96,7 @@ fn tls_err(e: impl std::fmt::Display) -> WifiError {
 
 /// The EAP-TLS method: drives a rustls client connection over EAP
 /// fragments and exports the RFC 9190 MSK.
-pub(crate) struct EapTlsMethod {
+pub struct EapTlsMethod {
     conn: Option<ClientConnection>,
     config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
@@ -114,7 +110,7 @@ pub(crate) struct EapTlsMethod {
 }
 
 impl EapTlsMethod {
-    pub(crate) fn new(
+    pub fn new(
         config: Arc<ClientConfig>,
         server_name: &str,
     ) -> Result<Self, WifiError> {
@@ -133,7 +129,7 @@ impl EapTlsMethod {
 
     /// Build the method from an [`EapConfig`] (certificate PEM files on
     /// disk).  Identity is handled by the [`EapPeer`](crate::eap::EapPeer).
-    pub(crate) fn from_config(config: &EapConfig) -> Result<Self, WifiError> {
+    pub fn from_config(config: &EapConfig) -> Result<Self, WifiError> {
         let read_pem = |path: &std::path::Path, what: &str| {
             std::fs::read_to_string(path).map_err(|e| {
                 WifiError::new(

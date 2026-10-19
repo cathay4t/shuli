@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use shuli::{ErrorKind, WifiError};
+use shuli_core::{ErrorKind, WifiError};
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,8 +28,8 @@ pub(crate) struct ShuliConfig {
 }
 
 /// SAE PWE derivation mode as configured in the YAML file. Kept as its
-/// own serde type (the `shuli` library does not depend on serde); maps
-/// onto `shuli::SaePwe`.
+/// own serde type (the `shuli-wifi` library does not depend on serde); maps
+/// onto `shuli_wifi::SaePwe`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SaePweConfig {
@@ -43,11 +43,11 @@ pub(crate) enum SaePweConfig {
 }
 
 impl SaePweConfig {
-    fn to_lib(self) -> shuli::SaePwe {
+    fn to_lib(self) -> shuli_wifi::SaePwe {
         match self {
-            SaePweConfig::Auto => shuli::SaePwe::Auto,
-            SaePweConfig::H2e => shuli::SaePwe::H2E,
-            SaePweConfig::Hnp => shuli::SaePwe::HnP,
+            SaePweConfig::Auto => shuli_wifi::SaePwe::Auto,
+            SaePweConfig::H2e => shuli_wifi::SaePwe::H2E,
+            SaePweConfig::Hnp => shuli_wifi::SaePwe::HnP,
         }
     }
 }
@@ -70,7 +70,7 @@ pub(crate) struct WifiEntry {
     #[serde(default)]
     pub hidden: bool,
     /// Preferred SSID for scan-result selection: when found with a signal
-    /// at or above `shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`, this
+    /// at or above `shuli_wifi::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM`, this
     /// network is chosen before a stronger BSS of another configured
     /// SSID. Defaults to `false`.
     #[serde(default)]
@@ -128,7 +128,7 @@ pub(crate) struct WifiEntry {
 }
 
 /// EAP credential settings as configured in the YAML file; mapped onto
-/// `shuli::EapConfig`.
+/// `shuli_core::EapConfig`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct EapEntry {
     #[serde(default)]
@@ -144,8 +144,8 @@ pub(crate) struct EapEntry {
 }
 
 impl EapEntry {
-    pub(crate) fn to_lib(&self) -> shuli::EapConfig {
-        let mut eap = shuli::EapConfig::default();
+    pub(crate) fn to_lib(&self) -> shuli_core::EapConfig {
+        let mut eap = shuli_core::EapConfig::default();
         eap.identity = self.identity.clone();
         eap.ca_cert = self.ca_cert.as_ref().map(PathBuf::from);
         eap.client_cert = self.client_cert.as_ref().map(PathBuf::from);
@@ -216,10 +216,10 @@ impl ShuliConfig {
     pub(crate) fn wifi_config_for_entries(
         iface_name: &str,
         entries: &[WifiEntry],
-    ) -> shuli::WifiConfig {
-        let mut config = shuli::WifiConfig::new(iface_name);
+    ) -> shuli_wifi::WifiConfig {
+        let mut config = shuli_wifi::WifiConfig::new(iface_name);
         for entry in entries {
-            let mut network = shuli::NetworkConfig::new(&entry.ssid);
+            let mut network = shuli_wifi::NetworkConfig::new(&entry.ssid);
             if let Some(password) = entry.password.as_deref() {
                 network.set_password(password);
             }
@@ -249,11 +249,11 @@ fn default_roaming() -> bool {
 }
 
 fn default_roam_threshold() -> i32 {
-    shuli::DEFAULT_ROAM_THRESHOLD_DBM
+    shuli_wifi::DEFAULT_ROAM_THRESHOLD_DBM
 }
 
 fn default_roam_critical_threshold() -> i32 {
-    shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
+    shuli_wifi::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
 }
 
 /// Deserialize an optional colon-separated MAC address
@@ -355,7 +355,7 @@ wifis:
         // The critical threshold keeps its -80 default unless set.
         assert_eq!(
             network.switch_ssid_lower_than_dbm,
-            shuli::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
+            shuli_wifi::DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
         );
     }
 
