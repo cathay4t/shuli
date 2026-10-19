@@ -37,6 +37,7 @@ pub(crate) const MI_LEN: usize = 12;
 pub(crate) const MKA_HELLO_SECS: u64 = 2;
 pub(crate) const MKA_LIFE_SECS: u64 = 6;
 pub(crate) const ALGO_AGILITY: [u8; 4] = [0x00, 0x80, 0xc2, 0x01];
+pub(crate) const MACSEC_CAP_NOT_IMPLEMENTED: u8 = 0;
 pub(crate) const MACSEC_CAP_INTEGRITY_CONFIDENTIALITY: u8 = 2;
 /// PendingPNExhaustion for 32-bit packet numbers (802.1X-2020 9.8).
 pub(crate) const PN_EXHAUSTION: u32 = 0xC000_0000;
@@ -673,6 +674,8 @@ struct Peer {
     sci: [u8; 8],
     priority: u8,
     key_server: bool,
+    macsec_desired: bool,
+    macsec_capability: u8,
     live: bool,
     last_seen: Instant,
     rx_ready: bool,
@@ -930,6 +933,13 @@ impl MkaSession {
             );
             return Ok(());
         }
+        if pdu.basic.algo_agility != ALGO_AGILITY {
+            log::debug!(
+                "ignoring MKPDU with unsupported algorithm agility {:02x?}",
+                pdu.basic.algo_agility
+            );
+            return Ok(());
+        }
 
         let now = Instant::now();
         let peer_idx = self.find_peer(&pdu.basic.mi);
@@ -943,6 +953,8 @@ impl MkaSession {
                     sci: pdu.basic.sci,
                     priority: pdu.basic.priority,
                     key_server: pdu.basic.key_server,
+                    macsec_desired: pdu.basic.macsec_desired,
+                    macsec_capability: pdu.basic.macsec_capability,
                     live: false,
                     last_seen: now,
                     rx_ready: false,
@@ -958,11 +970,15 @@ impl MkaSession {
             || peer.sci != pdu.basic.sci
             || peer.priority != pdu.basic.priority
             || peer.key_server != pdu.basic.key_server
+            || peer.macsec_desired != pdu.basic.macsec_desired
+            || peer.macsec_capability != pdu.basic.macsec_capability
             || !peer.live;
         peer.mn = pdu.basic.mn;
         peer.sci = pdu.basic.sci;
         peer.priority = pdu.basic.priority;
         peer.key_server = pdu.basic.key_server;
+        peer.macsec_desired = pdu.basic.macsec_desired;
+        peer.macsec_capability = pdu.basic.macsec_capability;
         peer.last_seen = now;
         if changed {
             self.need_send = true;
@@ -1009,6 +1025,8 @@ impl MkaSession {
                     sci: [0u8; 8],
                     priority: 0xff,
                     key_server: false,
+                    macsec_desired: false,
+                    macsec_capability: MACSEC_CAP_NOT_IMPLEMENTED,
                     live: false,
                     last_seen: now,
                     rx_ready: false,
@@ -1175,6 +1193,15 @@ impl MkaSession {
         self.key_server_sci != [0u8; 8] && sci == &self.key_server_sci
     }
 
+    /// 802.1X-2020 9.6: MACsec is only used when the Key Server and
+    /// every live participant are MACsec capable.
+    fn peers_support_macsec(&self) -> bool {
+        self.peers
+            .iter()
+            .filter(|peer| peer.live)
+            .all(|peer| peer.macsec_capability != MACSEC_CAP_NOT_IMPLEMENTED)
+    }
+
     /// Once the last live peer is gone the association is no longer
     /// alive: stop claiming Connected and drop the installed SAs.
     async fn drop_unsecure_sak(&mut self) -> Result<(), WifiError> {
@@ -1269,6 +1296,13 @@ impl MkaSession {
 
     async fn ensure_sak(&mut self) -> Result<(), WifiError> {
         if !self.is_key_server || !self.has_live_peer() {
+            return Ok(());
+        }
+        if !self.peers_support_macsec() {
+            log::debug!(
+                "MKA: a live peer does not support MACsec; no SAK will be \
+                 distributed"
+            );
             return Ok(());
         }
         let current_is_ours = self.lki.is_some_and(|ki| ki.mi == self.mi);
@@ -1422,6 +1456,8 @@ mod tests {
             sci,
             priority: 0xff,
             key_server: false,
+            macsec_desired: true,
+            macsec_capability: MACSEC_CAP_INTEGRITY_CONFIDENTIALITY,
             live: true,
             last_seen: Instant::now(),
             rx_ready: true,
@@ -1507,6 +1543,64 @@ mod tests {
             .unwrap();
         assert_ne!(session.mi, old_mi);
         assert_eq!(session.mn, 1);
+    }
+
+    #[tokio::test]
+    async fn test_key_server_requires_macsec_capable_peers() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        session.is_key_server = true;
+        let mut peer =
+            live_peer(0x44, [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0, 1]);
+        peer.macsec_capability = MACSEC_CAP_NOT_IMPLEMENTED;
+        session.peers.push(peer);
+        session.ensure_sak().await.unwrap();
+        assert!(
+            session.lki.is_none(),
+            "must not distribute a SAK to a non-MACsec peer"
+        );
+
+        session.peers[0].macsec_capability =
+            MACSEC_CAP_INTEGRITY_CONFIDENTIALITY;
+        session.ensure_sak().await.unwrap();
+        assert!(session.lki.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_algorithm_agility_is_ignored() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        let src = [0x02, 0, 0, 0, 0, 3];
+        let pdu = MkaPdu {
+            basic: MkaBasic {
+                version: MKA_VERSION,
+                priority: 0xff,
+                key_server: false,
+                macsec_desired: true,
+                macsec_capability: MACSEC_CAP_INTEGRITY_CONFIDENTIALITY,
+                sci: [0xde, 0xad, 0xbe, 0xef, 0, 1, 0, 1],
+                mi: [0x55; MI_LEN],
+                mn: 1,
+                algo_agility: [0, 0, 0, 0],
+                ckn: session.ckn.clone(),
+            },
+            live_peers: Vec::new(),
+            potential_peers: Vec::new(),
+            sak_use: None,
+            dist_sak: None,
+        };
+        let payload = pdu
+            .build_eapol(&PAE_GROUP_ADDR, &src, &session.ick)
+            .unwrap();
+        session
+            .handle_frame(crate::eap::EapolFrame {
+                src,
+                dst: PAE_GROUP_ADDR,
+                payload,
+            })
+            .await
+            .unwrap();
+        assert!(session.peers.is_empty());
     }
 
     #[tokio::test]
@@ -1633,16 +1727,7 @@ mod tests {
         session.ltx = true;
         assert!(!session.secured(), "no live peer means not secured");
 
-        session.peers.push(Peer {
-            mi: [2; MI_LEN],
-            mn: 1,
-            sci: [2, 0, 0, 0, 0, 1, 0, 1],
-            priority: 0xff,
-            key_server: false,
-            live: true,
-            last_seen: Instant::now(),
-            rx_ready: true,
-        });
+        session.peers.push(live_peer(2, [2, 0, 0, 0, 0, 1, 0, 1]));
         assert!(session.secured());
 
         session.peers.clear();
