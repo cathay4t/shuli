@@ -390,15 +390,11 @@ impl MkaPdu {
             let data = &body[start..end];
             match type_ {
                 1 => {
-                    let (ssci_len, peer_count) = if length % 16 == 1 {
-                        (1, (length - 1) / 16)
-                    } else if length.is_multiple_of(16) {
-                        (0, length / 16)
-                    } else {
+                    if !length.is_multiple_of(16) {
                         return Err(mka_err("invalid Live Peer List length"));
-                    };
+                    }
                     let _ = octet2; // Key Server SSCI (XPN only)
-                    live_peers = read_peers(data, ssci_len, peer_count);
+                    live_peers = read_peers(data, 0, length / 16);
                 }
                 2 => {
                     if !length.is_multiple_of(16) {
@@ -509,12 +505,14 @@ impl MkaPdu {
         }
 
         if !self.live_peers.is_empty() {
-            let length = 1 + self.live_peers.len() * 16;
+            // IEEE 802.1X-2020 Figure 11-9: the Key Server SSCI is
+            // octet 2 of the parameter set header and is not part of
+            // the body, so the body is exactly 16 octets per peer.
+            let length = self.live_peers.len() * 16;
             body.push(1);
-            body.push(0);
+            body.push(0); // Key Server SSCI (XPN only)
             body.push(((length >> 8) & 0x0f) as u8);
             body.push(length as u8);
-            body.push(0); // Key Server SSCI (XPN only)
             for peer in &self.live_peers {
                 body.extend_from_slice(&peer.mi);
                 body.extend_from_slice(&peer.mn.to_be_bytes());
@@ -1392,6 +1390,49 @@ mod tests {
             .unwrap()
             .expect("MKA frame");
         assert_eq!(parsed, pdu);
+    }
+
+    #[test]
+    fn test_live_peer_list_encoding() {
+        // IEEE 802.1X-2020 Figure 11-9: the Live Peer List body is
+        // exactly 16 octets per peer; the Key Server SSCI is octet 2
+        // of the parameter set header, not part of the body.
+        let ick = [0x42u8; 16];
+        let peer = PeerId {
+            mi: [0x11; MI_LEN],
+            mn: 7,
+        };
+        let pdu = MkaPdu {
+            basic: MkaBasic {
+                version: MKA_VERSION,
+                priority: 0x10,
+                key_server: true,
+                macsec_desired: true,
+                macsec_capability: MACSEC_CAP_INTEGRITY_CONFIDENTIALITY,
+                sci: [1, 2, 3, 4, 5, 6, 0, 1],
+                mi: [7u8; MI_LEN],
+                mn: 1,
+                algo_agility: ALGO_AGILITY,
+                ckn: b"ckn".to_vec(),
+            },
+            live_peers: vec![peer],
+            potential_peers: Vec::new(),
+            sak_use: None,
+            dist_sak: None,
+        };
+        let frame = pdu
+            .build_eapol(&PAE_GROUP_ADDR, &[2, 0, 0, 0, 0, 1], &ick)
+            .unwrap();
+        let body = &frame[4..];
+        let basic_len = (((body[2] & 0x0f) as usize) << 8) | body[3] as usize;
+        let pos = 4 + align4(basic_len);
+        assert_eq!(body[pos], 1, "Live Peer List type");
+        assert_eq!(body[pos + 1], 0, "Key Server SSCI");
+        let length =
+            (((body[pos + 2] & 0x0f) as usize) << 8) | body[pos + 3] as usize;
+        assert_eq!(length, 16, "body length must be 16 * peer count");
+        assert_eq!(&body[pos + 4..pos + 16], &peer.mi);
+        assert_eq!(&body[pos + 16..pos + 20], &peer.mn.to_be_bytes());
     }
 
     #[test]
