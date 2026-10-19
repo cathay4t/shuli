@@ -599,13 +599,14 @@ impl MkaPdu {
 }
 
 /// MACsec/MKA configuration for one wired port.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MacsecConfig {
     /// Connectivity Association Key: 16 or 32 octets.
     pub cak: Vec<u8>,
     /// Connectivity Association Key Name: 1..=32 octets.
     pub ckn: Vec<u8>,
-    /// Key Server Priority (lower wins). 0xFF never becomes Key Server.
+    /// Key Server Priority (lower wins). Use 0xFF when
+    /// `can_be_key_server` is false.
     pub key_server_priority: u8,
     /// Whether this participant may be elected Key Server.
     pub can_be_key_server: bool,
@@ -636,7 +637,8 @@ impl MacsecConfig {
         self.macsec_iface.as_deref().unwrap_or(DEFAULT_MACSEC_IFACE)
     }
 
-    fn validate(&self) -> Result<(), WifiError> {
+    /// Validate the CAK/CKN sizes.
+    pub fn validate(&self) -> Result<(), WifiError> {
         if !matches!(self.cak.len(), 16 | 32) {
             return Err(mka_err(format!(
                 "MKA CAK must be 16 or 32 octets, got {}",
@@ -664,6 +666,20 @@ impl Default for MacsecConfig {
             replay_window: 0,
             encrypt: true,
         }
+    }
+}
+
+impl std::fmt::Debug for MacsecConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacsecConfig")
+            .field("cak_len", &self.cak.len())
+            .field("ckn_len", &self.ckn.len())
+            .field("key_server_priority", &self.key_server_priority)
+            .field("can_be_key_server", &self.can_be_key_server)
+            .field("macsec_iface", &self.macsec_iface)
+            .field("replay_window", &self.replay_window)
+            .field("encrypt", &self.encrypt)
+            .finish()
     }
 }
 
@@ -1734,6 +1750,16 @@ mod tests {
         session.drop_unsecure_sak().await.unwrap();
         assert!(session.lki.is_none());
         assert!(!session.secured());
+    }
+
+    #[test]
+    fn test_macsec_config_debug_redacts_keys() {
+        let config = MacsecConfig::new(vec![0xab; 16], vec![0xcd; 4]);
+        let text = format!("{config:?}");
+        assert!(!text.contains("171"), "CAK bytes leaked: {text}");
+        assert!(!text.contains("205"), "CKN bytes leaked: {text}");
+        assert!(text.contains("cak_len"));
+        assert!(text.contains("ckn_len"));
     }
 
     #[test]

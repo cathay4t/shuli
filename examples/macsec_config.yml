@@ -12,7 +12,8 @@ ethernets:
       cak: "00112233445566778899aabbccddeeff"
       # Connectivity Association Key Name: 1..32 octets, hex encoded.
       ckn: "00112233445566778899aabbccddeeff"
-      # Lower values win the Key Server election. 255 never becomes
+      # Lower values win the Key Server election. Leave
+      # can_be_key_server false (with priority 255) to never act as
       # Key Server.
       key_server_priority: 16
       can_be_key_server: true

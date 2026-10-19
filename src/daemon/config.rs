@@ -21,8 +21,8 @@ pub(crate) struct ShuliConfig {
     pub version: u32,
     #[serde(default)]
     pub wifis: Vec<WifiEntry>,
-    /// Wired 802.1X ports: each entry authenticates one
-    /// Ethernet interface with EAP and then applies its IP config.
+    /// Wired ports: each entry authenticates one Ethernet interface
+    /// with 802.1X/EAP or MACsec/MKA and then applies its IP config.
     #[serde(default)]
     pub ethernets: Vec<EthernetEntry>,
 }
@@ -157,13 +157,14 @@ impl EapEntry {
 
 /// MACsec/MKA settings as configured in the YAML file; mapped onto
 /// `shuli_wired::MacsecConfig`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct MacsecEntry {
     /// Connectivity Association Key, hex encoded (16 or 32 octets).
     pub cak: String,
     /// Connectivity Association Key Name, hex encoded (1..=32 octets).
     pub ckn: String,
-    /// Key Server Priority: lower wins. Defaults to 255 (never).
+    /// Key Server Priority: lower wins. Defaults to 255; use 255 when
+    /// `can_be_key_server` is false.
     #[serde(default = "default_mka_priority")]
     pub key_server_priority: u8,
     /// Whether this participant may be elected Key Server.
@@ -178,6 +179,20 @@ pub(crate) struct MacsecEntry {
     /// Encrypt frames (false = integrity-only MACsec).
     #[serde(default = "default_true")]
     pub encrypt: bool,
+}
+
+impl std::fmt::Debug for MacsecEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacsecEntry")
+            .field("cak_len", &self.cak.len())
+            .field("ckn_len", &self.ckn.len())
+            .field("key_server_priority", &self.key_server_priority)
+            .field("can_be_key_server", &self.can_be_key_server)
+            .field("macsec_iface", &self.macsec_iface)
+            .field("replay_window", &self.replay_window)
+            .field("encrypt", &self.encrypt)
+            .finish()
+    }
 }
 
 fn default_mka_priority() -> u8 {
@@ -225,6 +240,7 @@ impl MacsecEntry {
         config.macsec_iface = self.macsec_iface.clone();
         config.replay_window = self.replay_window;
         config.encrypt = self.encrypt;
+        config.validate()?;
         Ok(config)
     }
 }
@@ -284,7 +300,41 @@ impl ShuliConfig {
             rmsd_yaml::from_str(&content).map_err(|e| {
                 WifiError::new(ErrorKind::InvalidConfig, e.to_string())
             })?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Reject invalid wired configuration at load time instead of
+    /// failing every reconnect attempt.
+    fn validate(&self) -> Result<(), WifiError> {
+        for entry in &self.ethernets {
+            match (&entry.eap, &entry.macsec) {
+                (Some(_), Some(_)) => {
+                    return Err(WifiError::new(
+                        ErrorKind::InvalidConfig,
+                        format!(
+                            "ethernet {}: 'eap' and 'macsec' are mutually \
+                             exclusive",
+                            entry.name
+                        ),
+                    ));
+                }
+                (None, None) => {
+                    return Err(WifiError::new(
+                        ErrorKind::InvalidConfig,
+                        format!(
+                            "ethernet {}: 'eap' or 'macsec' is required",
+                            entry.name
+                        ),
+                    ));
+                }
+                (None, Some(macsec)) => {
+                    macsec.to_lib()?;
+                }
+                (Some(_), None) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Convert `entries` - the configured networks bound to
@@ -658,12 +708,82 @@ ethernets:
             ),
         ] {
             let config = parse(text);
+            config.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
             for entry in &config.ethernets {
                 if let Some(macsec) = &entry.macsec {
                     macsec.to_lib().unwrap_or_else(|e| panic!("{name}: {e}"));
                 }
             }
         }
+    }
+
+    #[test]
+    fn ethernet_requires_exactly_one_auth_mode() {
+        let neither = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+",
+        );
+        assert!(neither.validate().is_err());
+
+        let mut both = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    eap:
+      identity: user@example.org
+    macsec:
+      cak: \"00112233445566778899aabbccddeeff\"
+      ckn: \"00112233445566778899aabbccddeeff\"
+",
+        );
+        assert!(both.validate().is_err());
+        both.ethernets[0].macsec = None;
+        assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    fn macsec_entry_validates_key_lengths() {
+        let config = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    macsec:
+      cak: \"00112233\"
+      ckn: \"0011\"
+",
+        );
+        let entry = &config.ethernets[0];
+        assert!(entry.macsec.as_ref().unwrap().to_lib().is_err());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn macsec_entry_debug_redacts_keys() {
+        let config = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    macsec:
+      cak: \"00112233445566778899aabbccddeeff\"
+      ckn: \"deadbeef\"
+",
+        );
+        let text =
+            format!("{:?}", config.ethernets[0].macsec.as_ref().unwrap());
+        assert!(!text.contains("00112233"), "CAK leaked: {text}");
+        assert!(!text.contains("deadbeef"), "CKN leaked: {text}");
+        assert!(text.contains("cak_len"));
+        assert!(text.contains("ckn_len"));
     }
 
     #[test]
