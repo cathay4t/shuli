@@ -376,6 +376,7 @@ async fn run_wired_interface(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool, shuli_core::WifiError> {
     let (auth, ip_iface) = wired_auth_and_ip_iface(entry)?;
+    let is_macsec = matches!(auth, shuli_wired::WiredAuth::Macsec(_));
     let mut connected = false;
     loop {
         let mut client = match shuli_wired::WiredClient::init_with_auth(
@@ -425,6 +426,19 @@ async fn run_wired_interface(
                                         "IP config failed on {ip_iface}: {e}"
                                     );
                                 }
+                            }
+                            if !is_macsec {
+                                // The 802.1X port stays authorized;
+                                // hold until shutdown instead of
+                                // polling an already-Connected client.
+                                let _ = shutdown_rx.changed().await;
+                                if let Err(e) = client.shutdown().await {
+                                    log::warn!(
+                                        "wired shutdown {} failed: {e}",
+                                        entry.name
+                                    );
+                                }
+                                return Ok(connected);
                             }
                             // Keep driving MACsec/MKA (SAK rotation,
                             // liveness) after the first Connected.
