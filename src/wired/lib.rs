@@ -14,5 +14,5 @@ pub use shuli_core::EapConfig;
 
 pub use self::{
     client::{WiredAuth, WiredClient, WiredState},
-    mka::MacsecConfig,
+    mka::{DEFAULT_MACSEC_IFACE, MacsecConfig},
 };

@@ -26,6 +26,9 @@ use crate::{
     macsec::MacsecDevice,
 };
 
+/// Default name of the MACsec netdev created on top of the physical port.
+pub const DEFAULT_MACSEC_IFACE: &str = "macsec0";
+
 pub(crate) const MKA_VERSION: u8 = 3;
 pub(crate) const EAPOL_TYPE_MKA: u8 = 5;
 pub(crate) const EAPOL_VERSION: u8 = 3;
@@ -624,6 +627,12 @@ impl MacsecConfig {
         }
     }
 
+    /// Name of the MACsec netdev, defaulting to
+    /// [`DEFAULT_MACSEC_IFACE`].
+    pub fn macsec_iface_name(&self) -> &str {
+        self.macsec_iface.as_deref().unwrap_or(DEFAULT_MACSEC_IFACE)
+    }
+
     fn validate(&self) -> Result<(), WifiError> {
         if !matches!(self.cak.len(), 16 | 32) {
             return Err(mka_err(format!(
@@ -732,10 +741,7 @@ impl MkaSession {
             ick,
             priority: config.key_server_priority,
             can_be_key_server: config.can_be_key_server,
-            macsec_iface: config
-                .macsec_iface
-                .clone()
-                .unwrap_or_else(|| "macsec0".to_string()),
+            macsec_iface: config.macsec_iface_name().to_string(),
             replay_window: config.replay_window,
             encrypt: config.encrypt,
             macsec: None,
@@ -1329,6 +1335,14 @@ mod tests {
         let wrapped = wrap_key(&kek, &sak).unwrap();
         assert_eq!(wrapped.len(), 24);
         assert_eq!(unwrap_key(&kek, &wrapped).unwrap(), sak);
+    }
+
+    #[test]
+    fn test_macsec_iface_name() {
+        let mut config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        assert_eq!(config.macsec_iface_name(), DEFAULT_MACSEC_IFACE);
+        config.macsec_iface = Some("ms1".to_string());
+        assert_eq!(config.macsec_iface_name(), "ms1");
     }
 
     #[test]

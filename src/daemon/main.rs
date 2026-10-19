@@ -338,6 +338,36 @@ async fn apply_network_config(
     ip::apply_ip_config(iface_name, ipv4, ipv6, dns.as_ref()).await
 }
 
+/// Pick the wired authentication mode for `entry` and the interface
+/// that carries the IP configuration: the physical port for 802.1X and
+/// the MACsec netdev for MKA.
+fn wired_auth_and_ip_iface(
+    entry: &config::EthernetEntry,
+) -> Result<(shuli_wired::WiredAuth, String), shuli_core::WifiError> {
+    match (&entry.eap, &entry.macsec) {
+        (Some(_), Some(_)) => Err(shuli_core::WifiError::new(
+            shuli_core::ErrorKind::InvalidConfig,
+            format!(
+                "ethernet {}: 'eap' and 'macsec' are mutually exclusive",
+                entry.name
+            ),
+        )),
+        (None, None) => Err(shuli_core::WifiError::new(
+            shuli_core::ErrorKind::InvalidConfig,
+            format!("ethernet {}: 'eap' or 'macsec' is required", entry.name),
+        )),
+        (Some(eap), None) => Ok((
+            shuli_wired::WiredAuth::Eap(eap.to_lib()),
+            entry.name.clone(),
+        )),
+        (None, Some(macsec)) => {
+            let config = macsec.to_lib()?;
+            let iface = config.macsec_iface_name().to_string();
+            Ok((shuli_wired::WiredAuth::Macsec(config), iface))
+        }
+    }
+}
+
 /// Drive one wired port until shutdown: authenticate with EAP or
 /// establish MACsec/MKA, apply the port's IP config, and retry with
 /// backoff on failure.
@@ -345,36 +375,12 @@ async fn run_wired_interface(
     entry: &config::EthernetEntry,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool, shuli_core::WifiError> {
+    let (auth, ip_iface) = wired_auth_and_ip_iface(entry)?;
     let mut connected = false;
     loop {
-        let auth = match (&entry.eap, &entry.macsec) {
-            (Some(_), Some(_)) => {
-                return Err(shuli_core::WifiError::new(
-                    shuli_core::ErrorKind::InvalidConfig,
-                    format!(
-                        "ethernet {}: 'eap' and 'macsec' are mutually \
-                         exclusive",
-                        entry.name
-                    ),
-                ));
-            }
-            (None, None) => {
-                return Err(shuli_core::WifiError::new(
-                    shuli_core::ErrorKind::InvalidConfig,
-                    format!(
-                        "ethernet {}: 'eap' or 'macsec' is required",
-                        entry.name
-                    ),
-                ));
-            }
-            (Some(eap), None) => shuli_wired::WiredAuth::Eap(eap.to_lib()),
-            (None, Some(macsec)) => {
-                shuli_wired::WiredAuth::Macsec(macsec.to_lib()?)
-            }
-        };
         let mut client = match shuli_wired::WiredClient::init_with_auth(
             &entry.name,
-            auth,
+            auth.clone(),
         ) {
             Ok(client) => client,
             Err(e) => {
@@ -399,11 +405,11 @@ async fn run_wired_interface(
                                 connected = true;
                                 log::info!(
                                     "wired authentication authorized on {} \
-                                     - link up",
+                                     - link up ({ip_iface})",
                                     entry.name
                                 );
                                 if let Err(e) = apply_network_config(
-                                    &entry.name,
+                                    &ip_iface,
                                     entry.dns.as_ref(),
                                     entry.ipv4.as_ref(),
                                     entry.ipv6.as_ref(),
@@ -411,8 +417,7 @@ async fn run_wired_interface(
                                 .await
                                 {
                                     log::warn!(
-                                        "IP config failed on {}: {e}",
-                                        entry.name
+                                        "IP config failed on {ip_iface}: {e}"
                                     );
                                 }
                             }
@@ -497,6 +502,62 @@ mod tests {
             ipv4: None,
             ipv6: None,
         }
+    }
+
+    fn ethernet_entry(name: &str) -> config::EthernetEntry {
+        config::EthernetEntry {
+            name: name.to_string(),
+            eap: None,
+            macsec: None,
+            dns: None,
+            ipv4: None,
+            ipv6: None,
+        }
+    }
+
+    fn macsec_entry(iface: Option<&str>) -> config::MacsecEntry {
+        config::MacsecEntry {
+            cak: "00112233445566778899aabbccddeeff".to_string(),
+            ckn: "00112233445566778899aabbccddeeff".to_string(),
+            key_server_priority: 0xff,
+            can_be_key_server: false,
+            macsec_iface: iface.map(str::to_string),
+            replay_window: 0,
+            encrypt: true,
+        }
+    }
+
+    #[test]
+    fn wired_macsec_ip_configures_macsec_dev() {
+        let mut entry = ethernet_entry("eth0");
+        entry.macsec = Some(macsec_entry(None));
+        let (auth, iface) = wired_auth_and_ip_iface(&entry).unwrap();
+        assert!(matches!(auth, shuli_wired::WiredAuth::Macsec(_)));
+        assert_eq!(iface, shuli_wired::DEFAULT_MACSEC_IFACE);
+
+        entry.macsec = Some(macsec_entry(Some("ms1")));
+        let (_, iface) = wired_auth_and_ip_iface(&entry).unwrap();
+        assert_eq!(iface, "ms1");
+    }
+
+    #[test]
+    fn wired_eap_ip_configures_physical_dev() {
+        let mut entry = ethernet_entry("eth0");
+        entry.eap = Some(config::EapEntry::default());
+        let (auth, iface) = wired_auth_and_ip_iface(&entry).unwrap();
+        assert!(matches!(auth, shuli_wired::WiredAuth::Eap(_)));
+        assert_eq!(iface, "eth0");
+    }
+
+    #[test]
+    fn wired_auth_requires_exactly_one_mode() {
+        let entry = ethernet_entry("eth0");
+        assert!(wired_auth_and_ip_iface(&entry).is_err());
+
+        let mut entry = ethernet_entry("eth0");
+        entry.eap = Some(config::EapEntry::default());
+        entry.macsec = Some(macsec_entry(None));
+        assert!(wired_auth_and_ip_iface(&entry).is_err());
     }
 
     #[test]
