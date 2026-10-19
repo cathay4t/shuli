@@ -396,6 +396,11 @@ async fn run_wired_interface(
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     log::info!("shutting down wired port {}", entry.name);
+                    if let Err(e) = client.shutdown().await {
+                        log::warn!(
+                            "wired shutdown {} failed: {e}", entry.name
+                        );
+                    }
                     return Ok(connected);
                 }
                 result = client.run() => {
@@ -433,6 +438,12 @@ async fn run_wired_interface(
                                 "wired authentication failed on {}; retrying",
                                 entry.name
                             );
+                            if let Err(e) = client.shutdown().await {
+                                log::warn!(
+                                    "wired shutdown {} failed: {e}",
+                                    entry.name
+                                );
+                            }
                             break;
                         }
                         Ok(_) => {}
@@ -441,6 +452,12 @@ async fn run_wired_interface(
                                 "wired authentication error on {}: {e}",
                                 entry.name
                             );
+                            if let Err(e) = client.shutdown().await {
+                                log::warn!(
+                                    "wired shutdown {} failed: {e}",
+                                    entry.name
+                                );
+                            }
                             break;
                         }
                     }

@@ -44,6 +44,7 @@ fn sci_be(sci: &[u8; 8]) -> u64 {
 /// A kernel MACsec interface with a handle for SA management.
 pub(crate) struct MacsecDevice {
     name: String,
+    if_index: u32,
     rtnl: rtnetlink::Handle,
     macsec: MacsecHandle,
     desired: NlMacsecConfig,
@@ -104,6 +105,7 @@ impl MacsecDevice {
         desired.rx_sc = Some(Vec::new());
         let mut dev = Self {
             name: name.to_string(),
+            if_index,
             rtnl: handle,
             macsec: macsec_handle,
             desired,
@@ -114,6 +116,26 @@ impl MacsecDevice {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Remove every installed TX/RX SA, keeping the netdev.
+    pub(crate) async fn clear_sas(&mut self) -> Result<(), WifiError> {
+        self.desired.tx_sa = Some(Vec::new());
+        self.desired.rx_sc = Some(Vec::new());
+        self.apply().await
+    }
+
+    /// Remove the MACsec netdev (and thereby all its SAs).
+    pub(crate) async fn remove(mut self) -> Result<(), WifiError> {
+        let _ = self.clear_sas().await;
+        self.rtnl
+            .link()
+            .del(self.if_index)
+            .execute()
+            .await
+            .map_err(|e| {
+                macsec_err(format!("delete macsec dev {}: {e}", self.name))
+            })
     }
 
     async fn apply(&mut self) -> Result<(), WifiError> {

@@ -413,6 +413,19 @@ async fn wired_macsec_mka_connect() {
             "invalid MKPDU must not abort the MKA session"
         );
     }
+
+    drop(raw_a);
+    drop(raw_b);
+    drop(raw_peer);
+    a.shutdown().await.expect("shutdown client A");
+    b.shutdown().await.expect("shutdown client B");
+    assert!(!iface_exists("macsec-a"), "macsec-a was not removed");
+    assert!(!iface_exists("macsec-b"), "macsec-b was not removed");
+}
+
+fn iface_exists(iface: &str) -> bool {
+    let name = std::ffi::CString::new(iface).expect("iface name");
+    unsafe { libc::if_nametoindex(name.as_ptr()) != 0 }
 }
 
 fn read_iface_mac(iface: &str) -> [u8; 6] {

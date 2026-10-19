@@ -780,6 +780,7 @@ impl MkaSession {
     pub(crate) async fn run(&mut self) -> Result<bool, WifiError> {
         self.ensure_macsec().await?;
         self.expire_peers();
+        self.drop_unsecure_sak().await?;
 
         let now = Instant::now();
         let next_hello = self.last_hello + Duration::from_secs(MKA_HELLO_SECS);
@@ -814,6 +815,7 @@ impl MkaSession {
         }
 
         self.expire_peers();
+        self.drop_unsecure_sak().await?;
         if self.need_send {
             self.send_mkpdu().await?;
         }
@@ -1089,6 +1091,45 @@ impl MkaSession {
         }
     }
 
+    fn has_live_peer(&self) -> bool {
+        self.peers.iter().any(|p| p.live)
+    }
+
+    /// Once the last live peer is gone the association is no longer
+    /// alive: stop claiming Connected and drop the installed SAs.
+    async fn drop_unsecure_sak(&mut self) -> Result<(), WifiError> {
+        if self.lki.is_none() || self.has_live_peer() {
+            return Ok(());
+        }
+        log::info!("MKA: no live peers left; dropping SAs");
+        if let Some(dev) = self.macsec.as_mut() {
+            dev.clear_sas().await?;
+        }
+        self.lki = None;
+        self.oki = None;
+        self.lan = 0;
+        self.oan = 0;
+        self.ltx = false;
+        self.lrx = false;
+        self.otx = false;
+        self.orx = false;
+        self.sak = None;
+        self.dist_sak = None;
+        for peer in &mut self.peers {
+            peer.rx_ready = false;
+        }
+        self.need_send = true;
+        Ok(())
+    }
+
+    /// Remove the MACsec netdev and its SAs.
+    pub(crate) async fn shutdown(&mut self) -> Result<(), WifiError> {
+        if let Some(dev) = self.macsec.take() {
+            dev.remove().await?;
+        }
+        Ok(())
+    }
+
     fn elect_key_server(&mut self) {
         let self_sci = self.actor_sci();
         let mut best: Option<(u8, [u8; 8], bool)> = None;
@@ -1260,9 +1301,10 @@ impl MkaSession {
         Ok(())
     }
 
-    /// Whether both directions have an installed SAK.
+    /// Whether both directions have an installed SAK and at least one
+    /// peer is still live.
     pub(crate) fn secured(&self) -> bool {
-        self.lki.is_some() && self.lrx && self.ltx
+        self.lki.is_some() && self.lrx && self.ltx && self.has_live_peer()
     }
 }
 
@@ -1353,6 +1395,36 @@ mod tests {
         let wrapped = wrap_key(&kek, &sak).unwrap();
         assert_eq!(wrapped.len(), 24);
         assert_eq!(unwrap_key(&kek, &wrapped).unwrap(), sak);
+    }
+
+    #[tokio::test]
+    async fn test_secured_requires_live_peer() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        session.lki = Some(KeyId {
+            mi: [1; MI_LEN],
+            kn: 1,
+        });
+        session.lrx = true;
+        session.ltx = true;
+        assert!(!session.secured(), "no live peer means not secured");
+
+        session.peers.push(Peer {
+            mi: [2; MI_LEN],
+            mn: 1,
+            sci: [2, 0, 0, 0, 0, 1, 0, 1],
+            priority: 0xff,
+            key_server: false,
+            live: true,
+            last_seen: Instant::now(),
+            rx_ready: true,
+        });
+        assert!(session.secured());
+
+        session.peers.clear();
+        session.drop_unsecure_sak().await.unwrap();
+        assert!(session.lki.is_none());
+        assert!(!session.secured());
     }
 
     #[test]

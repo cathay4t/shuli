@@ -76,6 +76,14 @@ impl WiredClient {
         self.state
     }
 
+    /// Release resources: remove the MACsec netdev and its SAs.
+    pub async fn shutdown(&mut self) -> Result<(), WifiError> {
+        match &mut self.mode {
+            Mode::Eap(_) => Ok(()),
+            Mode::Macsec(session) => session.shutdown().await,
+        }
+    }
+
     /// Advance the wired authentication flow by one step.
     pub async fn run(&mut self) -> Result<WiredState, WifiError> {
         self.state = match &mut self.mode {
