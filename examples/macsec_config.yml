@@ -1,0 +1,28 @@
+# shulid MACsec (802.1X/MKA) configuration.
+#
+# Both peers must be configured with the same CAK and CKN. The kernel
+# `macsec` module is required; MACsec netdevices are created
+# automatically on top of the physical interface.
+---
+version: 1
+ethernets:
+  - name: eth0
+    macsec:
+      # Connectivity Association Key: 16 or 32 octets, hex encoded.
+      cak: "00112233445566778899aabbccddeeff"
+      # Connectivity Association Key Name: 1..32 octets, hex encoded.
+      ckn: "00112233445566778899aabbccddeeff"
+      # Lower values win the Key Server election. 255 never becomes
+      # Key Server.
+      key_server_priority: 16
+      can_be_key_server: true
+      # Optional; defaults to macsec0.
+      macsec_iface: macsec0
+      # Replay protection window; 0 disables replay protection.
+      replay_window: 0
+      # false selects integrity-only MACsec.
+      encrypt: true
+    ipv4:
+      auto: true
+    ipv6:
+      auto: true

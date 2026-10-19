@@ -22,8 +22,8 @@ use shuli_core::{
 use tokio::io::unix::AsyncFd;
 
 /// PAE group address used for EAPOL on wired links (802.1X-2010).
-const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x03];
-const ETH_P_PAE: u16 = 0x888E;
+pub(crate) const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x03];
+pub(crate) const ETH_P_PAE: u16 = 0x888E;
 /// EAPOL-Start (version 2, type 1, length 0).
 const EAPOL_START: [u8; 4] = [0x02, 0x01, 0x00, 0x00];
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
@@ -31,7 +31,7 @@ const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
 /// Connection state of a wired 802.1X port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum WiredState {
+pub enum EapState {
     /// Socket ready; EAPOL-Start not sent yet.
     Init,
     /// EAP exchange in progress.
@@ -44,16 +44,16 @@ pub enum WiredState {
 
 /// A wired 802.1X supplicant for one Ethernet interface.
 #[non_exhaustive]
-pub struct WiredClient {
+pub struct EapClient {
     fd: OwnedFd,
     async_fd: AsyncFd<OwnedFd>,
     if_index: u32,
     mac: [u8; 6],
     peer: EapPeer,
-    state: WiredState,
+    state: EapState,
 }
 
-impl WiredClient {
+impl EapClient {
     /// Open the raw EAPOL socket on `iface_name` and prepare the EAP
     /// peer with the given credentials.
     pub fn init(iface_name: &str, eap: &EapConfig) -> Result<Self, WifiError> {
@@ -73,18 +73,14 @@ impl WiredClient {
             if_index,
             mac,
             peer,
-            state: WiredState::Init,
+            state: EapState::Init,
         })
     }
 
-    pub fn state(&self) -> WiredState {
-        self.state
-    }
-
     /// Advance the wired authentication flow by one step.
-    pub async fn run(&mut self) -> Result<WiredState, WifiError> {
+    pub async fn run(&mut self) -> Result<EapState, WifiError> {
         match self.state {
-            WiredState::Init => {
+            EapState::Init => {
                 // Kick the authenticator into sending the Identity
                 // request.
                 send_eapol_frame(
@@ -93,10 +89,10 @@ impl WiredClient {
                     &self.mac,
                     &EAPOL_START,
                 )?;
-                self.state = WiredState::Authenticating;
+                self.state = EapState::Authenticating;
                 Ok(self.state)
             }
-            WiredState::Authenticating => {
+            EapState::Authenticating => {
                 let frame = loop {
                     let timed = tokio::time::timeout(
                         std::time::Duration::from_secs(AUTH_EVENT_TIMEOUT_SECS),
@@ -113,7 +109,7 @@ impl WiredClient {
                         }
                         Err(_) => {
                             log::warn!("wired 802.1X timed out; will retry");
-                            self.state = WiredState::Failed;
+                            self.state = EapState::Failed;
                             return Ok(self.state);
                         }
                     };
@@ -128,8 +124,8 @@ impl WiredClient {
                 self.handle_eapol(&frame)?;
                 Ok(self.state)
             }
-            WiredState::Connected => Ok(WiredState::Connected),
-            WiredState::Failed => Ok(WiredState::Failed),
+            EapState::Connected => Ok(EapState::Connected),
+            EapState::Failed => Ok(EapState::Failed),
         }
     }
 
@@ -161,11 +157,11 @@ impl WiredClient {
                     ));
                 }
                 log::info!("wired 802.1X EAP-Success - port authorized");
-                self.state = WiredState::Connected;
+                self.state = EapState::Connected;
             }
             EapAction::Failure => {
                 log::warn!("wired 802.1X EAP-Failure");
-                self.state = WiredState::Failed;
+                self.state = EapState::Failed;
             }
             EapAction::Wait => {}
             _ => {}
@@ -259,8 +255,16 @@ fn create_eapol_socket(if_index: u32) -> Result<OwnedFd, WifiError> {
     Ok(owned)
 }
 
-pub(crate) fn recv_eapol_frame(fd: RawFd) -> io::Result<Vec<u8>> {
-    let mut buf = [0u8; 2048];
+pub(crate) struct EapolFrame {
+    pub(crate) src: [u8; 6],
+    pub(crate) dst: [u8; 6],
+    pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) fn recv_eapol_frame_full(
+    fd: RawFd,
+) -> io::Result<Option<EapolFrame>> {
+    let mut buf = [0u8; 4096];
     let n = unsafe {
         libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
     };
@@ -269,9 +273,23 @@ pub(crate) fn recv_eapol_frame(fd: RawFd) -> io::Result<Vec<u8>> {
     }
     let n = n as usize;
     if n < 14 || u16::from_be_bytes([buf[12], buf[13]]) != ETH_P_PAE {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    Ok(buf[14..n].to_vec())
+    let mut src = [0u8; 6];
+    let mut dst = [0u8; 6];
+    src.copy_from_slice(&buf[6..12]);
+    dst.copy_from_slice(&buf[..6]);
+    Ok(Some(EapolFrame {
+        src,
+        dst,
+        payload: buf[14..n].to_vec(),
+    }))
+}
+
+pub(crate) fn recv_eapol_frame(fd: RawFd) -> io::Result<Vec<u8>> {
+    Ok(recv_eapol_frame_full(fd)?
+        .map(|frame| frame.payload)
+        .unwrap_or_default())
 }
 
 fn read_sysfs_u32(iface: &str, file: &str) -> Result<u32, WifiError> {

@@ -18,6 +18,8 @@ entirely in Rust.
   BTM, 802.11k Neighbor Reports before quick roam scans, and
   signal-triggered roam scans; PMKSA caching and OKC.
 * **Wired 802.1X** - EAP-TLS over Ethernet (raw AF_PACKET EAPOL).
+* **MACsec** - 802.1X/MKA key agreement with a pre-shared CAK, kernel
+  MACsec SA installation, and automatic liveness/SAK rotation.
 * **Hardening** - WoWLAN (opt-in), OCV, Extended Key ID, Transition
   Disable, and BIP cipher negotiation (GMAC-256/CMAC-256/GMAC-128/
   CMAC-128).
@@ -30,13 +32,15 @@ entirely in Rust.
 
 * `shuli-core` - shared errors, EAP/EAP-TLS, EAPOL framing, and `EapConfig`.
 * `shuli-wifi` - WiFi/WPA client.
-* `shuli-wired` - wired 802.1X/EAP client (MACsec/MKA planned).
+* `shuli-wired` - wired 802.1X/EAP and MACsec/MKA client.
 * `shulid` - the daemon.
 
 ## Using the daemon for simple WiFi configuration
 
-Full configuration document are stored in
-[`examples/config.yml`](examples/config.yml).
+Full configuration examples are stored in
+[`examples/wifi_config.yml`](examples/wifi_config.yml),
+[`examples/eap_config.yml`](examples/eap_config.yml), and
+[`examples/macsec_config.yml`](examples/macsec_config.yml).
 
 `shulid` reads YAML from `/etc/shuli/config.yml` (or a path given on the
 command line).  It targets small systems that don't run nipart: each WiFi
@@ -105,7 +109,7 @@ Build and install the daemon, the systemd unit, and the default config:
 cargo build --release
 sudo install -Dm755 target/release/shulid /usr/bin/shulid
 sudo install -Dm644 packaging/shulid.service /etc/systemd/system/shulid.service
-sudo install -Dm644 examples/config.yml /etc/shuli/config.yml
+sudo install -Dm644 examples/wifi_config.yml /etc/shuli/config.yml
 sudo systemctl daemon-reload
 sudo systemctl enable --now shulid
 ```

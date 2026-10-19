@@ -338,20 +338,47 @@ async fn apply_network_config(
     ip::apply_ip_config(iface_name, ipv4, ipv6, dns.as_ref()).await
 }
 
-/// Drive one wired 802.1X port until shutdown: authenticate with EAP,
-/// apply the port's IP config, and retry with backoff on failure.
+/// Drive one wired port until shutdown: authenticate with EAP or
+/// establish MACsec/MKA, apply the port's IP config, and retry with
+/// backoff on failure.
 async fn run_wired_interface(
     entry: &config::EthernetEntry,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool, shuli_core::WifiError> {
-    let eap = entry.eap.to_lib();
     let mut connected = false;
     loop {
-        let mut client = match shuli_wired::WiredClient::init(&entry.name, &eap)
-        {
+        let auth = match (&entry.eap, &entry.macsec) {
+            (Some(_), Some(_)) => {
+                return Err(shuli_core::WifiError::new(
+                    shuli_core::ErrorKind::InvalidConfig,
+                    format!(
+                        "ethernet {}: 'eap' and 'macsec' are mutually \
+                         exclusive",
+                        entry.name
+                    ),
+                ));
+            }
+            (None, None) => {
+                return Err(shuli_core::WifiError::new(
+                    shuli_core::ErrorKind::InvalidConfig,
+                    format!(
+                        "ethernet {}: 'eap' or 'macsec' is required",
+                        entry.name
+                    ),
+                ));
+            }
+            (Some(eap), None) => shuli_wired::WiredAuth::Eap(eap.to_lib()),
+            (None, Some(macsec)) => {
+                shuli_wired::WiredAuth::Macsec(macsec.to_lib()?)
+            }
+        };
+        let mut client = match shuli_wired::WiredClient::init_with_auth(
+            &entry.name,
+            auth,
+        ) {
             Ok(client) => client,
             Err(e) => {
-                log::warn!("wired 802.1X init {} failed: {e}", entry.name);
+                log::warn!("wired init {} failed: {e}", entry.name);
                 tokio::select! {
                     _ = shutdown_rx.changed() => return Ok(connected),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
@@ -368,32 +395,37 @@ async fn run_wired_interface(
                 result = client.run() => {
                     match result {
                         Ok(shuli_wired::WiredState::Connected) => {
-                            connected = true;
-                            log::info!(
-                                "wired 802.1X authorized on {} - link up",
-                                entry.name
-                            );
-                            if let Err(e) = apply_network_config(
-                                &entry.name,
-                                entry.dns.as_ref(),
-                                entry.ipv4.as_ref(),
-                                entry.ipv6.as_ref(),
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "IP config failed on {}: {e}",
+                            if !connected {
+                                connected = true;
+                                log::info!(
+                                    "wired authentication authorized on {} \
+                                     - link up",
                                     entry.name
                                 );
+                                if let Err(e) = apply_network_config(
+                                    &entry.name,
+                                    entry.dns.as_ref(),
+                                    entry.ipv4.as_ref(),
+                                    entry.ipv6.as_ref(),
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "IP config failed on {}: {e}",
+                                        entry.name
+                                    );
+                                }
                             }
-                            // The port stays authorized; hold until
-                            // shutdown.
-                            let _ = shutdown_rx.changed().await;
-                            return Ok(connected);
+                            // Keep driving MACsec/MKA (SAK rotation,
+                            // liveness) after the first Connected.
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(100),
+                            )
+                            .await;
                         }
                         Ok(shuli_wired::WiredState::Failed) => {
                             log::warn!(
-                                "wired 802.1X failed on {}; retrying",
+                                "wired authentication failed on {}; retrying",
                                 entry.name
                             );
                             break;
@@ -401,7 +433,7 @@ async fn run_wired_interface(
                         Ok(_) => {}
                         Err(e) => {
                             log::warn!(
-                                "wired 802.1X error on {}: {e}",
+                                "wired authentication error on {}: {e}",
                                 entry.name
                             );
                             break;

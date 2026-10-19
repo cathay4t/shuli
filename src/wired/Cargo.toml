@@ -20,6 +20,9 @@ shuli-core.workspace = true
 tokio.workspace = true
 log.workspace = true
 libc.workspace = true
+aws-lc-rs.workspace = true
+nl-macsec.workspace = true
+rtnetlink.workspace = true
 
 [dev-dependencies]
 rustls.workspace = true

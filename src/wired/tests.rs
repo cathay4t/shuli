@@ -3,7 +3,12 @@
 //! Integration test for wired 802.1X (EAP-TLS) against an in-process
 //! EAP-TLS authenticator over a veth pair.
 
-use std::{io::Cursor, os::fd::AsRawFd, sync::Arc};
+use std::{
+    io::Cursor,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use rustls::{ServerConfig, ServerConnection};
 use shuli_core::{
@@ -17,7 +22,7 @@ use shuli_core::{
 };
 
 use crate::{
-    WiredClient, WiredState,
+    MacsecConfig, WiredAuth, WiredClient, WiredState,
     eap::{open_eapol_socket, recv_eapol_frame, send_eapol_frame},
 };
 
@@ -64,21 +69,27 @@ fn sh_allow_fail(cmd: &str) {
 }
 
 /// Wired test environment: a veth pair in the default netns.
-struct WiredVethEnv;
+struct WiredVethEnv {
+    first: &'static str,
+}
 
 impl WiredVethEnv {
     fn setup() -> Self {
-        sh_allow_fail("ip link del veth0");
-        sh_ok("ip link add veth0 type veth peer name veth1");
-        sh_ok("ip link set veth0 up");
-        sh_ok("ip link set veth1 up");
-        WiredVethEnv
+        Self::setup_named("veth0", "veth1")
+    }
+
+    fn setup_named(first: &'static str, second: &'static str) -> Self {
+        sh_allow_fail(&format!("ip link del {first}"));
+        sh_ok(&format!("ip link add {first} type veth peer name {second}"));
+        sh_ok(&format!("ip link set {first} up"));
+        sh_ok(&format!("ip link set {second} up"));
+        WiredVethEnv { first }
     }
 }
 
 impl Drop for WiredVethEnv {
     fn drop(&mut self) {
-        sh_allow_fail("ip link del veth0");
+        sh_allow_fail(&format!("ip link del {}", self.first));
     }
 }
 
@@ -279,4 +290,233 @@ async fn wired_8021x_eap_tls_connect() {
     );
     assert_eq!(client.state(), WiredState::Connected);
     auth.join().expect("wired authenticator thread");
+}
+
+/// MACsec/MKA end-to-end: two participants with the same pre-shared
+/// CAK/CKN over a veth pair elect a key server, distribute a SAK,
+/// install it into the kernel MACsec devices, and pass traffic.
+#[tokio::test]
+async fn wired_macsec_mka_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wired_macsec_mka_connect: test binary not running as \
+             root (`.cargo/config.toml` runs tests via `sudo`, so plain \
+             `cargo test` is root)"
+        );
+        return;
+    }
+
+    let _env = WiredVethEnv::setup_named("mka0", "mka1");
+    sh_allow_fail("ip link del macsec-a");
+    sh_allow_fail("ip link del macsec-b");
+
+    let cak = vec![0x11u8; 16];
+    let ckn = vec![0x22u8; 16];
+    let mut a = WiredClient::init_with_auth(
+        "mka0",
+        WiredAuth::Macsec(MacsecConfig {
+            cak: cak.clone(),
+            ckn: ckn.clone(),
+            key_server_priority: 0x10,
+            can_be_key_server: true,
+            macsec_iface: Some("macsec-a".to_string()),
+            replay_window: 0,
+            encrypt: true,
+        }),
+    )
+    .expect("MKA client A");
+    let mut b = WiredClient::init_with_auth(
+        "mka1",
+        WiredAuth::Macsec(MacsecConfig {
+            cak,
+            ckn,
+            key_server_priority: 0xff,
+            can_be_key_server: false,
+            macsec_iface: Some("macsec-b".to_string()),
+            replay_window: 0,
+            encrypt: true,
+        }),
+    )
+    .expect("MKA client B");
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (mut a_ok, mut b_ok) = (false, false);
+    while tokio::time::Instant::now() < deadline && !(a_ok && b_ok) {
+        let (ra, rb) = tokio::join!(a.run(), b.run());
+        match ra {
+            Ok(WiredState::Connected) => a_ok = true,
+            Ok(WiredState::Failed) => panic!("MKA client A failed"),
+            Ok(_) => {}
+            Err(e) => panic!("MKA client A error: {e}"),
+        }
+        match rb {
+            Ok(WiredState::Connected) => b_ok = true,
+            Ok(WiredState::Failed) => panic!("MKA client B failed"),
+            Ok(_) => {}
+            Err(e) => panic!("MKA client B error: {e}"),
+        }
+    }
+    assert!(
+        a_ok && b_ok,
+        "MKA never secured both participants (A={a_ok}, B={b_ok})"
+    );
+    assert_eq!(a.state(), WiredState::Connected);
+    assert_eq!(b.state(), WiredState::Connected);
+
+    // Both endpoints live in the same network namespace, so routing
+    // between their IP addresses short-circuits via `lo`. Exercise the
+    // kernel MACsec data path directly with raw Ethernet frames instead.
+    let mac_a = read_iface_mac("macsec-a");
+    let mac_b = read_iface_mac("macsec-b");
+    let ifindex_a = iface_index("macsec-a");
+    let ifindex_b = iface_index("macsec-b");
+    let raw_a = open_raw_socket("macsec-a");
+    let raw_b = open_raw_socket("macsec-b");
+
+    let payload = b"shuli-mka-data-path";
+    send_raw_frame(&raw_a, ifindex_a, &mac_a, &mac_b, 0x88b5, payload);
+    assert!(
+        recv_raw_frame(&raw_b, 0x88b5, payload, Duration::from_secs(5)),
+        "MACsec A->B data path never delivered the frame"
+    );
+
+    let reply = b"shuli-mka-reply";
+    send_raw_frame(&raw_b, ifindex_b, &mac_b, &mac_a, 0x88b5, reply);
+    assert!(
+        recv_raw_frame(&raw_a, 0x88b5, reply, Duration::from_secs(5)),
+        "MACsec B->A data path never delivered the frame"
+    );
+}
+
+fn read_iface_mac(iface: &str) -> [u8; 6] {
+    let text =
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/address"))
+            .unwrap_or_else(|e| panic!("read {iface} address: {e}"));
+    let mut mac = [0u8; 6];
+    for (i, part) in text.trim().split(':').enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)
+            .unwrap_or_else(|e| panic!("invalid MAC octet {part:?}: {e}"));
+    }
+    mac
+}
+
+fn iface_index(iface: &str) -> u32 {
+    let name = std::ffi::CString::new(iface).expect("iface name");
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    assert_ne!(index, 0, "interface {iface} not found");
+    index
+}
+
+fn open_raw_socket(iface: &str) -> OwnedFd {
+    let ifindex = iface_index(iface);
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0x0003u16.to_be() as i32,
+        )
+    };
+    assert!(
+        fd >= 0,
+        "raw socket on {iface}: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = 0x0003u16.to_be();
+    sll.sll_ifindex = ifindex as i32;
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    assert!(
+        rc >= 0,
+        "bind raw socket on {iface}: {}",
+        std::io::Error::last_os_error()
+    );
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn send_raw_frame(
+    fd: &OwnedFd,
+    ifindex: u32,
+    src: &[u8; 6],
+    dst: &[u8; 6],
+    ethertype: u16,
+    payload: &[u8],
+) {
+    let mut frame = Vec::with_capacity(14 + payload.len());
+    frame.extend_from_slice(dst);
+    frame.extend_from_slice(src);
+    frame.extend_from_slice(&ethertype.to_be_bytes());
+    frame.extend_from_slice(payload);
+
+    let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = 0x0003u16.to_be();
+    sll.sll_ifindex = ifindex as i32;
+    sll.sll_halen = 6;
+    sll.sll_addr[..6].copy_from_slice(dst);
+    let rc = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            frame.as_ptr() as *const libc::c_void,
+            frame.len(),
+            0,
+            &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        frame.len() as isize,
+        "send raw frame: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn recv_raw_frame(
+    fd: &OwnedFd,
+    ethertype: u16,
+    payload: &[u8],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait = (deadline - Instant::now()).as_millis().clamp(1, 500) as i32;
+        let rc = unsafe { libc::poll(&mut pfd, 1, wait) };
+        if rc <= 0 {
+            continue;
+        }
+        let mut buf = [0u8; 2048];
+        let n = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if n < 14 {
+            continue;
+        }
+        let n = n as usize;
+        if u16::from_be_bytes([buf[12], buf[13]]) != ethertype {
+            continue;
+        }
+        if n >= 14 + payload.len() && &buf[14..14 + payload.len()] == payload {
+            return true;
+        }
+    }
+    false
 }

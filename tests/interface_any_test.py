@@ -2,7 +2,7 @@
 
 """`interface: any` (or an absent `interface`) must resolve to the first
 WiFi interface found and apply the SSID's IP config (static or DHCP) to
-it.  This mirrors `examples/config.yml`: `Test-WIFI` has no `interface`
+it.  This mirrors `examples/wifi_config.yml`: `Test-WIFI` has no `interface`
 key, `Test-WIFI-OPEN` uses `interface: any`; both mean "any".
 """
 
@@ -48,7 +48,7 @@ DHCP_LEASE_MAX = 50
 STA_STATIC_IP = f"{IPV4_BLOCK}.10"
 
 # Explicit `interface: any` + full static IP config (mirrors the
-# Test-WIFI-OPEN shape in examples/config.yml, but static).
+# Test-WIFI-OPEN shape in examples/wifi_config.yml, but static).
 CONFIG_ANY_STATIC = f"""\
 ---
 version: 1
@@ -65,7 +65,7 @@ wifis:
 """
 
 # No `interface` key at all: must behave exactly like `interface: any`.
-# DHCP (mirrors Test-WIFI in examples/config.yml).
+# DHCP (mirrors Test-WIFI in examples/wifi_config.yml).
 CONFIG_ABSENT_DHCP = f"""\
 ---
 version: 1

@@ -32,6 +32,7 @@ genetlink = "0.3"
 netlink-proto = "0.13"
 netlink-sys = "0.9"
 rtnetlink = "0.23"
+nl-macsec = "0.2.1"
 wl-nl80211 = "0.8.0"
 #wl-nl80211 = { git = "https://github.com/rust-netlink/wl-nl80211.git" }
 mozim = { version = "0.3.2", default-features = false, features = ["netlink"] }

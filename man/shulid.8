@@ -130,9 +130,34 @@ ethernets:
 .fi
 .RE
 .PP
-There is no association, 4-way handshake, or key installation on
-wired links: EAP-TLS runs directly over EAPOL (ethertype 0x888E) and
-EAP-Success authorizes the port before the IP config is applied.
+There is no association or 4-way handshake on wired 802.1X links:
+EAP-TLS runs directly over EAPOL (ethertype 0x888E) and EAP-Success
+authorizes the port before the IP config is applied.
+.SH MACSEC
+Wired MACsec uses 802.1X/MKA.  Configure a
+.B macsec
+block instead of
+.BR eap ;
+both peers must use the same hex-encoded CAK and CKN:
+.PP
+.RS
+.nf
+ethernets:
+  - name: eth0
+    macsec:
+      cak: "00112233445566778899aabbccddeeff"
+      ckn: "00112233445566778899aabbccddeeff"
+      key_server_priority: 16
+      can_be_key_server: true
+    ipv4:
+      auto: true
+.fi
+.RE
+.PP
+The kernel MACsec netdev is created on top of the physical interface.
+MKA elects a key server, distributes SAKs, installs them into the
+kernel, and keeps the association alive; IP configuration is applied
+once the data path is secured.
 .SH SYSTEMD
 The package ships
 .I packaging/shulid.service
@@ -145,7 +170,7 @@ it and the default config with:
 .RS
 .nf
 sudo install -Dm644 packaging/shulid.service /etc/systemd/system/
-sudo install -Dm644 examples/config.yml /etc/shuli/config.yml
+sudo install -Dm644 examples/wifi_config.yml /etc/shuli/config.yml
 sudo systemctl daemon-reload
 sudo systemctl enable --now shulid
 .fi

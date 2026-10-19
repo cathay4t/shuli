@@ -1,0 +1,28 @@
+# shulid 802.1X/EAP-TLS configuration: WPA-Enterprise WiFi and wired
+# 802.1X Ethernet.
+---
+version: 1
+wifis:
+  - ssid: Test-WIFI-EAP
+    eap:
+      identity: user@example.org
+      ca_cert: /etc/shuli/ca.pem
+      client_cert: /etc/shuli/client.pem
+      client_key: /etc/shuli/client.key
+      server_name: radius.example.org
+    ipv4:
+      auto: true
+    ipv6:
+      auto: true
+ethernets:
+  - name: eth0
+    eap:
+      identity: user@example.org
+      ca_cert: /etc/shuli/ca.pem
+      client_cert: /etc/shuli/client.pem
+      client_key: /etc/shuli/client.key
+      server_name: radius.example.org
+    ipv4:
+      auto: true
+    ipv6:
+      auto: true

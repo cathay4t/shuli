@@ -155,11 +155,88 @@ impl EapEntry {
     }
 }
 
-/// A wired 802.1X port entry.
+/// MACsec/MKA settings as configured in the YAML file; mapped onto
+/// `shuli_wired::MacsecConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MacsecEntry {
+    /// Connectivity Association Key, hex encoded (16 or 32 octets).
+    pub cak: String,
+    /// Connectivity Association Key Name, hex encoded (1..=32 octets).
+    pub ckn: String,
+    /// Key Server Priority: lower wins. Defaults to 255 (never).
+    #[serde(default = "default_mka_priority")]
+    pub key_server_priority: u8,
+    /// Whether this participant may be elected Key Server.
+    #[serde(default)]
+    pub can_be_key_server: bool,
+    /// MACsec netdev name. Defaults to `macsec0`.
+    #[serde(default)]
+    pub macsec_iface: Option<String>,
+    /// Replay protection window; 0 disables replay protection.
+    #[serde(default)]
+    pub replay_window: u32,
+    /// Encrypt frames (false = integrity-only MACsec).
+    #[serde(default = "default_true")]
+    pub encrypt: bool,
+}
+
+fn default_mka_priority() -> u8 {
+    0xff
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn parse_hex(field: &str, value: &str) -> Result<Vec<u8>, WifiError> {
+    let cleaned: String = value
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':')
+        .collect();
+    if !cleaned.len().is_multiple_of(2) {
+        return Err(WifiError::new(
+            ErrorKind::InvalidConfig,
+            format!("{field} must contain an even number of hex digits"),
+        ));
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    format!("invalid hex in {field}: {e}"),
+                )
+            })
+        })
+        .collect()
+}
+
+impl MacsecEntry {
+    pub(crate) fn to_lib(
+        &self,
+    ) -> Result<shuli_wired::MacsecConfig, WifiError> {
+        let mut config = shuli_wired::MacsecConfig::new(
+            parse_hex("macsec.cak", &self.cak)?,
+            parse_hex("macsec.ckn", &self.ckn)?,
+        );
+        config.key_server_priority = self.key_server_priority;
+        config.can_be_key_server = self.can_be_key_server;
+        config.macsec_iface = self.macsec_iface.clone();
+        config.replay_window = self.replay_window;
+        config.encrypt = self.encrypt;
+        Ok(config)
+    }
+}
+
+/// A wired 802.1X or MACsec port entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EthernetEntry {
     pub name: String,
-    pub eap: EapEntry,
+    #[serde(default)]
+    pub eap: Option<EapEntry>,
+    #[serde(default)]
+    pub macsec: Option<MacsecEntry>,
     #[serde(default)]
     pub dns: Option<DnsConfig>,
     #[serde(default)]
@@ -527,8 +604,89 @@ ethernets:
         );
         let entry = &config.ethernets[0];
         assert_eq!(entry.name, "eth0");
-        assert_eq!(entry.eap.identity, "user@example.org");
+        assert_eq!(entry.eap.as_ref().unwrap().identity, "user@example.org");
         assert!(entry.dns.is_none());
+    }
+
+    #[test]
+    fn macsec_entry_parses_and_maps() {
+        let config = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    macsec:
+      cak: \"00112233445566778899aabbccddeeff\"
+      ckn: \"00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff\"
+      key_server_priority: 16
+      can_be_key_server: true
+      macsec_iface: macsec-test
+      replay_window: 32
+",
+        );
+        let entry = &config.ethernets[0];
+        let macsec = entry.macsec.as_ref().expect("macsec config");
+        let lib = macsec.to_lib().expect("valid macsec config");
+        let expected = vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ];
+        assert_eq!(lib.cak, expected);
+        assert_eq!(lib.ckn, expected);
+        assert_eq!(lib.key_server_priority, 16);
+        assert!(lib.can_be_key_server);
+        assert_eq!(lib.macsec_iface.as_deref(), Some("macsec-test"));
+        assert_eq!(lib.replay_window, 32);
+        assert!(lib.encrypt);
+    }
+
+    #[test]
+    fn example_configs_parse() {
+        for (name, text) in [
+            (
+                "wifi_config.yml",
+                include_str!("../../examples/wifi_config.yml"),
+            ),
+            (
+                "eap_config.yml",
+                include_str!("../../examples/eap_config.yml"),
+            ),
+            (
+                "macsec_config.yml",
+                include_str!("../../examples/macsec_config.yml"),
+            ),
+        ] {
+            let config = parse(text);
+            for entry in &config.ethernets {
+                if let Some(macsec) = &entry.macsec {
+                    macsec.to_lib().unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macsec_entry_rejects_bad_hex() {
+        let config = parse(
+            "\
+---
+version: 1
+ethernets:
+  - name: eth0
+    macsec:
+      cak: \"xyz\"
+      ckn: \"0011\"
+",
+        );
+        assert!(
+            config.ethernets[0]
+                .macsec
+                .as_ref()
+                .unwrap()
+                .to_lib()
+                .is_err()
+        );
     }
 
     #[test]
