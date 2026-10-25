@@ -128,6 +128,31 @@ async fn apply_static_ip(
     Ok(())
 }
 
+/// Add an IPv4 route to `destination/prefix` via `gateway`.
+pub(crate) async fn add_route(
+    handle: &rtnetlink::Handle,
+    if_index: u32,
+    destination: Ipv4Addr,
+    prefix_length: u8,
+    gateway: Ipv4Addr,
+) -> Result<(), WifiError> {
+    let route_msg = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(destination, prefix_length)
+        .gateway(gateway)
+        .output_interface(if_index)
+        .build();
+    handle.route().add(route_msg).execute().await.map_err(|e| {
+        WifiError::new(
+            ErrorKind::Nl80211,
+            format!(
+                "route add {destination}/{prefix_length} via {gateway}: {e}"
+            ),
+        )
+    })?;
+    log::info!("Added route {destination}/{prefix_length} via {gateway}");
+    Ok(())
+}
+
 /// Add a default route via `gateway` on `if_index`.
 ///
 /// Linux keeps at most one route per (table, prefix, metric) key, so on

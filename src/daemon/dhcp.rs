@@ -7,7 +7,7 @@
 //! enables kernel Router Advertisement (accept_ra=2) so the
 //! kernel handles SLAAC; DHCPv6 is run on a best-effort basis.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use mozim::{DhcpV4Client, DhcpV4Config, DhcpV4Lease, DhcpV4State};
 use shuli_core::{ErrorKind, WifiError};
@@ -97,15 +97,88 @@ async fn apply_dhcpv4_lease(
         lease.prefix_length()
     );
 
-    // Add default route via the lease gateway.
-    if let Some(ref gateways) = lease.gateways
-        && let Some(gw) = gateways.first()
-    {
-        crate::ip::add_default_route(&handle, if_index, IpAddr::V4(*gw))
+    // RFC 3442: when Classless Static Routes (option 121) are present,
+    // the Router option must be ignored.  A 0.0.0.0/0 entry is the
+    // default route; every other entry is installed as given.
+    for (destination, prefix_length, gateway) in dhcp_routes(lease) {
+        if prefix_length == 0 {
+            crate::ip::add_default_route(
+                &handle,
+                if_index,
+                IpAddr::V4(gateway),
+            )
             .await?;
+        } else {
+            crate::ip::add_route(
+                &handle,
+                if_index,
+                destination,
+                prefix_length,
+                gateway,
+            )
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+/// Turn a DHCPv4 lease into the routes to install.  Option 121 takes
+/// precedence over the Router option (RFC 3442 section 3.1).
+fn dhcp_routes(lease: &DhcpV4Lease) -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
+    if let Some(routes) = &lease.classless_routes {
+        return routes
+            .iter()
+            .map(|route| (route.destination, route.prefix_length, route.router))
+            .collect();
+    }
+    lease
+        .gateways
+        .as_ref()
+        .and_then(|gateways| gateways.first())
+        .map(|gateway| vec![(Ipv4Addr::UNSPECIFIED, 0, *gateway)])
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use mozim::DhcpV4ClasslessRoute;
+
+    use super::*;
+
+    #[test]
+    fn classless_routes_override_the_router_option() {
+        let mut lease = DhcpV4Lease::default();
+        lease.gateways = Some(vec![Ipv4Addr::new(192, 0, 2, 254)]);
+        assert_eq!(
+            dhcp_routes(&lease),
+            vec![(Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::new(192, 0, 2, 254))]
+        );
+
+        lease.classless_routes = Some(vec![
+            DhcpV4ClasslessRoute {
+                destination: Ipv4Addr::UNSPECIFIED,
+                prefix_length: 0,
+                router: Ipv4Addr::new(198, 51, 100, 1),
+            },
+            DhcpV4ClasslessRoute {
+                destination: Ipv4Addr::new(10, 0, 0, 0),
+                prefix_length: 8,
+                router: Ipv4Addr::new(198, 51, 100, 2),
+            },
+        ]);
+        assert_eq!(
+            dhcp_routes(&lease),
+            vec![
+                (Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::new(198, 51, 100, 1)),
+                (
+                    Ipv4Addr::new(10, 0, 0, 0),
+                    8,
+                    Ipv4Addr::new(198, 51, 100, 2)
+                ),
+            ]
+        );
+    }
 }
 
 /// Enable IPv6 Router Advertisement (SLAAC) on the interface by
