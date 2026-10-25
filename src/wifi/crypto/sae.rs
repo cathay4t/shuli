@@ -46,6 +46,9 @@ const EXT_ANTI_CLOGGING_TOKEN: u8 = 93;
 /// Element ID extension of the Password Identifier element (inside the
 /// `WLAN_EID_EXTENSION` = 255 element, 802.11-2020 §9.4.2.47.2).
 const EXT_PASSWORD_IDENTIFIER: u8 = 33;
+/// Element ID extension of the AKM Suite Selector element (inside the
+/// `WLAN_EID_EXTENSION` = 255 element, 802.11-2024 §9.4.2.47.3).
+const EXT_AKM_SUITE_SELECTOR: u8 = 114;
 /// Number of hunting-and-pecking iterations before giving up (both
 /// reference implementations cap at 200; the PWE is found within a few).
 const HNP_MAX_ITER: u16 = 200;
@@ -80,6 +83,9 @@ pub(crate) struct SaeAuth {
     /// H2E PWE derivation and in the commit's Password Identifier
     /// element.  H2E-only, like wpa_supplicant.
     password_id: Option<String>,
+    /// AKM Suite Selector carried in the commit for SAE-EXT-KEY /
+    /// FT-SAE-EXT-KEY (00-0F-AC:24 / 25); `None` for plain SAE.
+    akm_selector: Option<[u8; 4]>,
 }
 
 impl SaeAuth {
@@ -147,6 +153,7 @@ impl SaeAuth {
             own_scalar_bytes: [0u8; 32],
             own_elem_bytes: [0u8; 64],
             password_id: password_id.map(str::to_string),
+            akm_selector: None,
         })
     }
 
@@ -158,6 +165,11 @@ impl SaeAuth {
     /// Whether the PWE was derived with hash-to-element.
     pub(crate) fn is_h2e(&self) -> bool {
         self.h2e
+    }
+
+    /// Set the AKM Suite Selector advertised in the SAE commit.
+    pub(crate) fn set_akm_selector(&mut self, selector: Option<[u8; 4]>) {
+        self.akm_selector = selector;
     }
 
     /// Whether a rejected H2E commit may fall back to hunting-and-pecking.
@@ -218,6 +230,22 @@ impl SaeAuth {
         peer_scalar_bytes: &[u8],
         peer_elem_bytes: &[u8],
     ) -> Result<Vec<u8>, WifiError> {
+        self.process_commit_with_elements(
+            peer_scalar_bytes,
+            peer_elem_bytes,
+            &[],
+        )
+    }
+
+    /// Like [`process_commit`](Self::process_commit) but also validates
+    /// the extended elements that follow the commit-element (AKM Suite
+    /// Selector and Password Identifier).
+    pub(crate) fn process_commit_with_elements(
+        &mut self,
+        peer_scalar_bytes: &[u8],
+        peer_elem_bytes: &[u8],
+        elements: &[u8],
+    ) -> Result<Vec<u8>, WifiError> {
         let peer_scalar = scalar_from_bytes(peer_scalar_bytes)?;
         let peer_elem = projective_from_elem(peer_elem_bytes);
 
@@ -237,6 +265,44 @@ impl SaeAuth {
                 ErrorKind::SaeFailed,
                 "peer commit reflects our own commit",
             ));
+        }
+
+        let parsed = parse_commit_elements(elements)?;
+        if let Some(expected) = self.akm_selector {
+            let peer = parsed
+                .iter()
+                .find(|(id, _)| *id == EXT_AKM_SUITE_SELECTOR)
+                .map(|(_, data)| data)
+                .ok_or_else(|| {
+                    WifiError::new(
+                        ErrorKind::SaeFailed,
+                        "peer SAE commit has no AKM Suite Selector",
+                    )
+                })?;
+            if peer.len() != 4 || peer[..4] != expected[..] {
+                return Err(WifiError::new(
+                    ErrorKind::SaeFailed,
+                    "SAE AKM Suite Selector mismatch",
+                ));
+            }
+        }
+        if let Some(own_id) = &self.password_id {
+            let peer = parsed
+                .iter()
+                .find(|(id, _)| *id == EXT_PASSWORD_IDENTIFIER)
+                .map(|(_, data)| *data)
+                .ok_or_else(|| {
+                    WifiError::new(
+                        ErrorKind::SaeFailed,
+                        "peer SAE commit has no password identifier",
+                    )
+                })?;
+            if peer != own_id.as_bytes() {
+                return Err(WifiError::new(
+                    ErrorKind::SaeFailed,
+                    "SAE password identifier mismatch",
+                ));
+            }
         }
 
         // K = rand * (peer_scalar * PWE + peer_elem); k = K.x
@@ -383,6 +449,7 @@ impl SaeAuth {
             &element,
             None,
             self.password_id.as_deref().map(str::as_bytes),
+            self.akm_selector,
         )
     }
 
@@ -411,6 +478,7 @@ impl SaeAuth {
             &self.own_elem_bytes,
             Some(token),
             self.password_id.as_deref().map(str::as_bytes),
+            self.akm_selector,
         ))
     }
 }
@@ -424,11 +492,13 @@ fn build_commit_auth_data(
     element: &[u8],
     token: Option<&[u8]>,
     password_id: Option<&[u8]>,
+    akm_selector: Option<[u8; 4]>,
 ) -> Vec<u8> {
     let token_len = token.map_or(0, |t| t.len());
     let id_len = password_id.map_or(0, |id| 3 + id.len());
+    let akm_len = akm_selector.map_or(0, |_| 3 + 4);
     let mut auth_data = Vec::with_capacity(
-        6 + scalar.len() + element.len() + token_len + id_len + 3,
+        6 + scalar.len() + element.len() + token_len + id_len + akm_len + 3,
     );
     auth_data.extend_from_slice(&1u16.to_le_bytes()); // transaction = commit
     // status: SAE_HASH_TO_ELEMENT for H2E, 0 for hunting-and-pecking
@@ -462,7 +532,51 @@ fn build_commit_auth_data(
         auth_data.push(EXT_ANTI_CLOGGING_TOKEN);
         auth_data.extend_from_slice(token);
     }
+    if let Some(selector) = akm_selector {
+        // AKM Suite Selector: FF || 5 || 114 || OUI || type.
+        auth_data.push(255);
+        auth_data.push(1 + selector.len() as u8);
+        auth_data.push(EXT_AKM_SUITE_SELECTOR);
+        auth_data.extend_from_slice(&selector);
+    }
     auth_data
+}
+
+fn parse_commit_elements(
+    elements: &[u8],
+) -> Result<Vec<(u8, &[u8])>, WifiError> {
+    let mut parsed = Vec::new();
+    let mut offset = 0;
+    while offset < elements.len() {
+        if elements.len() - offset < 2 {
+            return Err(WifiError::new(
+                ErrorKind::SaeFailed,
+                "truncated SAE commit element",
+            ));
+        }
+        let id = elements[offset];
+        let len = elements[offset + 1] as usize;
+        if len == 0 || offset + 2 + len > elements.len() {
+            return Err(WifiError::new(
+                ErrorKind::SaeFailed,
+                "invalid SAE commit element length",
+            ));
+        }
+        if id == 255 {
+            if len < 1 {
+                return Err(WifiError::new(
+                    ErrorKind::SaeFailed,
+                    "invalid extended SAE commit element",
+                ));
+            }
+            parsed.push((
+                elements[offset + 2],
+                &elements[offset + 3..offset + 2 + len],
+            ));
+        }
+        offset += 2 + len;
+    }
+    Ok(parsed)
 }
 
 /// Parse the anti-clogging token from a status-76 commit response.

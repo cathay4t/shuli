@@ -65,6 +65,13 @@ impl AuthMethod {
         )?))
     }
 
+    /// Set the AKM Suite Selector for SAE-EXT-KEY commits.
+    pub(crate) fn set_akm_selector(&mut self, selector: Option<[u8; 4]>) {
+        match self {
+            AuthMethod::Sae(sae) => sae.set_akm_selector(selector),
+        }
+    }
+
     /// Build the initial AUTHENTICATE payload (SAE commit for WPA3).
     pub(crate) fn initial_frame(&mut self) -> Result<Vec<u8>, WifiError> {
         match self {
@@ -227,8 +234,11 @@ fn process_sae_frame(
                     format!("unsupported SAE group {group}"),
                 ));
             }
-            let confirm =
-                sae.process_commit(&payload[2..34], &payload[34..98])?;
+            let confirm = sae.process_commit_with_elements(
+                &payload[2..34],
+                &payload[34..98],
+                &payload[98..],
+            )?;
             Ok(AuthAction::SendConfirm(confirm))
         }
         // AP confirm: send_confirm(2 LE) || CN(32). SAE is done.
@@ -399,17 +409,32 @@ impl WifiIface {
             "AP RSNXE advertises SAE H2E: {ap_supports_h2e} (sae_pwe={:?})",
             self.link.network.sae_pwe
         );
-        self.auth.method = Some(AuthMethod::new_sae(
+        let ext_key = matches!(
+            self.link.bss_info.security,
+            SecurityType::SaeExtKey | SecurityType::FtSaeExtKey
+        );
+        let mut method = AuthMethod::new_sae(
             password,
             &self.link.network.ssid,
             self.core.nl.mac,
             self.link.bss_info.bssid,
-            self.link.network.sae_pwe.starts_h2e(ap_supports_h2e)
+            ext_key
+                || self.link.network.sae_pwe.starts_h2e(ap_supports_h2e)
                 || self.link.network.sae_password_id.is_some(),
-            self.link.network.sae_pwe.allows_hnp_fallback()
+            !ext_key
+                && self.link.network.sae_pwe.allows_hnp_fallback()
                 && self.link.network.sae_password_id.is_none(),
             self.link.network.sae_password_id.as_deref(),
-        )?);
+        )?;
+        if ext_key {
+            // AKM 24/25 require hash-to-element and an AKM Suite
+            // Selector in every commit (802.11-2024 §12.4.5.1).
+            method.set_akm_selector(Some(match self.link.bss_info.security {
+                SecurityType::SaeExtKey => [0x00, 0x0f, 0xac, 0x18],
+                _ => [0x00, 0x0f, 0xac, 0x19],
+            }));
+        }
+        self.auth.method = Some(method);
 
         let auth_data = self.auth.method.as_mut().unwrap().initial_frame()?;
         let attrs = wl_nl80211::Nl80211Authenticate::new(self.core.nl.if_index)

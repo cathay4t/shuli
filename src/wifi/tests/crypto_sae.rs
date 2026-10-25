@@ -129,9 +129,67 @@ fn test_sae_password_identifier() {
     )
     .unwrap();
     let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
-    supp.process_commit(&ap_scalar, &ap_elem).unwrap();
-    ap.process_commit(&supp_scalar, &supp_elem).unwrap();
+    let mut id_elem = vec![0xff, 1 + 7, 33];
+    id_elem.extend_from_slice(b"corp-id");
+    supp.process_commit_with_elements(&ap_scalar, &ap_elem, &id_elem)
+        .unwrap();
+    ap.process_commit_with_elements(&supp_scalar, &supp_elem, &id_elem)
+        .unwrap();
     assert_eq!(supp.pmk(), ap.pmk(), "PMK must match with the same id");
+}
+
+#[test]
+fn test_sae_ext_key_commit_carries_and_validates_akm_selector() {
+    let mut rng = getrandom::SysRng;
+    let (mac_sta, mac_ap) = test_macs();
+    let ssid = "Test-WIFI";
+    let selector = [0x00, 0x0f, 0xac, 0x18];
+
+    let mut supp =
+        SaeAuth::new("12345678", ssid, mac_sta, mac_ap, true, false).unwrap();
+    supp.set_akm_selector(Some(selector));
+    let auth_data = supp.build_init_auth_msg();
+    assert_eq!(
+        &auth_data[auth_data.len() - 7..],
+        &[0xff, 5, 114, 0x00, 0x0f, 0xac, 0x18],
+        "commit must end with the AKM Suite Selector element"
+    );
+    let body = &auth_data[4..];
+    let supp_scalar = &body[2..34];
+    let supp_elem = &body[34..98];
+
+    let mut ap =
+        SaeAuth::new("12345678", ssid, mac_ap, mac_sta, true, false).unwrap();
+    ap.set_akm_selector(Some(selector));
+    let ap_auth = ap.build_init_auth_msg();
+    let ap_body = &ap_auth[4..];
+    let ap_scalar = &ap_body[2..34];
+    let ap_elem = &ap_body[34..98];
+    let akm_elem = [0xff, 5, 114, 0x00, 0x0f, 0xac, 0x18];
+
+    supp.process_commit_with_elements(ap_scalar, ap_elem, &akm_elem)
+        .unwrap();
+    ap.process_commit_with_elements(supp_scalar, supp_elem, &akm_elem)
+        .unwrap();
+    assert_eq!(supp.pmk(), ap.pmk());
+
+    let mut missing =
+        SaeAuth::new("12345678", ssid, mac_sta, mac_ap, true, false).unwrap();
+    missing.set_akm_selector(Some(selector));
+    missing.build_commit(&mut rng).unwrap();
+    let err = missing
+        .process_commit_with_elements(ap_scalar, ap_elem, &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("AKM Suite Selector"), "{err}");
+
+    let mut wrong =
+        SaeAuth::new("12345678", ssid, mac_sta, mac_ap, true, false).unwrap();
+    wrong.set_akm_selector(Some([0x00, 0x0f, 0xac, 0x19]));
+    wrong.build_commit(&mut rng).unwrap();
+    let err = wrong
+        .process_commit_with_elements(ap_scalar, ap_elem, &akm_elem)
+        .unwrap_err();
+    assert!(err.to_string().contains("mismatch"), "{err}");
 }
 
 /// an AP that requires SAE-PK (status 127) fails cleanly
