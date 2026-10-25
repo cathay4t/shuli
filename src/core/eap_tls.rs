@@ -85,6 +85,16 @@ pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>, WifiError> {
     CertificateDer::from_pem_slice(pem.as_bytes()).map_err(tls_err)
 }
 
+/// Parse every certificate in a PEM file (certificate chains and CA
+/// bundles).
+pub fn certs_from_pem(
+    pem: &str,
+) -> Result<Vec<CertificateDer<'static>>, WifiError> {
+    CertificateDer::pem_slice_iter(pem.as_bytes())
+        .map(|certificate| certificate.map_err(tls_err))
+        .collect()
+}
+
 /// Parse a PEM private key.
 pub fn key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>, WifiError> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(tls_err)
@@ -106,6 +116,11 @@ pub struct EapTlsMethod {
     rx_fragments: Vec<u8>,
     /// Total TLS length announced by the L bit of the first fragment.
     rx_expected_len: Option<u32>,
+    /// TLS bytes waiting to be sent, and how many were already sent.
+    tx_queue: Vec<u8>,
+    tx_offset: usize,
+    tx_total: usize,
+    max_tls_fragment: usize,
     msk: Option<[u8; MSK_LEN]>,
 }
 
@@ -123,8 +138,60 @@ impl EapTlsMethod {
             rx_buf: Vec::new(),
             rx_fragments: Vec::new(),
             rx_expected_len: None,
+            tx_queue: Vec::new(),
+            tx_offset: 0,
+            tx_total: 0,
+            max_tls_fragment: 1200,
             msk: None,
         })
+    }
+
+    /// Set the maximum TLS payload per EAP-TLS fragment (tests use a
+    /// small value to exercise fragmentation).
+    #[cfg(test)]
+    pub(crate) fn set_max_fragment_len(&mut self, len: usize) {
+        self.max_tls_fragment = len.max(1);
+    }
+
+    fn next_tx_fragment(&mut self) -> Vec<u8> {
+        if self.tx_queue.is_empty() || self.tx_offset >= self.tx_queue.len() {
+            return build_tls_message(&[]);
+        }
+        let remaining = self.tx_queue.len() - self.tx_offset;
+        let take = remaining.min(self.max_tls_fragment);
+        let first = self.tx_offset == 0;
+        let more = take < remaining;
+        let mut flags = 0u8;
+        if first {
+            flags |= EAP_TLS_FLAG_L;
+        }
+        if more {
+            flags |= EAP_TLS_FLAG_M;
+        }
+        let mut body = Vec::with_capacity(1 + 4 + take);
+        body.push(flags);
+        if first {
+            body.extend_from_slice(&(self.tx_total as u32).to_be_bytes());
+        }
+        body.extend_from_slice(
+            &self.tx_queue[self.tx_offset..self.tx_offset + take],
+        );
+        self.tx_offset += take;
+        if !more {
+            self.tx_queue.clear();
+            self.tx_offset = 0;
+            self.tx_total = 0;
+        }
+        body
+    }
+
+    fn queue_tls_output(&mut self, output: Vec<u8>) {
+        if output.is_empty() {
+            return;
+        }
+        self.tx_queue = output;
+        self.tx_offset = 0;
+        self.tx_total = self.tx_queue.len();
     }
 
     /// Build the method from an [`EapConfig`] (certificate PEM files on
@@ -160,11 +227,11 @@ impl EapTlsMethod {
             )
         })?;
 
-        let ca = cert_from_pem(&read_pem(ca_path, "CA certificate")?)?;
+        let ca = certs_from_pem(&read_pem(ca_path, "CA certificate")?)?;
         let cert =
-            cert_from_pem(&read_pem(client_cert, "client certificate")?)?;
+            certs_from_pem(&read_pem(client_cert, "client certificate")?)?;
         let key = key_from_pem(&read_pem(client_key, "client key")?)?;
-        let config = client_config(&[ca], vec![cert], key)?;
+        let config = client_config(&ca, cert, key)?;
         Self::new(config, server_name)
     }
 }
@@ -199,6 +266,13 @@ impl EapMethod for EapTlsMethod {
             ));
         };
 
+        // A pure ACK (flags 0, no data) asks for the next fragment of
+        // the TLS message we are sending.
+        let ack = flags == 0 && data.is_empty();
+        if ack {
+            return Ok(self.next_tx_fragment());
+        }
+
         // RFC 5216 receive-side fragmentation: a message with the M
         // bit (or one whose L bit announced a longer total) is
         // acknowledged with an empty EAP-TLS response and only fed to
@@ -210,17 +284,52 @@ impl EapMethod for EapTlsMethod {
                     "EAP-TLS message with L bit but no length field",
                 ));
             }
-            let len = u32::from_be_bytes(body[1..5].try_into().unwrap());
-            self.rx_expected_len = Some(len);
+            let len =
+                u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+            if len > 65_535 {
+                return Err(WifiError::new(
+                    ErrorKind::HandshakeFailed,
+                    "EAP-TLS message length exceeds the reassembly limit",
+                ));
+            }
+            if let Some(expected) = self.rx_expected_len
+                && expected as usize != len
+            {
+                return Err(WifiError::new(
+                    ErrorKind::HandshakeFailed,
+                    "EAP-TLS fragments announce different lengths",
+                ));
+            }
+            self.rx_expected_len = Some(len as u32);
+        }
+        let limit = self
+            .rx_expected_len
+            .map(|len| len as usize)
+            .unwrap_or(65_535);
+        if self.rx_fragments.len() + data.len() > limit {
+            self.rx_fragments.clear();
+            self.rx_expected_len = None;
+            return Err(WifiError::new(
+                ErrorKind::HandshakeFailed,
+                "EAP-TLS fragment exceeds the announced message length",
+            ));
         }
         if !data.is_empty() {
             self.rx_fragments.extend_from_slice(data);
         }
-        let complete = self
-            .rx_expected_len
-            .is_none_or(|len| self.rx_fragments.len() as u32 >= len)
-            && flags & EAP_TLS_FLAG_M == 0;
+        let complete = flags & EAP_TLS_FLAG_M == 0
+            && self
+                .rx_expected_len
+                .is_none_or(|len| self.rx_fragments.len() as u32 == len);
         if !complete {
+            if flags & EAP_TLS_FLAG_M == 0 {
+                self.rx_fragments.clear();
+                self.rx_expected_len = None;
+                return Err(WifiError::new(
+                    ErrorKind::HandshakeFailed,
+                    "short EAP-TLS message did not reach its announced                      length",
+                ));
+            }
             // ACK this fragment; the rest of the message is coming.
             return Ok(build_tls_message(&[]));
         }
@@ -260,7 +369,8 @@ impl EapMethod for EapTlsMethod {
             self.msk = Some(msk);
         }
 
-        Ok(build_tls_message(&out))
+        self.queue_tls_output(out);
+        Ok(self.next_tx_fragment())
     }
 
     fn msk(&self) -> Option<[u8; MSK_LEN]> {

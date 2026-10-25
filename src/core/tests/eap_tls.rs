@@ -14,8 +14,9 @@ use crate::{
         EapPacket, EapPeer, TYPE_IDENTITY, TYPE_TLS,
     },
     eap_tls::{
-        EAP_TLS_FLAG_START, EapTlsMethod, build_tls_message, cert_from_pem,
-        client_config, key_from_pem, parse_tls_message,
+        EAP_TLS_FLAG_L, EAP_TLS_FLAG_M, EAP_TLS_FLAG_START, EapTlsMethod,
+        build_tls_message, cert_from_pem, certs_from_pem, client_config,
+        key_from_pem, parse_tls_message,
     },
 };
 
@@ -65,6 +66,72 @@ fn test_tls_message_framing_roundtrip() {
     // L bit without the 4-octet length field is malformed.
     let err = parse_tls_message(&[0x80, 1, 2]).unwrap_err();
     assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+}
+
+#[test]
+fn test_pem_chain_loads_every_certificate() {
+    let chain = format!("{CA_PEM}\n{SERVER_PEM}");
+    assert_eq!(certs_from_pem(&chain).unwrap().len(), 2);
+    let bundle = format!("{CA_PEM}\n{SERVER_PEM}\n{CLIENT_PEM}");
+    assert_eq!(certs_from_pem(&bundle).unwrap().len(), 3);
+    assert!(certs_from_pem("not a pem").unwrap().is_empty());
+}
+
+#[test]
+fn test_outgoing_tls_message_is_fragmented() {
+    let mut client = client_method();
+    client.set_max_fragment_len(10);
+    let first = client
+        .handle_request(1, &[EAP_TLS_FLAG_START])
+        .expect("start");
+    assert_ne!(first[0] & EAP_TLS_FLAG_L, 0, "first fragment has L");
+    assert_ne!(first[0] & EAP_TLS_FLAG_M, 0, "first fragment has M");
+    let total = u32::from_be_bytes(first[1..5].try_into().unwrap()) as usize;
+    let mut data = first[5..].to_vec();
+    assert!(data.len() <= 10);
+    let mut flags = first[0];
+    let mut rounds = 0;
+    while flags & EAP_TLS_FLAG_M != 0 {
+        let next = client.handle_request(1, &[0]).expect("next fragment");
+        flags = next[0];
+        if round_more(flags) {
+            assert_eq!(flags & EAP_TLS_FLAG_L, 0, "L only on the first");
+        }
+        data.extend_from_slice(&next[1..]);
+        rounds += 1;
+        assert!(rounds < 100, "fragmentation did not finish");
+    }
+    assert_eq!(data.len(), total, "all announced bytes were sent");
+}
+
+fn round_more(flags: u8) -> bool {
+    flags & EAP_TLS_FLAG_M != 0
+}
+
+#[test]
+fn test_incoming_fragment_cannot_exceed_announced_length() {
+    let mut client = client_method();
+    client.handle_request(1, &[EAP_TLS_FLAG_START]).unwrap();
+    let mut body = vec![EAP_TLS_FLAG_L, 0, 0, 0, 10];
+    body.extend_from_slice(&[0u8; 8]);
+    body[0] |= EAP_TLS_FLAG_M;
+    let ack = client.handle_request(1, &body).unwrap();
+    assert_eq!(ack, vec![0]);
+
+    let mut overlong = vec![0u8; 4];
+    overlong.extend_from_slice(&[0u8; 4]);
+    let err = client.handle_request(1, &overlong).unwrap_err();
+    assert!(err.to_string().contains("exceeds"), "{err}");
+}
+
+#[test]
+fn test_incoming_first_fragment_cannot_exceed_announced_length() {
+    let mut client = client_method();
+    client.handle_request(1, &[EAP_TLS_FLAG_START]).unwrap();
+    let mut body = vec![EAP_TLS_FLAG_L, 0, 0, 0, 4];
+    body.extend_from_slice(&[0u8; 8]);
+    let err = client.handle_request(1, &body).unwrap_err();
+    assert!(err.to_string().contains("exceeds"), "{err}");
 }
 
 #[test]
@@ -259,4 +326,99 @@ fn test_eap_peer_full_tls_exchange() {
         peer.msk().expect("MSK") != [0u8; 64],
         "MSK must be non-zero"
     );
+}
+
+#[test]
+fn test_eap_tls_handshake_with_fragmented_server_flights() {
+    let mut client = client_method();
+    let mut server = server_connection();
+
+    let mut server_tx = Vec::new();
+    let mut first = true;
+    let mut rounds = 0;
+    loop {
+        let request = if first {
+            first = false;
+            vec![EAP_TLS_FLAG_START]
+        } else {
+            build_tls_message(&server_tx)
+        };
+        server_tx.clear();
+
+        let mut next_request = request;
+        loop {
+            let response =
+                client.handle_request(1, &next_request).expect("client");
+            let (_, tls_data) =
+                parse_tls_message(&response).expect("parse response");
+            if !tls_data.is_empty() {
+                let used =
+                    server.read_tls(&mut Cursor::new(tls_data)).expect("read");
+                assert_eq!(
+                    used,
+                    tls_data.len(),
+                    "server consumed all TLS data"
+                );
+            }
+            server.process_new_packets().expect("server process");
+            server.write_tls(&mut server_tx).expect("server write");
+            if tls_data.is_empty() || server_tx.is_empty() {
+                break;
+            }
+            next_request = vec![0];
+        }
+
+        // Fragment the server flight into 5-byte EAP-TLS messages.
+        let flight = std::mem::take(&mut server_tx);
+        if !flight.is_empty() {
+            let total = flight.len();
+            let mut offset = 0;
+            while offset < total {
+                let take = (total - offset).min(5);
+                let mut body = Vec::new();
+                let more = offset + take < total;
+                body.push(if offset == 0 { EAP_TLS_FLAG_L } else { 0 });
+                if offset == 0 {
+                    body.extend_from_slice(&(total as u32).to_be_bytes());
+                }
+                if more {
+                    body[0] |= EAP_TLS_FLAG_M;
+                }
+                body.extend_from_slice(&flight[offset..offset + take]);
+                let response =
+                    client.handle_request(1, &body).expect("fragment");
+                if more {
+                    assert_eq!(response, vec![0], "fragment ACK");
+                } else {
+                    let (_, tls_data) =
+                        parse_tls_message(&response).expect("parse final");
+                    if !tls_data.is_empty() {
+                        server
+                            .read_tls(&mut Cursor::new(tls_data))
+                            .expect("read");
+                    }
+                    server.process_new_packets().expect("process");
+                    server.write_tls(&mut server_tx).expect("write");
+                }
+                offset += take;
+            }
+        }
+
+        rounds += 1;
+        assert!(rounds < 30, "TLS handshake did not converge");
+        if !server.is_handshaking() && client.msk().is_some() {
+            break;
+        }
+    }
+
+    let client_msk = client.msk().expect("client MSK");
+    let mut km = [0u8; 128];
+    let km = server
+        .export_keying_material(
+            &mut km,
+            b"EXPORTER_EAP_TLS_Key_Material",
+            Some(&[TYPE_TLS]),
+        )
+        .expect("server exporter");
+    assert_eq!(&client_msk[..], &km[..64]);
 }
