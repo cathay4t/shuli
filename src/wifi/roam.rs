@@ -766,8 +766,9 @@ impl WifiIface {
     /// wait (bounded) for the response, merging the reported channels
     /// into [`Self::roam_freqs`]. Runs before every quick roam scan when
     /// the AP advertises the capability; on failure or timeout the quick
-    /// scan proceeds with the frequencies already known. Non-response
-    /// events are left queued for the regular state machine.
+    /// scan proceeds with the frequencies already known. Events that
+    /// arrive while waiting are dispatched to the regular state machine
+    /// instead of being dropped.
     async fn request_neighbor_report_freqs(&mut self) {
         if !self.link.bss_info.rm_neighbor_report {
             return;
@@ -812,6 +813,7 @@ impl WifiIface {
             .await
             {
                 Ok(Some(raw_msg)) => {
+                    let info = self.disconnect_info(&raw_msg);
                     if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {
                             Nl80211Event::Frame(Ieee80211Frame::Action(
@@ -831,7 +833,10 @@ impl WifiIface {
                                 )
                                 .await;
                             }
-                            _ => {}
+                            other => {
+                                Box::pin(self.handle_client_event(other, info))
+                                    .await;
+                            }
                         }
                     }
                 }
