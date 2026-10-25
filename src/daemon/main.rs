@@ -240,8 +240,6 @@ async fn run_wifi_interfaces(
                                 .map(String::as_str)
                                 != Some(ssid.as_str())
                             {
-                                applied_ssid
-                                    .insert(iface_name.clone(), ssid.clone());
                                 log::info!(
                                     "connection established to '{ssid}' on \
                                      {iface_name} - link up"
@@ -259,7 +257,7 @@ async fn run_wifi_interfaces(
                                     .find(|entry| entry.ssid == ssid)
                                 {
                                     Some(entry) => {
-                                        if let Err(e) = apply_network_config(
+                                        match apply_network_config(
                                             iface_name,
                                             entry.dns.as_ref(),
                                             entry.ipv4.as_ref(),
@@ -267,12 +265,21 @@ async fn run_wifi_interfaces(
                                         )
                                         .await
                                         {
-                                            log::warn!("IP config failed: {e}");
+                                            Ok(()) => {
+                                                applied_ssid.insert(
+                                                    iface_name.clone(),
+                                                    ssid.clone(),
+                                                );
+                                                log::info!(
+                                                    "holding connection on \
+                                                     {iface_name} (Ctrl-C to \
+                                                     disconnect)"
+                                                );
+                                            }
+                                            Err(e) => log::warn!(
+                                                "IP config failed: {e}"
+                                            ),
                                         }
-                                        log::info!(
-                                            "holding connection on {iface_name} \
-                                             (Ctrl-C to disconnect)"
-                                        );
                                     }
                                     None => log::warn!(
                                         "no wifis config entry for connected \
@@ -437,13 +444,12 @@ async fn run_wired_interface(
                     match result {
                         Ok(shuli_wired::WiredState::Connected) => {
                             if !connected {
-                                connected = true;
                                 log::info!(
                                     "wired authentication authorized on {} \
                                      - link up ({ip_iface})",
                                     entry.name
                                 );
-                                if let Err(e) = apply_network_config(
+                                match apply_network_config(
                                     &ip_iface,
                                     entry.dns.as_ref(),
                                     entry.ipv4.as_ref(),
@@ -451,9 +457,10 @@ async fn run_wired_interface(
                                 )
                                 .await
                                 {
-                                    log::warn!(
+                                    Ok(()) => connected = true,
+                                    Err(e) => log::warn!(
                                         "IP config failed on {ip_iface}: {e}"
-                                    );
+                                    ),
                                 }
                             }
                             if !is_macsec {
