@@ -485,6 +485,13 @@ fn hex_bytes(value: &str) -> Vec<u8> {
 }
 
 #[test]
+fn identity_hex_rejects_non_ascii_without_panicking() {
+    assert!("keyid:€a".parse::<Identity>().is_err());
+    assert!("keyid:+f".parse::<Identity>().is_err());
+    assert!("keyid:0f".parse::<Identity>().is_ok());
+}
+
+#[test]
 fn identity_uses_rfc_7296_id_types() {
     use std::net::Ipv6Addr;
 

@@ -149,10 +149,16 @@ fn unhex(value: &str) -> Result<Vec<u8>, IpsecError> {
     if !value.len().is_multiple_of(2) {
         return Err(IpsecError::config("identity hex value has an odd length"));
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| {
+    let digits = value.as_bytes();
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(IpsecError::config("identity contains invalid hex"));
+    }
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .expect("ASCII hex digits are valid UTF-8");
+            u8::from_str_radix(pair, 16).map_err(|_| {
                 IpsecError::config("identity contains invalid hex")
             })
         })
