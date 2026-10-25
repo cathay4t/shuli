@@ -95,6 +95,9 @@ pub(crate) struct DistSak {
     pub(crate) an: u8,
     pub(crate) confidentiality_offset: u8,
     pub(crate) kn: u32,
+    /// Explicit cipher suite ID when the body is 36+ octets; `None`
+    /// means the default GCM-AES-128 suite.
+    pub(crate) cipher_suite: Option<[u8; 8]>,
     pub(crate) wrapped_sak: Vec<u8>,
 }
 
@@ -339,6 +342,11 @@ impl MkaPdu {
         if body_len < ICV_LEN + 4 || eapol.len() < 4 + body_len {
             return Err(mka_err("truncated EAPOL-MKA frame"));
         }
+        if !body_len.is_multiple_of(4) {
+            return Err(mka_err(
+                "EAPOL-MKA body length is not a multiple of 4",
+            ));
+        }
         let icv_start = 4 + body_len - ICV_LEN;
         if !verify_icv(ick, da, sa, &eapol[..icv_start], &eapol[icv_start..]) {
             return Err(mka_err("invalid MKPDU ICV"));
@@ -411,7 +419,7 @@ impl MkaPdu {
                     potential_peers = read_peers(data, 0, length / 16);
                 }
                 3 => {
-                    if length == 40 {
+                    if length >= 40 {
                         let latest_ki = KeyId {
                             mi: data[0..12].try_into().unwrap(),
                             kn: u32::from_be_bytes(
@@ -446,15 +454,19 @@ impl MkaPdu {
                     }
                 }
                 4 => {
-                    let (cipher_len, kn) = if length >= 4 {
+                    let (cipher_suite, kn) = if length >= 4 {
                         let kn =
                             u32::from_be_bytes(data[..4].try_into().unwrap());
-                        let cipher_len = if length >= 36 { 8 } else { 0 };
-                        (cipher_len, kn)
+                        let cipher_suite = if length >= 36 {
+                            Some(data[4..12].try_into().unwrap())
+                        } else {
+                            None
+                        };
+                        (cipher_suite, kn)
                     } else {
-                        (0, 0)
+                        (None, 0)
                     };
-                    let wrapped_start = 4 + cipher_len;
+                    let wrapped_start = 4 + cipher_suite.map_or(0, |_| 8);
                     let wrapped_sak = if length == 0 {
                         Vec::new()
                     } else if data.len() >= wrapped_start {
@@ -466,6 +478,7 @@ impl MkaPdu {
                         an: (octet2 >> 6) & 0x03,
                         confidentiality_offset: (octet2 >> 4) & 0x03,
                         kn,
+                        cipher_suite,
                         wrapped_sak,
                     });
                 }
@@ -770,6 +783,20 @@ fn sak_use_matches(local: Option<KeyId>, peer: KeyId) -> bool {
     local == Some(peer)
 }
 
+const CS_ID_GCM_AES_128: [u8; 8] =
+    [0x00, 0x80, 0x02, 0x00, 0x01, 0x00, 0x00, 0x01];
+
+fn dist_sak_supported(encrypt: bool, dist: &DistSak) -> bool {
+    if dist.confidentiality_offset > 1 {
+        return false;
+    }
+    if encrypt != (dist.confidentiality_offset == 1) {
+        return false;
+    }
+    dist.cipher_suite
+        .is_none_or(|suite| suite == CS_ID_GCM_AES_128)
+}
+
 fn confidentiality_offset(encrypt: bool) -> u8 {
     if encrypt { 1 } else { 0 }
 }
@@ -924,6 +951,9 @@ impl MkaSession {
         frame: crate::eap::EapolFrame,
     ) -> Result<(), WifiError> {
         if frame.payload.len() < 4 || frame.payload[1] != EAPOL_TYPE_MKA {
+            return Ok(());
+        }
+        if frame.dst != PAE_GROUP_ADDR || frame.src[0] & 1 != 0 {
             return Ok(());
         }
         // Packet sockets may echo our own transmitted frame back.
@@ -1112,6 +1142,13 @@ impl MkaSession {
             && !self.is_key_server
             && !dist.wrapped_sak.is_empty()
         {
+            if !dist_sak_supported(self.encrypt, dist) {
+                log::warn!(
+                    "ignoring Distributed SAK with unsupported cipher suite \
+                     or confidentiality offset"
+                );
+                return Ok(());
+            }
             let ki = KeyId {
                 mi: sender_mi,
                 kn: dist.kn,
@@ -1379,6 +1416,7 @@ impl MkaSession {
             an,
             confidentiality_offset: confidentiality_offset(self.encrypt),
             kn,
+            cipher_suite: None,
             wrapped_sak: wrapped,
         });
 
@@ -1833,8 +1871,9 @@ mod tests {
             }),
             dist_sak: Some(DistSak {
                 an: 1,
-                confidentiality_offset: 0,
+                confidentiality_offset: 1,
                 kn: 4,
+                cipher_suite: None,
                 wrapped_sak: vec![0xa5; 24],
             }),
         };
@@ -1853,6 +1892,41 @@ mod tests {
         assert!(mn_is_recent(10, 8));
         assert!(!mn_is_recent(10, 7));
         assert!(!mn_is_recent(10, 10));
+    }
+
+    #[test]
+    fn distributed_sak_rejects_unsupported_cipher_or_offset() {
+        let mut dist = DistSak {
+            an: 1,
+            confidentiality_offset: 1,
+            kn: 1,
+            cipher_suite: None,
+            wrapped_sak: vec![0; 24],
+        };
+        assert!(dist_sak_supported(true, &dist));
+        dist.cipher_suite = Some(CS_ID_GCM_AES_128);
+        assert!(dist_sak_supported(true, &dist));
+        dist.cipher_suite = Some([0, 0x80, 0xc2, 0, 1, 0, 0, 3]);
+        assert!(!dist_sak_supported(true, &dist));
+        dist.cipher_suite = None;
+        dist.confidentiality_offset = 2;
+        assert!(!dist_sak_supported(true, &dist));
+        dist.confidentiality_offset = 0;
+        assert!(!dist_sak_supported(true, &dist));
+        assert!(dist_sak_supported(false, &dist));
+    }
+
+    #[test]
+    fn sak_use_parameter_set_accepts_trailing_extension_bytes() {
+        let mut body = vec![0u8; 36];
+        body[0] = MKA_VERSION;
+        body[2] = 0x00;
+        body[3] = 32;
+        let mut sak_use = vec![3u8, 0, 0, 44];
+        sak_use.extend_from_slice(&[0u8; 44]);
+        body.extend_from_slice(&sak_use);
+        let pdu = MkaPdu::parse_body(&body).expect("parse body");
+        assert!(pdu.sak_use.is_some());
     }
 
     #[test]
