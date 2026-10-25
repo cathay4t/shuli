@@ -1560,8 +1560,15 @@ impl WifiIface {
         if self.link.network.ext_key_id {
             rsne_set_ext_key_id(&mut rsne, true);
         }
+        let ft_mic_alg = match target.security {
+            SecurityType::FtSaeExtKey => {
+                crate::crypto::handshake4::MicAlg::HmacSha256
+            }
+            _ => crate::crypto::handshake4::MicAlg::AesCmac,
+        };
         let mut fw = FourWayState::new_ft(
             pmk_r1.clone(),
+            ft_mic_alg,
             self.core.nl.mac,
             target.bssid,
             rsne,

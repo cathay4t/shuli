@@ -125,11 +125,13 @@ impl FourWayState {
     }
 
     /// 4-way state for an initial association with an FT AKM (FT-PSK /
-    /// FT-SAE): the PTK is derived from PMK-R1 (which itself comes from
-    /// PMK-R0 over the R1KH of the associated AP), and the MIC uses
-    /// AES-CMAC regardless of the underlying PSK (802.11-2020 §12.8).
+    /// FT-SAE / FT-SAE-EXT-KEY): the PTK is derived from PMK-R1 (which
+    /// itself comes from PMK-R0 over the R1KH of the associated AP).  The
+    /// MIC algorithm follows the AKM: AES-CMAC for FT-PSK and FT-SAE,
+    /// HMAC-SHA-256 for FT-SAE-EXT-KEY (802.11-2024 Table 12-11).
     pub fn new_ft(
         ft_pmk_r1: super::ft::PmkR1,
+        mic_alg: MicAlg,
         mac_sta: [u8; 6],
         mac_ap: [u8; 6],
         rsne: Vec<u8>,
@@ -153,7 +155,7 @@ impl FourWayState {
             ap_rsnxe,
             gtk: None,
             gtk_index: 0,
-            mic_alg: MicAlg::AesCmac,
+            mic_alg,
             desc_version: 0,
             ft_pmk_r1: Some(ft_pmk_r1),
             ocv: false,

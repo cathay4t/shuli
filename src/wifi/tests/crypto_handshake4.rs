@@ -182,6 +182,70 @@ fn test_gtk_unwrap() {
 }
 
 #[test]
+fn test_ft_sae_ext_key_uses_hmac_sha256_mic() {
+    let sta = [0x03u8; 6];
+    let ap = [0x04u8; 6];
+    let mut state = FourWayState::new_ft(
+        PmkR1 {
+            key: [0x11u8; 32],
+            name: [0x22u8; 16],
+        },
+        MicAlg::HmacSha256,
+        sta,
+        ap,
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    let anonce = [0x55u8; 32];
+    let msg1 = Ieee80211EapolKeyFrame::build(
+        0x0080 | 0x0008,
+        16,
+        1,
+        &anonce,
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let msg1 = Ieee80211EapolKeyFrame::parse(&msg1).unwrap();
+    let msg2 = state
+        .process_message_1(
+            &msg1.key_nonce,
+            msg1.replay_counter,
+            msg1.desc_version(),
+        )
+        .unwrap();
+    let kck = state.kck().unwrap();
+    let m2 = Ieee80211EapolKeyFrame::parse(&msg2).unwrap();
+    let expected = hmac_sha256_mic(
+        &kck,
+        &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2),
+    );
+    assert_eq!(m2.key_mic, expected);
+    assert_ne!(
+        m2.key_mic,
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2))
+            .unwrap()
+    );
+
+    let key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
+        key_info, 16, 2, &anonce, &[0u8; 16], &[0u8; 8], &[0u8; 8], &[0u8; 16],
+        b"",
+    );
+    let mic = hmac_sha256_mic(
+        &kck,
+        &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3),
+    );
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &mic);
+    let msg3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
+    state.process_message_3(&msg3).unwrap();
+}
+
+#[test]
 fn test_group_rekey() {
     let pmk = [0x11u8; 32];
     let sta = [0x03u8; 6];
@@ -268,6 +332,7 @@ fn test_ft_state_with_precomputed_ptk_processes_group_rekey() {
             key: [0x11u8; 32],
             name: [0x22u8; 16],
         },
+        MicAlg::AesCmac,
         sta,
         ap,
         vec![],
