@@ -9,7 +9,7 @@ use crate::error::IpsecError;
 /// An IKEv2 identification payload value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Identity {
-    /// IPv4 or IPv6 address (ID types 1 and 6).
+    /// IPv4 or IPv6 address (ID types 1 and 5).
     Ip(IpAddr),
     /// Fully qualified domain name (ID type 2).
     Fqdn(String),
@@ -17,7 +17,7 @@ pub enum Identity {
     Email(String),
     /// X.500 distinguished name encoded as DER (ID type 9).
     DerAsn1Dn(Vec<u8>),
-    /// Opaque key identifier (ID type 5).
+    /// Opaque key identifier (ID type 11).
     KeyId(Vec<u8>),
     /// Matches any peer identity.  Valid only for configured remote
     /// identities, never for the identity sent on the wire.
@@ -32,8 +32,8 @@ impl Identity {
             Self::Ip(IpAddr::V4(_)) => Some(1),
             Self::Fqdn(_) => Some(2),
             Self::Email(_) => Some(3),
-            Self::KeyId(_) => Some(5),
-            Self::Ip(IpAddr::V6(_)) => Some(6),
+            Self::Ip(IpAddr::V6(_)) => Some(5),
+            Self::KeyId(_) => Some(11),
             Self::DerAsn1Dn(_) => Some(9),
             Self::Any => None,
         }
@@ -75,8 +75,8 @@ impl Identity {
             3 => String::from_utf8(data.to_vec()).map(Self::Email).map_err(
                 |_| IpsecError::ike("RFC 822 identity is not valid UTF-8"),
             ),
-            5 => Ok(Self::KeyId(data.to_vec())),
-            6 => {
+            11 => Ok(Self::KeyId(data.to_vec())),
+            5 => {
                 let bytes: [u8; 16] = data.try_into().map_err(|_| {
                     IpsecError::ike(
                         "IPv6 identity payload has the wrong length",

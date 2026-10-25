@@ -266,6 +266,30 @@ fn ipnet_handles_default_prefix() {
 }
 
 #[test]
+fn identity_uses_rfc_7296_id_types() {
+    use std::net::Ipv6Addr;
+
+    let ipv4 = Identity::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    assert_eq!(ipv4.id_type(), Some(1));
+    assert_eq!(Identity::decode(1, &ipv4.encode().unwrap()).unwrap(), ipv4);
+
+    let ipv6 = Identity::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    assert_eq!(ipv6.id_type(), Some(5));
+    assert_eq!(Identity::decode(5, &ipv6.encode().unwrap()).unwrap(), ipv6);
+
+    let key_id = Identity::KeyId(b"shuli".to_vec());
+    assert_eq!(key_id.id_type(), Some(11));
+    assert_eq!(
+        Identity::decode(11, &key_id.encode().unwrap()).unwrap(),
+        key_id
+    );
+
+    let dn = Identity::DerAsn1Dn(vec![0x30, 0x00]);
+    assert_eq!(dn.id_type(), Some(9));
+    assert_eq!(Identity::decode(9, &dn.encode().unwrap()).unwrap(), dn);
+}
+
+#[test]
 fn config_validation_rejects_bad_selectors() {
     let mut config = psk_config(
         "a",
