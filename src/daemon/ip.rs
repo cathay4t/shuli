@@ -273,16 +273,53 @@ async fn current_default_routes(
 }
 
 pub(crate) fn write_resolv_conf(dns: &DnsConfig) -> Result<(), WifiError> {
-    let mut content = String::new();
-    for search in &dns.searches {
-        content.push_str(&format!("search {search}\n"));
-    }
-    for ns in &dns.nameservers {
-        content.push_str(&format!("nameserver {ns}\n"));
-    }
+    let content = render_resolv_conf(dns);
     std::fs::write("/etc/resolv.conf", &content).map_err(|e| {
         WifiError::new(ErrorKind::Io, format!("write /etc/resolv.conf: {e}"))
     })?;
     log::info!("Updated /etc/resolv.conf");
     Ok(())
+}
+
+/// Render the resolver configuration.  `resolv.conf` only honors the
+/// last `search` directive, so all search domains must share one line.
+fn render_resolv_conf(dns: &DnsConfig) -> String {
+    let mut content = String::new();
+    if !dns.searches.is_empty() {
+        content.push_str("search ");
+        content.push_str(&dns.searches.join(" "));
+        content.push('\n');
+    }
+    for ns in &dns.nameservers {
+        content.push_str(&format!("nameserver {ns}\n"));
+    }
+    content
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolv_conf_uses_a_single_search_directive() {
+        let dns = DnsConfig {
+            nameservers: vec![
+                "192.0.2.1".to_string(),
+                "2001:db8::1".to_string(),
+            ],
+            searches: vec![
+                "corp.example".to_string(),
+                "lab.example".to_string(),
+            ],
+        };
+        let rendered = render_resolv_conf(&dns);
+        assert_eq!(rendered.matches("search ").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("search corp.example lab.example\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("nameserver 192.0.2.1\n"));
+        assert!(rendered.contains("nameserver 2001:db8::1\n"));
+        assert_eq!(render_resolv_conf(&DnsConfig::default()), String::new());
+    }
 }
