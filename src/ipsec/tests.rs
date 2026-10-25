@@ -602,6 +602,58 @@ fn esp_selection_returns_the_matching_proposal_number() {
 }
 
 #[test]
+fn esp_selection_matches_esn_transform() {
+    use crate::{
+        config::{
+            ChildProposal, DhGroup, EncryptionAlgorithm, IntegrityAlgorithm,
+        },
+        ikev2::{
+            codec::{self, Proposal},
+            proposal,
+        },
+    };
+
+    let make_received = |esn: bool| {
+        vec![Proposal {
+            number: 1,
+            protocol: codec::protocol_id::ESP,
+            spi: 0x0102_0304u32.to_be_bytes().to_vec(),
+            transforms: codec::esp_transforms(
+                EncryptionAlgorithm::AesGcm16_256,
+                IntegrityAlgorithm::None,
+                esn,
+                DhGroup::None,
+            ),
+        }]
+    };
+    let make_configured = |esn: bool| {
+        vec![ChildProposal {
+            encryption: EncryptionAlgorithm::AesGcm16_256,
+            integrity: IntegrityAlgorithm::None,
+            esn,
+            dh: DhGroup::None,
+        }]
+    };
+
+    assert!(
+        proposal::select_esp(&make_configured(true), &make_received(true))
+            .is_ok()
+    );
+    assert!(
+        proposal::select_esp(&make_configured(false), &make_received(false))
+            .is_ok()
+    );
+    assert!(
+        proposal::select_esp(&make_configured(true), &make_received(false))
+            .is_err()
+    );
+    assert!(
+        proposal::select_esp(&make_configured(false), &make_received(true))
+            .is_err()
+    );
+}
+
+#[test]
 fn config_rejects_non_aead_proposals_without_integrity() {
     use crate::config::{
         EncryptionAlgorithm, IkeProposal, IntegrityAlgorithm, PrfAlgorithm,

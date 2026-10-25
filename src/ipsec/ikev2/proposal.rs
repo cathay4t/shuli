@@ -117,7 +117,7 @@ fn select_esp_with_dh(
                 } else {
                     DhGroup::None
                 },
-            )
+            ) && esn_offer_matches(&offer.transforms, candidate.esn)
         }) {
             let mut candidate = *candidate;
             if !include_dh {
@@ -215,6 +215,13 @@ pub fn parse_selected_esp(
         integrity,
         esn,
         dh,
+    })
+}
+
+fn esn_offer_matches(transforms: &[Transform], esn: bool) -> bool {
+    transforms.iter().any(|transform| {
+        transform.transform_type == transform_type::ESN
+            && (transform.id == 1) == esn
     })
 }
 
