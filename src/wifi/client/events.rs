@@ -632,11 +632,18 @@ impl WifiIface {
             },
 
             Nl80211Event::PortAuthorized => {
-                log::info!("PORT_AUTHORIZED - connection ready");
-                self.fast_reconnect = None;
-                self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
-                self.state = WifiState::ConnectedWithoutOffloadRekey;
-                self.arm_wowlan_if_enabled().await;
+                if port_authorized_applies(self.state) {
+                    log::info!("PORT_AUTHORIZED - connection ready");
+                    self.fast_reconnect = None;
+                    self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
+                    self.state = WifiState::ConnectedWithoutOffloadRekey;
+                    self.arm_wowlan_if_enabled().await;
+                } else {
+                    log::debug!(
+                        "stale PORT_AUTHORIZED in state {:?}; ignored",
+                        self.state
+                    );
+                }
             }
 
             Nl80211Event::WowlanWakeup(reasons) => {
@@ -1939,6 +1946,18 @@ fn rekey_akm(security: SecurityType) -> Ieee80211AkmSuite {
     }
 }
 
+/// Whether a PORT_AUTHORIZED event belongs to the attempt in flight.
+/// A delayed event from an old association must not mark a scanning or
+/// failed interface as connected.
+fn port_authorized_applies(state: WifiState) -> bool {
+    matches!(
+        state,
+        WifiState::Authenticating
+            | WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    )
+}
+
 fn could_be_psk_mismatch(
     state: WifiState,
     security: SecurityType,
@@ -2175,5 +2194,17 @@ mod tests {
             true,
             Some(true)
         ));
+    }
+
+    #[test]
+    fn port_authorized_only_applies_to_live_attempts() {
+        assert!(port_authorized_applies(WifiState::Authenticating));
+        assert!(port_authorized_applies(
+            WifiState::ConnectedWithoutOffloadRekey
+        ));
+        assert!(!port_authorized_applies(WifiState::Scanning));
+        assert!(!port_authorized_applies(WifiState::Failed));
+        assert!(!port_authorized_applies(WifiState::FailedAuthentication));
+        assert!(!port_authorized_applies(WifiState::Init));
     }
 }
