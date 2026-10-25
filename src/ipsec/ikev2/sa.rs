@@ -143,11 +143,11 @@ pub(crate) fn derive_child_keys(
     esn: bool,
 ) -> ChildSaHandle {
     let mut seed = Vec::new();
-    seed.extend_from_slice(nonce_i);
-    seed.extend_from_slice(nonce_r);
     if let Some(shared) = dh_shared {
         seed.extend_from_slice(shared);
     }
+    seed.extend_from_slice(nonce_i);
+    seed.extend_from_slice(nonce_r);
     let enc_len = encryption.key_len() + encryption.salt_len();
     let integ_len = integrity.key_len();
     let total = enc_len * 2 + integ_len * 2;

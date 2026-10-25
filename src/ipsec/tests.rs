@@ -266,6 +266,51 @@ fn ipnet_handles_default_prefix() {
 }
 
 #[test]
+fn child_keys_follow_rfc_7296_pfs_order() {
+    use crate::ikev2::sa::{Role, derive_child_keys};
+
+    let sk_d: Vec<u8> = (1..=32).collect();
+    let nonce_i: Vec<u8> = (33..=64).collect();
+    let nonce_r: Vec<u8> = (65..=96).collect();
+    let shared = vec![0x5a; 32];
+    let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let remote = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let child = derive_child_keys(
+        crate::config::PrfAlgorithm::HmacSha2_256,
+        &sk_d,
+        &nonce_i,
+        &nonce_r,
+        Some(&shared),
+        Role::Initiator,
+        crate::config::EncryptionAlgorithm::AesGcm16_256,
+        crate::config::IntegrityAlgorithm::HmacSha2_256_128,
+        0x0102_0304,
+        0x0506_0708,
+        crate::config::ChildMode::Tunnel,
+        vec![crate::config::TrafficSelector::host(local)],
+        vec![crate::config::TrafficSelector::host(remote)],
+        false,
+    );
+    // KEYMAT = prf+(SK_d, g^ir | Ni | Nr) per RFC 7296 section 2.17.
+    assert_eq!(
+        child.outbound_key.as_slice(),
+        hex_bytes("890a0ee861a6983a66cb9dc442ce1631b8da9b133129392be39cef90525d3b1b515d38a1")
+    );
+    assert_eq!(
+        child.inbound_key.as_slice(),
+        hex_bytes("253ccfeade5319f4773264a2178ec8a7a2866040a9d625742ecd45c4e86ee1e3dbeee051")
+    );
+    assert_eq!(
+        child.outbound_integrity_key.as_ref().unwrap().as_slice(),
+        hex_bytes("351a38ee7ec38cfdb02e96cdd80277c818f736300bfda51ed1096aa8bb780530")
+    );
+    assert_eq!(
+        child.inbound_integrity_key.as_ref().unwrap().as_slice(),
+        hex_bytes("ec938eeae1fb04f1a760263edb1b48bb5fbb6694ff9d066bbdc807bed54c8855")
+    );
+}
+
+#[test]
 fn ike_keys_follow_rfc_7296_skeyseed() {
     use crate::{
         config::{
