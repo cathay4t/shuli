@@ -4,9 +4,9 @@ use futures::{TryStream, TryStreamExt};
 use netlink_packet_core::{EthernetProtocol, Parseable};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
-    Ieee80211Element, Ieee80211Elements, Nl80211Attr, Nl80211BssInfo,
-    Nl80211ConnectionHandle, Nl80211ControlPortFrame, Nl80211Error,
-    Nl80211Handle, Nl80211Message,
+    Ieee80211CapabilityInfo, Ieee80211Element, Ieee80211Elements, Nl80211Attr,
+    Nl80211BssInfo, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
+    Nl80211Error, Nl80211Handle, Nl80211Message,
 };
 
 use crate::{ETH_ALEN, ErrorKind, WifiError};
@@ -365,6 +365,16 @@ pub(crate) fn extract_ies(bss: &[Nl80211BssInfo]) -> Option<&[u8]> {
         }
     }
     None
+}
+
+/// Whether the BSS privacy bit is set (WEP or an RSNE-protected BSS).
+pub(crate) fn extract_privacy(bss: &[Nl80211BssInfo]) -> bool {
+    for info in bss {
+        if let Nl80211BssInfo::Capability(capability) = info {
+            return capability.contains(Ieee80211CapabilityInfo::Privacy);
+        }
+    }
+    false
 }
 
 /// Extract BSSID from a BSS info entry list.

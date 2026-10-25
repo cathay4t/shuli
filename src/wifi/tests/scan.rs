@@ -11,8 +11,8 @@ use wl_nl80211::{
 use crate::{
     nl80211::extract_signal_dbm,
     scan::{
-        SecurityType, detect_security, negotiate_group_mgmt_cipher,
-        scan_results_from_bss_list,
+        SecurityType, detect_security, detect_security_with_privacy,
+        negotiate_group_mgmt_cipher, scan_results_from_bss_list,
     },
 };
 
@@ -264,6 +264,34 @@ fn test_wpa1_ie_without_rsne_is_unsupported() {
         Some("WPA1 is not supported")
     );
     assert!(sec.ap_rsne.is_empty());
+}
+
+#[test]
+fn test_privacy_bit_without_rsne_is_not_open() {
+    let sec = detect_security_with_privacy(&[], true);
+    assert_eq!(sec.security, SecurityType::Unsupported);
+    assert!(
+        sec.unsupported_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("WEP"))
+    );
+    assert_eq!(
+        detect_security_with_privacy(&[], false).security,
+        SecurityType::Open
+    );
+
+    let mut bss = bss_entry(
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x05],
+        2412,
+        -5000,
+        ssid_ie("OldWep"),
+    );
+    bss.push(Nl80211BssInfo::Capability(
+        wl_nl80211::Ieee80211CapabilityInfo::Ess
+            | wl_nl80211::Ieee80211CapabilityInfo::Privacy,
+    ));
+    let results = scan_results_from_bss_list(&[bss]);
+    assert_eq!(results[0].0.security, SecurityType::Unsupported);
 }
 
 #[test]

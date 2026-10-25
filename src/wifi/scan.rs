@@ -22,8 +22,8 @@ use crate::{
     DEFAULT_SWITCH_SSID_LOWER_THAN_DBM, ETH_ALEN, ErrorKind, NetworkConfig,
     ShuliNl80211Connection, WifiClient, WifiError, WifiIface, WifiState,
     nl80211::{
-        extract_bssid, extract_freq, extract_ies, extract_signal_dbm,
-        extract_ssid_from_ies,
+        extract_bssid, extract_freq, extract_ies, extract_privacy,
+        extract_signal_dbm, extract_ssid_from_ies,
     },
 };
 
@@ -861,7 +861,8 @@ impl WifiIface {
                 "candidate BSS: ssid={bss_ssid}, bssid={bssid:02x?}, \
                  freq={freq_mhz} MHz, signal={signal_dbm}"
             );
-            let bss_security = detect_security(ies);
+            let bss_security =
+                detect_security_with_privacy(ies, extract_privacy(bss));
             // never present an AP shuli cannot actually join
             // (WPA1/TKIP, ...) as a connection candidate - classifying
             // it open would make the client associate without
@@ -1001,6 +1002,15 @@ fn security_name(security: SecurityType) -> &'static str {
 /// associate without encryption. `unsupported_reason` carries a
 /// user-facing explanation for the caller to surface.
 pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
+    detect_security_with_privacy(ies, false)
+}
+
+/// [`detect_security`] with the BSS Capability Information privacy bit,
+/// which identifies WEP and other privacy-only BSSes without an RSNE.
+pub(crate) fn detect_security_with_privacy(
+    ies: &[u8],
+    privacy: bool,
+) -> BssScanSecurity {
     let mut rsne = Vec::new();
     let mut rsnxe = Vec::new();
     let mut mdie = None;
@@ -1037,6 +1047,11 @@ pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
         (
             SecurityType::Unsupported,
             Some("WPA1 is not supported".to_string()),
+        )
+    } else if privacy {
+        (
+            SecurityType::Unsupported,
+            Some("WEP/privacy-only networks are not supported".to_string()),
         )
     } else {
         (SecurityType::Open, None)
@@ -1185,7 +1200,8 @@ pub(crate) fn scan_results_from_bss_list(
         ) else {
             continue;
         };
-        let bss_security = detect_security(ies);
+        let bss_security =
+            detect_security_with_privacy(ies, extract_privacy(bss));
         let info = BssInfo {
             bssid,
             freq_mhz,
