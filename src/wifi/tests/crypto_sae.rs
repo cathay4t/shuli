@@ -256,6 +256,11 @@ fn test_commit_with_token_format() {
         .expect("commit with token");
     assert!(auth_data.len() > initial.len());
     assert_eq!(&auth_data[..6], &initial[..6], "trans/status/group prefix");
+    assert_eq!(
+        &auth_data[6..102],
+        &initial[6..102],
+        "the retry must reuse the original scalar and element"
+    );
 
     // Payload: group(2) || scalar(32) || element(64) || FF || 1+32 || 5D ||
     // token
@@ -263,6 +268,44 @@ fn test_commit_with_token_format() {
     assert_eq!(body.len(), 2 + 32 + 64 + 3 + 32);
     assert_eq!(&body[98..101], &[0xff, 33, 0x5d], "token container header");
     assert_eq!(&body[101..], &token[..], "token bytes");
+}
+
+#[test]
+fn test_hnp_commit_with_token_reuses_commit_and_prefixes_token() {
+    let (mac_sta, mac_ap) = test_macs();
+    let mut sae =
+        SaeAuth::new("12345678", "Test-WIFI", mac_sta, mac_ap, false, false)
+            .unwrap();
+    let initial = sae.build_init_auth_msg();
+    let token: Vec<u8> = (0u8..32).collect();
+    let auth_data = sae
+        .build_commit_with_token(&token)
+        .expect("commit with token");
+
+    let body = &auth_data[4..];
+    let initial_body = &initial[4..];
+    assert_eq!(&body[..2], &initial_body[..2], "group");
+    assert_eq!(&body[2..2 + token.len()], &token[..], "raw token");
+    assert_eq!(
+        &body[2 + token.len()..],
+        &initial_body[2..],
+        "scalar and element must be reused after the token"
+    );
+}
+
+#[test]
+fn test_reflected_commit_is_rejected() {
+    let mut rng = getrandom::SysRng;
+    let (mac_sta, mac_ap) = test_macs();
+    let mut sae =
+        SaeAuth::new("12345678", "Test-WIFI", mac_sta, mac_ap, true, false)
+            .unwrap();
+    let (scalar, element) = sae.build_commit(&mut rng).unwrap();
+    let err = sae
+        .process_commit(&scalar, &element)
+        .expect_err("reflected commit must be rejected");
+    assert_eq!(err.kind, crate::ErrorKind::SaeFailed);
+    assert_eq!(sae.pmk(), None);
 }
 
 /// parse the AP's status-76 response payload back into the token.

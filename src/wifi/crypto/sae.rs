@@ -228,6 +228,17 @@ impl SaeAuth {
             ));
         }
 
+        // A peer commit identical to ours is a reflection attack and
+        // must be silently discarded (802.11-2024 §12.4.8.6.2).
+        if peer_scalar_bytes.get(..32) == Some(&self.own_scalar_bytes[..])
+            && peer_elem_bytes.get(..64) == Some(&self.own_elem_bytes[..])
+        {
+            return Err(WifiError::new(
+                ErrorKind::SaeFailed,
+                "peer commit reflects our own commit",
+            ));
+        }
+
         // K = rand * (peer_scalar * PWE + peer_elem); k = K.x
         let k_point = (self.pwe * peer_scalar + peer_elem) * self.rand;
         if bool::from(k_point.is_identity()) {
@@ -375,12 +386,11 @@ impl SaeAuth {
         )
     }
 
-    /// Re-run the commit and return the auth_data for a retry that must
-    /// echo the AP's anti-clogging token (status 76 response). Only valid
-    /// before any peer commit was processed: a fresh scalar/element pair
-    /// is generated and the token is appended after the element - inside
-    /// the Anti-Clogging Token Container element for H2E (802.11-2020
-    /// §9.4.2.47.4), raw for hunting-and-pecking.
+    /// Return the auth_data for a retry that must echo the AP's
+    /// anti-clogging token (status 76 response). Only valid before any
+    /// peer commit was processed.  The commit-scalar and COMMIT-ELEMENT
+    /// previously sent are reused; only the token framing changes
+    /// (802.11-2024 §12.4.8.6.4).
     pub(crate) fn build_commit_with_token(
         &mut self,
         token: &[u8],
@@ -391,12 +401,14 @@ impl SaeAuth {
                 "cannot retry commit with token after processing the peer",
             ));
         }
-        let (scalar, element) = self.build_commit(&mut getrandom::SysRng)?;
+        if self.own_scalar_bytes == [0u8; 32] {
+            self.build_commit(&mut getrandom::SysRng)?;
+        }
         Ok(build_commit_auth_data(
             self.h2e,
             self.group_id(),
-            &scalar,
-            &element,
+            &self.own_scalar_bytes,
+            &self.own_elem_bytes,
             Some(token),
             self.password_id.as_deref().map(str::as_bytes),
         ))
@@ -424,6 +436,13 @@ fn build_commit_auth_data(
         &(if h2e { SAE_STATUS_H2E } else { 0 }).to_le_bytes(),
     );
     auth_data.extend_from_slice(&group.to_le_bytes());
+    if let Some(token) = token
+        && !h2e
+    {
+        // Hunting-and-pecking carries the raw token before the scalar
+        // (802.11-2024 Table 9-70).
+        auth_data.extend_from_slice(token);
+    }
     auth_data.extend_from_slice(scalar);
     auth_data.extend_from_slice(element);
     if let Some(id) = password_id {
@@ -433,14 +452,14 @@ fn build_commit_auth_data(
         auth_data.push(EXT_PASSWORD_IDENTIFIER);
         auth_data.extend_from_slice(id);
     }
-    if let Some(token) = token {
-        if h2e {
-            // Anti-Clogging Token Container: extended element
-            // (ID 255, extension 93 = EXT_ANTI_CLOGGING_TOKEN).
-            auth_data.push(255);
-            auth_data.push(1 + token.len() as u8);
-            auth_data.push(EXT_ANTI_CLOGGING_TOKEN);
-        }
+    if let Some(token) = token
+        && h2e
+    {
+        // Anti-Clogging Token Container: extended element
+        // (ID 255, extension 93 = EXT_ANTI_CLOGGING_TOKEN).
+        auth_data.push(255);
+        auth_data.push(1 + token.len() as u8);
+        auth_data.push(EXT_ANTI_CLOGGING_TOKEN);
         auth_data.extend_from_slice(token);
     }
     auth_data
