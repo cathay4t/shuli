@@ -559,6 +559,32 @@ fn config_rejects_non_aead_proposals_without_integrity() {
 }
 
 #[test]
+fn traffic_selector_protocol_zero_matches_any_protocol() {
+    use crate::config::TrafficSelector;
+
+    let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let remote = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let any = TrafficSelector::host(local);
+    let tcp = TrafficSelector {
+        protocol: 6,
+        start_port: 443,
+        end_port: 443,
+        ..TrafficSelector::host(local)
+    };
+    let intersection = any.intersection(&tcp).unwrap();
+    assert_eq!(intersection.protocol, 6);
+    assert_eq!(intersection.start_port, 443);
+    assert!(tcp.is_subset_of(&any));
+    assert!(!any.is_subset_of(&tcp));
+
+    let udp = TrafficSelector {
+        protocol: 17,
+        ..TrafficSelector::host(remote)
+    };
+    assert!(tcp.intersection(&udp).is_none());
+}
+
+#[test]
 fn config_validation_rejects_bad_selectors() {
     let mut config = psk_config(
         "a",

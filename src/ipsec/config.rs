@@ -771,10 +771,19 @@ impl TrafficSelector {
     }
 
     /// Intersect two selectors, if their protocol/port ranges overlap.
+    ///
+    /// Traffic selector protocol 0 means any protocol (RFC 7296 section
+    /// 3.13.1), so it intersects any peer protocol.
     pub fn intersection(&self, other: &Self) -> Option<Self> {
-        if self.family() != other.family() || self.protocol != other.protocol {
+        if self.family() != other.family() {
             return None;
         }
+        let protocol = match (self.protocol, other.protocol) {
+            (0, 0) => 0,
+            (0, protocol) | (protocol, 0) => protocol,
+            (left, right) if left == right => left,
+            _ => return None,
+        };
         let start = self.start.max(other.start);
         let end = self.end.min(other.end);
         if start > end {
@@ -788,16 +797,19 @@ impl TrafficSelector {
         Some(Self {
             start,
             end,
-            protocol: self.protocol,
+            protocol,
             start_port,
             end_port,
         })
     }
 
     /// Whether `self` is fully contained in `other`.
+    ///
+    /// A selector with protocol 0 is broader than one restricted to a
+    /// specific protocol, so it is not a subset of the latter.
     pub fn is_subset_of(&self, other: &Self) -> bool {
         self.family() == other.family()
-            && self.protocol == other.protocol
+            && (other.protocol == 0 || self.protocol == other.protocol)
             && self.start >= other.start
             && self.end <= other.end
             && self.start_port >= other.start_port
