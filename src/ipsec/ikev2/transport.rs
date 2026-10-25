@@ -71,12 +71,55 @@ impl IkeTransport {
         self.remote = remote;
     }
 
-    pub fn enable_nat_t(&mut self) {
-        if !self.nat_t {
-            return;
-        }
-        self.encapsulated = true;
+    /// Switch to UDP-encapsulated IKE on port 4500 (RFC 7296 section
+    /// 2.23).  Both the destination and the local source port must change
+    /// so that subsequent responses arrive on the NAT-T socket.
+    pub async fn enable_nat_t(&mut self) -> Result<(), IpsecError> {
         self.remote.set_port(NAT_T_PORT);
+        if !self.nat_t || self.encapsulated {
+            return Ok(());
+        }
+        let local = self.socket.local_addr()?;
+        let bind_address = SocketAddr::new(local.ip(), NAT_T_PORT);
+        let socket = UdpSocket::bind(bind_address).await.map_err(|e| {
+            IpsecError::new(
+                crate::error::IpsecErrorKind::Io,
+                format!("bind NAT-T socket {bind_address}: {e}"),
+            )
+        })?;
+        self.socket = socket;
+        self.encapsulated = true;
+        Ok(())
+    }
+
+    /// Determine the local source address the kernel would select for
+    /// `remote`, even when the IKE socket is bound to a wildcard address.
+    pub async fn route_source_ip(
+        &self,
+        remote: SocketAddr,
+    ) -> Result<IpAddr, IpsecError> {
+        let local = self.socket.local_addr()?;
+        if !local.ip().is_unspecified() {
+            return Ok(local.ip());
+        }
+        let bind_address = if remote.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        let probe = UdpSocket::bind(bind_address).await.map_err(|e| {
+            IpsecError::new(
+                crate::error::IpsecErrorKind::Io,
+                format!("bind route probe socket {bind_address}: {e}"),
+            )
+        })?;
+        probe.connect(remote).await.map_err(|e| {
+            IpsecError::new(
+                crate::error::IpsecErrorKind::Io,
+                format!("connect route probe to {remote}: {e}"),
+            )
+        })?;
+        Ok(probe.local_addr()?.ip())
     }
 
     pub fn nat_t_enabled(&self) -> bool {

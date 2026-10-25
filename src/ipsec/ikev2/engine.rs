@@ -101,6 +101,8 @@ struct PendingSaInit {
     proposals: Vec<IkeProposal>,
     real_message1: Vec<u8>,
     local_spi: u64,
+    local_address: IpAddr,
+    local_port: u16,
 }
 
 struct PendingRekey {
@@ -222,11 +224,15 @@ impl Runner {
         let local_spi = crypto::random_u64()?;
         let proposals =
             proposal::build_ike(&self.config.ike.proposals.proposals);
-        let source_address = self
-            .config
-            .local
-            .address
-            .unwrap_or_else(|| self.transport.remote().ip());
+        let source_address = match self.config.local.address {
+            Some(address) => address,
+            None => {
+                self.transport
+                    .route_source_ip(self.transport.remote())
+                    .await?
+            }
+        };
+        let local_port = self.transport.local_addr()?.port();
         let payloads = vec![
             Payload::Sa(proposals),
             Payload::Ke {
@@ -242,7 +248,7 @@ impl Runner {
                     local_spi,
                     0,
                     source_address,
-                    self.config.local.port,
+                    local_port,
                 ),
             },
             Payload::Notify {
@@ -277,6 +283,8 @@ impl Runner {
             proposals: self.config.ike.proposals.proposals.clone(),
             real_message1: message.clone(),
             local_spi,
+            local_address: source_address,
+            local_port,
         });
         self.retransmit = Some(Retransmit::new(
             message,
@@ -294,7 +302,7 @@ impl Runner {
     ) -> Result<(), IpsecError> {
         if source.port() == NAT_T_PORT {
             self.transport.set_remote(source);
-            self.transport.enable_nat_t();
+            self.transport.enable_nat_t().await?;
         } else if self.config.local.nat_t && self.transport.nat_t_enabled() {
             self.transport.set_remote(source);
         }
@@ -302,7 +310,7 @@ impl Runner {
         if message.header.is_response() {
             match self.phase {
                 Phase::SaInitSent => {
-                    self.handle_sa_init_response(data, &message).await
+                    self.handle_sa_init_response(data, source, &message).await
                 }
                 Phase::AuthSent | Phase::EapAuth => {
                     self.handle_auth_response(&message).await
@@ -418,8 +426,10 @@ impl Runner {
                         source.port(),
                     )
                 {
+                    // Keep using port 500 for the response because the
+                    // initiator has not switched to 4500 yet.  The
+                    // responder follows the initiator to 4500 later.
                     log::debug!("NAT detected on inbound IKE_SA_INIT");
-                    self.transport.enable_nat_t();
                 }
             }
         }
@@ -439,6 +449,11 @@ impl Runner {
             suite.encryption,
             suite.integrity,
         );
+        let local_address = match self.config.local.address {
+            Some(address) => address,
+            None => self.transport.route_source_ip(source).await?,
+        };
+        let local_port = self.transport.local_addr()?.port();
 
         let response_sa = vec![codec::Proposal {
             number: proposal_number,
@@ -465,8 +480,8 @@ impl Runner {
                 data: crate::ikev2::transport::nat_detection_hash(
                     message.header.initiator_spi,
                     remote_spi,
-                    source.ip(),
-                    source.port(),
+                    local_address,
+                    local_port,
                 ),
             },
             Payload::Notify {
@@ -476,13 +491,8 @@ impl Runner {
                 data: crate::ikev2::transport::nat_detection_hash(
                     message.header.initiator_spi,
                     remote_spi,
-                    self.config.local.address.unwrap_or_else(|| {
-                        self.transport
-                            .local_addr()
-                            .map(|a| a.ip())
-                            .unwrap_or(source.ip())
-                    }),
-                    self.config.local.port,
+                    source.ip(),
+                    source.port(),
                 ),
             },
         ];
@@ -532,6 +542,7 @@ impl Runner {
     async fn handle_sa_init_response(
         &mut self,
         raw: &[u8],
+        source: SocketAddr,
         message: &codec::Message,
     ) -> Result<(), IpsecError> {
         let pending = self.pending_sa_init.take().ok_or_else(|| {
@@ -543,6 +554,8 @@ impl Runner {
             proposals: offered_proposals,
             real_message1,
             local_spi,
+            local_address,
+            local_port,
         } = pending;
         let sa = message.payload(codec::payload_type::SA).ok_or_else(|| {
             IpsecError::ike("IKE_SA_INIT response without SA")
@@ -599,30 +612,29 @@ impl Runner {
         // on UDP 4500.
         let mut nat_detected = false;
         for payload in &message.payloads {
-            if let Payload::Notify {
+            let Payload::Notify {
                 notify_type, data, ..
             } = payload
-                && *notify_type == codec::notify_type::NAT_DETECTION_SOURCE_IP
-            {
-                let source = self.config.local.address.unwrap_or_else(|| {
-                    self.transport
-                        .local_addr()
-                        .map(|a| a.ip())
-                        .unwrap_or_else(|_| self.transport.remote().ip())
-                });
-                if !crate::ikev2::transport::nat_detection_matches(
-                    data,
-                    local_spi,
-                    remote_spi,
-                    source,
-                    self.config.local.port,
-                ) {
-                    nat_detected = true;
+            else {
+                continue;
+            };
+            let (address, port) = match *notify_type {
+                codec::notify_type::NAT_DETECTION_SOURCE_IP => {
+                    (source.ip(), source.port())
                 }
+                codec::notify_type::NAT_DETECTION_DESTINATION_IP => {
+                    (local_address, local_port)
+                }
+                _ => continue,
+            };
+            if !crate::ikev2::transport::nat_detection_matches(
+                data, local_spi, remote_spi, address, port,
+            ) {
+                nat_detected = true;
             }
         }
         if nat_detected && self.config.local.nat_t {
-            self.transport.enable_nat_t();
+            self.transport.enable_nat_t().await?;
         }
 
         self.ike = Some(IkeRuntime {

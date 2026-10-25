@@ -1006,6 +1006,52 @@ async fn certificate_point_to_point_self_connection() {
 }
 
 #[tokio::test]
+async fn nat_t_does_not_false_positive_on_loopback() {
+    let mut a = psk_config(
+        "a",
+        15500,
+        Some(15501),
+        Identity::Fqdn("a.example".into()),
+        Identity::Fqdn("b.example".into()),
+    );
+    let mut b = psk_config(
+        "b",
+        15501,
+        None,
+        Identity::Fqdn("b.example".into()),
+        Identity::Fqdn("a.example".into()),
+    );
+    a.local.address = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    a.local.nat_t = true;
+    a.peers[0].remote.address = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    b.local.address = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    b.local.nat_t = true;
+
+    let mut client_a = crate::IpsecClient::init(vec![a]).await.unwrap();
+    let mut client_b = crate::IpsecClient::init(vec![b]).await.unwrap();
+    let mut ready = false;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !ready {
+        tokio::select! {
+            event = client_a.run() => {
+                if let Ok(crate::IpsecEvent::ChildSaReady { .. }) = event {
+                    ready = true;
+                }
+            }
+            event = client_b.run() => {
+                if let Ok(crate::IpsecEvent::ChildSaReady { .. }) = event {
+                    ready = true;
+                }
+            }
+        }
+    }
+    client_a.shutdown().await;
+    client_b.shutdown().await;
+    assert!(ready, "NAT-T loopback connection did not establish");
+}
+
+#[tokio::test]
 async fn peer_delete_removes_child_sa() {
     let _ = env_logger::builder().is_test(true).try_init();
     let a = psk_config(
