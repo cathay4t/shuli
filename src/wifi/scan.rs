@@ -870,7 +870,9 @@ impl WifiIface {
             );
             let bss_security =
                 detect_security_with_privacy(ies, extract_privacy(bss));
-            if !network.accepts_security(bss_security.security) {
+            if bss_security.security != SecurityType::Unsupported
+                && !network.accepts_security(bss_security.security)
+            {
                 let reason = format!(
                     "BSS uses {:?} but the configured credentials do not match",
                     bss_security.security
