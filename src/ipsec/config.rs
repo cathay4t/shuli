@@ -225,10 +225,11 @@ pub struct IkeProposal {
 
 impl IkeProposal {
     /// Whether the transform combination is valid: AEAD ciphers carry
-    /// their own integrity protection.
+    /// their own integrity protection while other ciphers require an
+    /// integrity transform (RFC 7296 section 3.3.3).
     pub fn is_valid(&self) -> bool {
-        !(self.encryption.is_aead()
-            && self.integrity != IntegrityAlgorithm::None)
+        self.encryption.is_aead()
+            == (self.integrity == IntegrityAlgorithm::None)
     }
 }
 
@@ -246,9 +247,12 @@ pub struct ChildProposal {
 }
 
 impl ChildProposal {
+    /// Whether the transform combination is valid: AEAD ciphers carry
+    /// their own integrity protection while other ciphers require an
+    /// integrity transform (RFC 7296 section 3.3.3).
     pub fn is_valid(&self) -> bool {
-        !(self.encryption.is_aead()
-            && self.integrity != IntegrityAlgorithm::None)
+        self.encryption.is_aead()
+            == (self.integrity == IntegrityAlgorithm::None)
     }
 }
 
@@ -1027,16 +1031,16 @@ impl IpsecConfig {
         for proposal in &self.ike.proposals.proposals {
             if !proposal.is_valid() {
                 return Err(IpsecError::config(
-                    "AEAD IKE proposals must not specify an integrity \
-                     transform",
+                    "IKE proposals require an integrity transform unless they \
+                     use an AEAD cipher",
                 ));
             }
         }
         for proposal in &self.child.proposals.proposals {
             if !proposal.is_valid() {
                 return Err(IpsecError::config(
-                    "AEAD ESP proposals must not specify an integrity \
-                     transform",
+                    "ESP proposals require an integrity transform unless they \
+                     use an AEAD cipher",
                 ));
             }
         }

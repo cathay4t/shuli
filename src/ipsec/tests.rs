@@ -509,6 +509,56 @@ fn identity_uses_rfc_7296_id_types() {
 }
 
 #[test]
+fn config_rejects_non_aead_proposals_without_integrity() {
+    use crate::config::{
+        EncryptionAlgorithm, IkeProposal, IntegrityAlgorithm, PrfAlgorithm,
+    };
+
+    assert!(
+        !IkeProposal {
+            encryption: EncryptionAlgorithm::AesCbc128,
+            prf: PrfAlgorithm::HmacSha2_256,
+            integrity: IntegrityAlgorithm::None,
+            dh: crate::config::DhGroup::Ecp256,
+        }
+        .is_valid()
+    );
+    assert!(
+        !crate::config::ChildProposal {
+            encryption: EncryptionAlgorithm::AesCbc128,
+            integrity: IntegrityAlgorithm::None,
+            esn: false,
+            dh: crate::config::DhGroup::None,
+        }
+        .is_valid()
+    );
+
+    let mut config = psk_config(
+        "a",
+        500,
+        Some(500),
+        Identity::Fqdn("a.example".into()),
+        Identity::Fqdn("b.example".into()),
+    );
+    config.ike.proposals.proposals[0].integrity = IntegrityAlgorithm::None;
+    config.ike.proposals.proposals[0].encryption =
+        EncryptionAlgorithm::AesCbc128;
+    assert!(config.validate().is_err());
+
+    let mut config = psk_config(
+        "a",
+        500,
+        Some(500),
+        Identity::Fqdn("a.example".into()),
+        Identity::Fqdn("b.example".into()),
+    );
+    config.child.proposals.proposals[0].integrity = IntegrityAlgorithm::None;
+    config.child.proposals.proposals[0].encryption =
+        EncryptionAlgorithm::AesCbc128;
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn config_validation_rejects_bad_selectors() {
     let mut config = psk_config(
         "a",
