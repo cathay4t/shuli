@@ -854,6 +854,7 @@ impl Runner {
                     &config.ca_certificates,
                     &chain,
                     &initiator_id_identity(initiator_id)?,
+                    crate::ikev2::auth::cert::PeerRole::Initiator,
                 )?;
                 let signed = auth::signed_octets(
                     &ike.real_message1,
@@ -1080,6 +1081,7 @@ impl Runner {
                     &config.ca_certificates,
                     &chain,
                     &responder_identity,
+                    crate::ikev2::auth::cert::PeerRole::Responder,
                 )?;
                 let id_body = id_payload_body(responder_id);
                 let signed = auth::signed_octets(

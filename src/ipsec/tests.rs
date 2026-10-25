@@ -485,6 +485,36 @@ fn hex_bytes(value: &str) -> Vec<u8> {
 }
 
 #[test]
+fn certificate_eku_depends_on_peer_role() {
+    use crate::ikev2::auth::cert::{PeerRole, parse_certificates, verify_peer};
+
+    let ca = parse_certificates(include_bytes!("../../testdata/certs/ca.pem"))
+        .unwrap();
+    let server =
+        parse_certificates(include_bytes!("../../testdata/certs/server.pem"))
+            .unwrap();
+    let client =
+        parse_certificates(include_bytes!("../../testdata/certs/client.pem"))
+            .unwrap();
+
+    verify_peer(
+        &ca,
+        &server,
+        &Identity::Fqdn("eap-tls.test".to_string()),
+        PeerRole::Responder,
+    )
+    .unwrap();
+    verify_peer(&ca, &client, &Identity::Any, PeerRole::Initiator).unwrap();
+
+    assert!(
+        verify_peer(&ca, &server, &Identity::Any, PeerRole::Initiator).is_err()
+    );
+    assert!(
+        verify_peer(&ca, &client, &Identity::Any, PeerRole::Responder).is_err()
+    );
+}
+
+#[test]
 fn identity_hex_rejects_non_ascii_without_panicking() {
     assert!("keyid:€a".parse::<Identity>().is_err());
     assert!("keyid:+f".parse::<Identity>().is_err());

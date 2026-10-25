@@ -24,6 +24,17 @@ use crate::{
 
 const CERT_ENCODING_X509: u8 = 4;
 
+/// Which side of the IKE exchange sent a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerRole {
+    Initiator,
+    Responder,
+}
+
+const EKU_SERVER_AUTH: &[u8] = &[43, 6, 1, 5, 5, 7, 3, 1];
+const EKU_CLIENT_AUTH: &[u8] = &[43, 6, 1, 5, 5, 7, 3, 2];
+const EKU_IPSEC_IKE: &[u8] = &[43, 6, 1, 5, 5, 7, 3, 17];
+
 /// Local signing credentials.
 pub(crate) enum LocalCredentials {
     Rsa(RsaKeyPair),
@@ -126,6 +137,7 @@ pub(crate) fn verify_peer(
     ca_certificates: &[Vec<u8>],
     peer_chain: &[Vec<u8>],
     identity: &Identity,
+    role: PeerRole,
 ) -> Result<(), IpsecError> {
     if peer_chain.is_empty() {
         return Err(IpsecError::new(
@@ -173,21 +185,34 @@ pub(crate) fn verify_peer(
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default(),
     );
-    leaf.verify_for_usage(
-        webpki::ALL_VERIFICATION_ALGS,
-        &anchors,
-        &intermediates,
-        time,
-        KeyUsage::required_if_present(&[43, 6, 1, 5, 5, 7, 3, 2]),
-        None,
-        None,
-    )
-    .map_err(|e| {
-        IpsecError::new(
+    let extended_key_usage = match role {
+        PeerRole::Initiator => [EKU_CLIENT_AUTH, EKU_IPSEC_IKE],
+        PeerRole::Responder => [EKU_SERVER_AUTH, EKU_IPSEC_IKE],
+    };
+    let mut usage_error = None;
+    for eku in extended_key_usage {
+        match leaf.verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &anchors,
+            &intermediates,
+            time,
+            KeyUsage::required_if_present(eku),
+            None,
+            None,
+        ) {
+            Ok(_) => {
+                usage_error = None;
+                break;
+            }
+            Err(error) => usage_error = Some(error),
+        }
+    }
+    if let Some(error) = usage_error {
+        return Err(IpsecError::new(
             IpsecErrorKind::Certificate,
-            format!("peer certificate validation failed: {e}"),
-        )
-    })?;
+            format!("peer certificate validation failed: {error}"),
+        ));
+    }
 
     match identity {
         Identity::Ip(address) => {
