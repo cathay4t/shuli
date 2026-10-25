@@ -61,8 +61,8 @@ impl IkeKeys {
 
         let skeyseed = Zeroizing::new(crypto::prf(
             prf,
-            shared_secret,
             &[nonce_i, nonce_r].concat(),
+            shared_secret,
         ));
 
         let prf_len = prf.key_len();

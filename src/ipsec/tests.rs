@@ -266,6 +266,57 @@ fn ipnet_handles_default_prefix() {
 }
 
 #[test]
+fn ike_keys_follow_rfc_7296_skeyseed() {
+    use crate::{
+        config::{
+            EncryptionAlgorithm, IntegrityAlgorithm, PrfAlgorithm,
+        },
+        ikev2::sa::{IkeKeys, Role},
+    };
+
+    let nonce_i: Vec<u8> = (1..=32).collect();
+    let nonce_r: Vec<u8> = (33..=64).collect();
+    let shared = vec![0x5a; 32];
+    let keys = IkeKeys::derive(
+        PrfAlgorithm::HmacSha2_256,
+        &shared,
+        &nonce_i,
+        &nonce_r,
+        0x1122_3344_5566_7788,
+        0x8877_6655_4433_2211,
+        EncryptionAlgorithm::AesGcm16_256,
+        IntegrityAlgorithm::HmacSha2_256_128,
+    );
+    // Expected values were produced independently with
+    // SKEYSEED = prf(Ni | Nr, g^ir) per RFC 7296 section 2.14.
+    assert_eq!(
+        keys.sk_d.as_slice(),
+        hex_bytes("8bfd98e2b8add5d8036166e2c4c406a900fda72ae71550c2753f85b5761b6213")
+    );
+    assert_eq!(
+        keys.sk_ai.as_slice(),
+        hex_bytes("f21aab0e94311308c72416ed94d555230272459b300fb6dbe751a701be460c55")
+    );
+    assert_eq!(
+        keys.sk_ei.as_slice(),
+        hex_bytes("4551604f68b637015f19de2c74befcc47e08dcfd2903eccabbad623fc951f454d8164142")
+    );
+    assert_eq!(
+        keys.sk_er.as_slice(),
+        hex_bytes("93f7f3ac21722dc1141966da0fd3df690f63614e6cba0e0cb79c4ad160e65d714e1be7c1")
+    );
+    assert_eq!(keys.outbound_encryption(Role::Initiator), &keys.sk_ei[..]);
+    assert_eq!(keys.inbound_encryption(Role::Responder), &keys.sk_ei[..]);
+}
+
+fn hex_bytes(value: &str) -> Vec<u8> {
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
 fn identity_uses_rfc_7296_id_types() {
     use std::net::Ipv6Addr;
 
