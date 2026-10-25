@@ -28,12 +28,11 @@ use wl_nl80211::{
     Ieee80211OperatingClass, Ieee80211StatusCode, Nl80211Associate,
     Nl80211Attr, Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm,
     Nl80211CqmAttr, Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent,
-    Nl80211Event, Nl80211Key, Nl80211KeyAttr, Nl80211UseMfp, find_ie,
-    find_ie_pos, ft_psk_ie_cipher, ft_psk_rsne_cipher,
-    ft_sae_ext_key_ie_cipher, ft_sae_ext_key_rsne_cipher, ft_sae_ie_cipher,
-    ft_sae_rsne_cipher, ftie_auth_request, ie_at, mdie, parse_ftie, parse_mdie,
-    rsne_first_pmkid, rsne_match_ignore_pmkid, rsne_set_ext_key_id,
-    rsne_set_ocvc, sae_rsnxe,
+    Nl80211Event, Nl80211Key, Nl80211UseMfp, find_ie, find_ie_pos,
+    ft_psk_ie_cipher, ft_psk_rsne_cipher, ft_sae_ext_key_ie_cipher,
+    ft_sae_ext_key_rsne_cipher, ft_sae_ie_cipher, ft_sae_rsne_cipher,
+    ftie_auth_request, ie_at, mdie, parse_ftie, parse_mdie, rsne_first_pmkid,
+    rsne_match_ignore_pmkid, rsne_set_ext_key_id, rsne_set_ocvc, sae_rsnxe,
 };
 
 use crate::{
@@ -1672,6 +1671,8 @@ fn ft_bigtk_attrs(
 
 #[cfg(test)]
 mod tests {
+    use wl_nl80211::Nl80211KeyAttr;
+
     use super::*;
     use crate::config::SaePwe;
 
