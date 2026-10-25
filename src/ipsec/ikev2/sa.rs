@@ -204,13 +204,20 @@ pub(crate) fn seal_message(
     key_e: &[u8],
     key_a: &[u8],
 ) -> Result<Vec<u8>, IpsecError> {
-    let plaintext = codec::encode_chain(payloads)?;
+    let mut plaintext = codec::encode_chain(payloads)?;
     let iv_len = encryption.iv_len();
     let block = encryption.block_len();
+    let padding = if encryption.is_aead() {
+        0
+    } else {
+        (block - ((plaintext.len() + 1) % block)) % block
+    };
+    plaintext.extend(std::iter::repeat_n(0u8, padding));
+    plaintext.push(padding as u8);
     let ciphertext_len = if encryption.is_aead() {
         plaintext.len() + 16
     } else {
-        (plaintext.len() / block + 1) * block
+        plaintext.len()
     };
     let icv_len = integrity.output_len();
     let total = IKE_HEADER_LEN + 4 + iv_len + ciphertext_len + icv_len;
@@ -276,5 +283,13 @@ pub(crate) fn open_message(
     let ciphertext = &rest[..rest.len() - icv_len];
     let plaintext =
         crypto::decrypt(encryption, key_e, iv, ciphertext, &header.encode())?;
-    codec::decode_chain(*next, &plaintext)
+    let padding = *plaintext
+        .last()
+        .ok_or_else(|| IpsecError::ike("empty encrypted IKE payload"))?
+        as usize;
+    if padding + 1 > plaintext.len() {
+        return Err(IpsecError::ike("invalid IKE padding length"));
+    }
+    let end = plaintext.len() - padding - 1;
+    codec::decode_chain(*next, &plaintext[..end])
 }

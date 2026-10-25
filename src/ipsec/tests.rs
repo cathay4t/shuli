@@ -189,6 +189,89 @@ fn encrypted_message_round_trip() {
 }
 
 #[test]
+fn encrypted_payload_uses_rfc_7296_padding() {
+    use crate::{
+        config::EncryptionAlgorithm,
+        ikev2::{
+            codec::payload_type,
+            sa::{open_message, seal_message},
+        },
+    };
+
+    let header = IkeHeader::new(1, 2, ExchangeType::IkeAuth, 0x08, 1);
+    let payloads = vec![
+        Payload::Nonce(vec![0x33; 32]),
+        Payload::Id {
+            initiator: true,
+            id_type: 2,
+            data: b"a.example".to_vec(),
+        },
+    ];
+    let encoded = codec::encode_chain(&payloads).unwrap();
+
+    for (encryption, padding) in [
+        (EncryptionAlgorithm::AesCbc128, (16 - ((encoded.len() + 1) % 16)) % 16),
+        (EncryptionAlgorithm::AesGcm16_256, 3),
+    ] {
+        let mut plaintext = encoded.clone();
+        plaintext.extend(std::iter::repeat_n(0xa5, padding));
+        plaintext.push(padding as u8);
+        let key = vec![0x42; encryption.key_len() + encryption.salt_len()];
+        let iv = vec![0x24; encryption.iv_len()];
+        let mut wire_header = header.clone();
+        wire_header.next_payload = payload_type::SK;
+        wire_header.length = (28 + 4 + iv.len() + plaintext.len() + 16) as u32;
+        let aad = wire_header.encode();
+        let ciphertext =
+            crypto::encrypt(encryption, &key, &iv, &plaintext, &aad).unwrap();
+        let mut data = iv.clone();
+        data.extend_from_slice(&ciphertext);
+        let opened = open_message(
+            &wire_header,
+            &Payload::Encrypted {
+                next: payload_type::NONCE,
+                data,
+            },
+            encryption,
+            crate::config::IntegrityAlgorithm::None,
+            &key,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened, payloads, "{encryption:?}");
+    }
+
+    let sealed = seal_message(
+        &header,
+        &payloads,
+        EncryptionAlgorithm::AesCbc128,
+        crate::config::IntegrityAlgorithm::None,
+        &[0x42; 16],
+        &[],
+    )
+    .unwrap();
+    let decoded = codec::Message::decode(&sealed).unwrap();
+    let Payload::Encrypted { next, data } = &decoded.payloads[0] else {
+        panic!("expected an encrypted payload");
+    };
+    let raw = crypto::decrypt(
+        EncryptionAlgorithm::AesCbc128,
+        &[0x42; 16],
+        &data[..16],
+        &data[16..],
+        &decoded.header.encode(),
+    )
+    .unwrap();
+    assert_eq!(raw.len() % 16, 0);
+    let padding = *raw.last().unwrap() as usize;
+    assert_eq!(raw.len() - 1 - encoded.len(), padding);
+    assert_eq!(
+        codec::decode_chain(*next, &raw[..raw.len() - padding - 1]).unwrap(),
+        payloads
+    );
+}
+
+#[test]
 fn crypto_round_trip_cbc_and_gcm() {
     for algorithm in [
         crate::config::EncryptionAlgorithm::AesCbc128,
@@ -198,9 +281,9 @@ fn crypto_round_trip_cbc_and_gcm() {
     ] {
         let key = vec![0x42; algorithm.key_len() + algorithm.salt_len()];
         let iv = vec![0x24; algorithm.iv_len()];
-        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let plaintext = vec![0x5a; 32];
         let ciphertext =
-            crypto::encrypt(algorithm, &key, &iv, plaintext, b"aad").unwrap();
+            crypto::encrypt(algorithm, &key, &iv, &plaintext, b"aad").unwrap();
         let decrypted =
             crypto::decrypt(algorithm, &key, &iv, &ciphertext, b"aad").unwrap();
         assert_eq!(decrypted, plaintext, "{algorithm:?}");

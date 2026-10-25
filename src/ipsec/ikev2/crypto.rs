@@ -236,12 +236,15 @@ fn encrypt_cbc(
     iv: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, IpsecError> {
+    if !plaintext.len().is_multiple_of(16) {
+        return Err(IpsecError::internal(
+            "AES-CBC plaintext is not block aligned",
+        ));
+    }
     let iv: [u8; 16] = iv
         .try_into()
         .map_err(|_| IpsecError::internal("invalid AES-CBC IV length"))?;
     let mut output = plaintext.to_vec();
-    let padding = 16 - (output.len() % 16);
-    output.extend(std::iter::repeat_n(padding as u8, padding));
     let unbound = UnboundCipherKey::new(cipher_algorithm(algorithm), key)
         .map_err(|_| IpsecError::internal("invalid AES key"))?;
     let cipher = EncryptingKey::cbc(unbound)
@@ -278,21 +281,7 @@ fn decrypt_cbc(
             DecryptionContext::Iv128(FixedLength::<IV_LEN_128_BIT>::from(iv)),
         )
         .map_err(|_| IpsecError::authentication("AES-CBC decryption failed"))?;
-    let padding = *plaintext
-        .last()
-        .ok_or_else(|| IpsecError::ike("empty AES-CBC plaintext"))?
-        as usize;
-    if padding == 0 || padding > 16 || padding > plaintext.len() {
-        return Err(IpsecError::ike("invalid AES-CBC padding"));
-    }
-    if !plaintext[plaintext.len() - padding..]
-        .iter()
-        .all(|byte| *byte as usize == padding)
-    {
-        return Err(IpsecError::ike("invalid AES-CBC padding"));
-    }
-    let length = plaintext.len() - padding;
-    Ok(plaintext[..length].to_vec())
+    Ok(plaintext.to_vec())
 }
 
 /// A Diffie-Hellman private/public key pair.
