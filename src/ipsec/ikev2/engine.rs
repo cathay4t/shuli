@@ -885,12 +885,17 @@ impl Runner {
                 _ => None,
             })
             .ok_or_else(|| IpsecError::ike("IKE_AUTH without SA payload"))?;
-        let (child_suite, _) = proposal::select_esp_initial(
-            &self.config.child.proposals.proposals,
-            &sa,
-        )?;
+        let (child_suite, child_proposal_number) =
+            proposal::select_esp_initial(
+                &self.config.child.proposals.proposals,
+                &sa,
+            )?;
         let remote_child_spi = sa
-            .first()
+            .iter()
+            .find(|proposal| {
+                proposal.number == child_proposal_number
+                    && proposal.protocol == codec::protocol_id::ESP
+            })
             .and_then(|proposal| proposal.spi.get(..4))
             .map(|spi| u32::from_be_bytes(spi.try_into().unwrap()))
             .ok_or_else(|| IpsecError::ike("IKE_AUTH SA without an SPI"))?;
@@ -943,7 +948,7 @@ impl Runner {
             AuthConfig::EapTls(_) => unreachable!(),
         }
         response_payloads.push(Payload::Sa(vec![codec::Proposal {
-            number: 1,
+            number: child_proposal_number,
             protocol: codec::protocol_id::ESP,
             spi: local_child_spi.to_be_bytes().to_vec(),
             transforms: codec::esp_transforms(
@@ -1137,12 +1142,17 @@ impl Runner {
                 _ => None,
             })
             .ok_or_else(|| IpsecError::ike("IKE_AUTH response without SA"))?;
-        let (child_suite, _) = proposal::select_esp_initial(
-            &self.config.child.proposals.proposals,
-            &sa,
-        )?;
+        let (child_suite, child_proposal_number) =
+            proposal::select_esp_initial(
+                &self.config.child.proposals.proposals,
+                &sa,
+            )?;
         let remote_child_spi = sa
-            .first()
+            .iter()
+            .find(|proposal| {
+                proposal.number == child_proposal_number
+                    && proposal.protocol == codec::protocol_id::ESP
+            })
             .and_then(|proposal| proposal.spi.get(..4))
             .map(|spi| u32::from_be_bytes(spi.try_into().unwrap()))
             .ok_or_else(|| IpsecError::ike("responder SA without an SPI"))?;

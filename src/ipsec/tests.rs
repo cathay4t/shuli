@@ -546,6 +546,62 @@ fn identity_uses_rfc_7296_id_types() {
 }
 
 #[test]
+fn esp_selection_returns_the_matching_proposal_number() {
+    use crate::{
+        config::{
+            ChildProposal, DhGroup, EncryptionAlgorithm, IntegrityAlgorithm,
+        },
+        ikev2::{
+            codec::{self, Proposal, transform_type},
+            proposal,
+        },
+    };
+
+    let configured = vec![
+        ChildProposal {
+            encryption: EncryptionAlgorithm::AesGcm16_256,
+            integrity: IntegrityAlgorithm::None,
+            esn: false,
+            dh: DhGroup::None,
+        },
+        ChildProposal {
+            encryption: EncryptionAlgorithm::AesCbc128,
+            integrity: IntegrityAlgorithm::HmacSha2_256_128,
+            esn: false,
+            dh: DhGroup::None,
+        },
+    ];
+    let received = vec![
+        Proposal {
+            number: 1,
+            protocol: codec::protocol_id::ESP,
+            spi: 0x0102_0304u32.to_be_bytes().to_vec(),
+            transforms: codec::esp_transforms(
+                EncryptionAlgorithm::AesCbc256,
+                IntegrityAlgorithm::HmacSha2_256_128,
+                false,
+                DhGroup::None,
+            ),
+        },
+        Proposal {
+            number: 2,
+            protocol: codec::protocol_id::ESP,
+            spi: 0x0102_0304u32.to_be_bytes().to_vec(),
+            transforms: codec::esp_transforms(
+                EncryptionAlgorithm::AesCbc128,
+                IntegrityAlgorithm::HmacSha2_256_128,
+                false,
+                DhGroup::None,
+            ),
+        },
+    ];
+    let (suite, number) =
+        proposal::select_esp_initial(&configured, &received).unwrap();
+    assert_eq!(number, 2);
+    assert_eq!(suite.encryption, EncryptionAlgorithm::AesCbc128);
+}
+
+#[test]
 fn config_rejects_non_aead_proposals_without_integrity() {
     use crate::config::{
         EncryptionAlgorithm, IkeProposal, IntegrityAlgorithm, PrfAlgorithm,
