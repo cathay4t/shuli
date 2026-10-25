@@ -766,6 +766,22 @@ fn ordered_live_peers(peers: &[Peer]) -> Vec<PeerId> {
     live.into_iter().map(|(peer, _)| peer).collect()
 }
 
+fn sak_use_matches(local: Option<KeyId>, peer: KeyId) -> bool {
+    local == Some(peer)
+}
+
+fn confidentiality_offset(encrypt: bool) -> u8 {
+    if encrypt { 1 } else { 0 }
+}
+
+/// Whether a peer-list MN is one of the last two MN values we sent.
+/// `own_next_mn` is the counter for the next MKPDU, so the last sent
+/// values are `own_next_mn - 1` and `own_next_mn - 2`.
+fn mn_is_recent(own_next_mn: u32, peer_mn: u32) -> bool {
+    peer_mn == own_next_mn.wrapping_sub(1)
+        || peer_mn == own_next_mn.wrapping_sub(2)
+}
+
 impl MkaSession {
     pub(crate) fn new(
         iface_name: &str,
@@ -1000,12 +1016,12 @@ impl MkaSession {
             self.need_send = true;
         }
 
-        // MI collision: our MI was used with a higher MN.
+        // MI collision: our MI was used with an MN we have not sent yet.
         let collision = pdu
             .live_peers
             .iter()
             .chain(pdu.potential_peers.iter())
-            .any(|p| p.mi == self.mi && p.mn > self.mn);
+            .any(|p| p.mi == self.mi && p.mn >= self.mn);
         if collision {
             log::warn!("MKA MI collision detected; choosing a new MI");
             self.reset_mi();
@@ -1017,7 +1033,7 @@ impl MkaSession {
             .live_peers
             .iter()
             .chain(pdu.potential_peers.iter())
-            .any(|p| p.mi == self.mi);
+            .any(|p| p.mi == self.mi && mn_is_recent(self.mn, p.mn));
         if knows_us && !self.peers[idx].live {
             self.peers[idx].live = true;
             self.peers[idx].last_seen = now;
@@ -1059,7 +1075,7 @@ impl MkaSession {
         self.elect_key_server();
 
         if let Some(use_) = &pdu.sak_use
-            && use_.latest_ki == self.lki.unwrap_or_default()
+            && sak_use_matches(self.lki, use_.latest_ki)
         {
             if self.is_key_server && sender_is_live {
                 self.peers[idx].rx_ready = use_.latest_rx;
@@ -1361,7 +1377,7 @@ impl MkaSession {
         }
         self.dist_sak = Some(DistSak {
             an,
-            confidentiality_offset: 0,
+            confidentiality_offset: confidentiality_offset(self.encrypt),
             kn,
             wrapped_sak: wrapped,
         });
@@ -1829,6 +1845,34 @@ mod tests {
             .unwrap()
             .expect("MKA frame");
         assert_eq!(parsed, pdu);
+    }
+
+    #[test]
+    fn liveness_requires_a_recent_mn() {
+        assert!(mn_is_recent(10, 9));
+        assert!(mn_is_recent(10, 8));
+        assert!(!mn_is_recent(10, 7));
+        assert!(!mn_is_recent(10, 10));
+    }
+
+    #[test]
+    fn sak_use_with_zero_key_id_does_not_match_without_a_sak() {
+        let zero = KeyId::default();
+        assert!(!sak_use_matches(None, zero));
+        let ki = KeyId {
+            mi: [1; MI_LEN],
+            kn: 1,
+        };
+        assert!(sak_use_matches(Some(ki), ki));
+        assert!(!sak_use_matches(Some(ki), zero));
+    }
+
+    #[test]
+    fn key_server_distributes_the_negotiated_confidentiality_offset() {
+        // The Distributed SAK offset is 1 when confidentiality is used
+        // and 0 for integrity-only operation (802.1X-2020 Table 11-6).
+        assert_eq!(confidentiality_offset(true), 1);
+        assert_eq!(confidentiality_offset(false), 0);
     }
 
     #[test]
