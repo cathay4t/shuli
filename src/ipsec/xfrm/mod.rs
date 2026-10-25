@@ -247,14 +247,14 @@ impl XfrmManager {
             let outbound_id = SaRecord {
                 source: spec.local_address,
                 destination: spec.remote_address,
-                spi: child.local_spi,
+                spi: child.remote_spi,
                 proto: IPPROTO_ESP,
                 family: spec.direction_addr(),
             };
             let inbound_id = SaRecord {
                 source: spec.remote_address,
                 destination: spec.local_address,
-                spi: child.remote_spi,
+                spi: child.local_spi,
                 proto: IPPROTO_ESP,
                 family: spec.direction_addr(),
             };
@@ -322,7 +322,7 @@ impl XfrmManager {
         let outbound = SaRecord {
             source: installed.local_address,
             destination: installed.remote_address,
-            spi: installed.local_spi,
+            spi: installed.remote_spi,
             proto: IPPROTO_ESP,
             family: if installed.local_address.is_ipv4() {
                 netlink_packet_xfrm::AF_INET
@@ -333,7 +333,7 @@ impl XfrmManager {
         let inbound = SaRecord {
             source: installed.remote_address,
             destination: installed.local_address,
-            spi: installed.remote_spi,
+            spi: installed.local_spi,
             proto: IPPROTO_ESP,
             family: outbound.family,
         };

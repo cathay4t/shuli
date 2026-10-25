@@ -29,7 +29,7 @@ pub(crate) fn build(
         (
             spec.local_address,
             spec.remote_address,
-            child.local_spi,
+            child.remote_spi,
             child.outbound_key.clone(),
             child.outbound_integrity_key.clone(),
         )
@@ -37,7 +37,7 @@ pub(crate) fn build(
         (
             spec.remote_address,
             spec.local_address,
-            child.remote_spi,
+            child.local_spi,
             child.inbound_key.clone(),
             child.inbound_integrity_key.clone(),
         )
@@ -58,8 +58,12 @@ pub(crate) fn build(
     info.lifetime_cfg.hard_add_expires_seconds = spec.lifetime.as_secs();
     info.lifetime_cfg.soft_add_expires_seconds =
         soft_lifetime(spec.lifetime).as_secs();
-    info.selector.source_prefix(&src, full_prefix(&src));
-    info.selector.destination_prefix(&dst, full_prefix(&dst));
+    if spec.mode == ChildMode::Tunnel {
+        apply_tunnel_selector(&mut info.selector, child, outbound, spec)?;
+    } else {
+        info.selector.source_prefix(&src, full_prefix(&src));
+        info.selector.destination_prefix(&dst, full_prefix(&dst));
+    }
 
     let mut nlas =
         vec![encryption_transform(child.encryption, &enc_key, spec)?];
@@ -126,6 +130,81 @@ pub(crate) fn delete<'a>(
     })
 }
 
+fn apply_tunnel_selector(
+    selector: &mut netlink_packet_xfrm::Selector,
+    child: &ChildSaHandle,
+    outbound: bool,
+    spec: &InstallSpec,
+) -> Result<(), IpsecError> {
+    let (source, destination) = if outbound {
+        (&child.local_selectors, &child.remote_selectors)
+    } else {
+        (&child.remote_selectors, &child.local_selectors)
+    };
+    if let ([source], [destination]) =
+        (source.as_slice(), destination.as_slice())
+    {
+        if source.family() != destination.family() {
+            return Err(IpsecError::xfrm(
+                "traffic selectors use different address families",
+            ));
+        }
+        selector.source_prefix(
+            &source.start,
+            common_prefix_len(&source.start, &source.end),
+        );
+        selector.destination_prefix(
+            &destination.start,
+            common_prefix_len(&destination.start, &destination.end),
+        );
+        selector.proto = source.protocol;
+        selector.sport = source.start_port;
+        selector.dport = destination.start_port;
+        selector.sport_mask = if source.start_port == source.end_port {
+            u16::MAX
+        } else {
+            0
+        };
+        selector.dport_mask = if destination.start_port == destination.end_port
+        {
+            u16::MAX
+        } else {
+            0
+        };
+        return Ok(());
+    }
+
+    let wildcard = if spec.local_address.is_ipv4() {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    selector.source_prefix(&wildcard, 0);
+    selector.destination_prefix(&wildcard, 0);
+    Ok(())
+}
+
+fn common_prefix_len(start: &IpAddr, end: &IpAddr) -> u8 {
+    match (start, end) {
+        (IpAddr::V4(start), IpAddr::V4(end)) => {
+            if start == end {
+                32
+            } else {
+                (u32::from(*start) ^ u32::from(*end)).leading_zeros() as u8
+            }
+        }
+        (IpAddr::V6(start), IpAddr::V6(end)) => {
+            if start == end {
+                128
+            } else {
+                let xor = u128::from(*start) ^ u128::from(*end);
+                xor.leading_zeros() as u8
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn encryption_transform(
     algorithm: EncryptionAlgorithm,
     key: &[u8],
@@ -186,4 +265,98 @@ fn full_prefix(address: &IpAddr) -> u8 {
 
 fn soft_lifetime(lifetime: Duration) -> Duration {
     lifetime.mul_f64(0.9)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use crate::{
+        InstallSpec,
+        config::{EncryptionAlgorithm, IpNet, TrafficSelector},
+    };
+
+    fn child() -> ChildSaHandle {
+        let local = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1));
+        ChildSaHandle {
+            local_spi: 0x1122_3344,
+            remote_spi: 0x5566_7788,
+            encryption: EncryptionAlgorithm::AesGcm16_256,
+            integrity: None,
+            esn: false,
+            mode: ChildMode::Tunnel,
+            local_selectors: vec![TrafficSelector::net(
+                IpNet::new(local, 24).unwrap(),
+            )],
+            remote_selectors: vec![TrafficSelector::net(
+                IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 1)), 24).unwrap(),
+            )],
+            outbound_key: zeroize::Zeroizing::new(vec![1; 36]),
+            outbound_integrity_key: None,
+            inbound_key: zeroize::Zeroizing::new(vec![2; 36]),
+            inbound_integrity_key: None,
+        }
+    }
+
+    fn spec(mode: ChildMode) -> InstallSpec {
+        InstallSpec {
+            interface: None,
+            if_id: 0,
+            reqid: 1,
+            local_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            remote_address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            mode,
+            lifetime: Duration::from_secs(60),
+            priority: 100,
+            replay_window: 32,
+            mark: None,
+            mark_mask: 0,
+            forward: false,
+            nat_t: false,
+        }
+    }
+
+    #[test]
+    fn state_spis_and_tunnel_selectors_follow_ikev2_directions() {
+        let child = child();
+        let outbound = build(&child, &spec(ChildMode::Tunnel), true).unwrap();
+        assert_eq!(outbound.user_sa_info.id.spi, child.remote_spi);
+        assert_eq!(
+            outbound.user_sa_info.selector.saddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)))
+        );
+        assert_eq!(
+            outbound.user_sa_info.selector.daddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(10, 2, 0, 0)))
+        );
+        assert_eq!(outbound.user_sa_info.selector.prefixlen_s, 24);
+        assert_eq!(outbound.user_sa_info.selector.prefixlen_d, 24);
+
+        let inbound = build(&child, &spec(ChildMode::Tunnel), false).unwrap();
+        assert_eq!(inbound.user_sa_info.id.spi, child.local_spi);
+        assert_eq!(
+            inbound.user_sa_info.selector.saddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(10, 2, 0, 0)))
+        );
+        assert_eq!(
+            inbound.user_sa_info.selector.daddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn transport_state_selector_uses_underlay_addresses() {
+        let child = child();
+        let outbound =
+            build(&child, &spec(ChildMode::Transport), true).unwrap();
+        assert_eq!(
+            outbound.user_sa_info.selector.saddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            outbound.user_sa_info.selector.daddr,
+            Address::from_ip(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)))
+        );
+    }
 }
