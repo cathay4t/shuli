@@ -139,7 +139,7 @@ fn test_psk_sha256_kdv3_handshake() {
         msg3_key_info,
         16,
         2,
-        &[0u8; 32],
+        &[0x55u8; 32],
         &[0u8; 16],
         &[0u8; 8],
         &[0u8; 8],
@@ -427,8 +427,15 @@ fn run_msg1_msg3(
     let wrapped = aes_key_wrap(&kek, &padded)?;
     let key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
     let mut msg3 = Ieee80211EapolKeyFrame::build(
-        key_info, 16, 2, &[0u8; 32], &[0u8; 16], &[0u8; 8], &[0u8; 8],
-        &[0u8; 16], &wrapped,
+        key_info,
+        16,
+        2,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
     );
     let msg3_mic =
         aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
@@ -560,6 +567,140 @@ fn test_ptk_rekey_fresh_snonce() {
 /// with OCV enabled, Message 2 carries our OCI KDE and
 /// Message 3 is accepted only when the AP's OCI matches the BSS
 /// frequency.
+fn build_msg3(
+    state: &FourWayState,
+    replay_counter: u64,
+    nonce: &[u8; 32],
+    corrupt_mic: bool,
+) -> Ieee80211EapolKeyFrame {
+    let key_info = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
+        key_info,
+        16,
+        replay_counter,
+        nonce,
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    let kck = state.kck().unwrap();
+    let mut mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    if corrupt_mic {
+        mic[0] ^= 1;
+    }
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &mic);
+    Ieee80211EapolKeyFrame::parse(&msg3).unwrap()
+}
+
+#[test]
+fn test_duplicate_msg1_reuses_snonce_and_msg2() {
+    let pmk = [0x01u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let first = state.process_message_1(&[0x11u8; 32], 1, 0).unwrap();
+    let second = state.process_message_1(&[0x11u8; 32], 1, 0).unwrap();
+    assert_eq!(first, second, "retransmitted Message 1 changed Message 2");
+
+    let valid = build_msg3(&state, 1, &[0x11u8; 32], false);
+    state.process_message_3(&valid).unwrap();
+    let err = state.process_message_1(&[0x11u8; 32], 1, 0).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+}
+
+#[test]
+fn test_bad_msg3_mic_does_not_advance_replay_counter() {
+    let pmk = [0x01u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let anonce = [0x11u8; 32];
+    state.process_message_1(&anonce, 1, 0).unwrap();
+
+    let wrong_nonce = build_msg3(&state, 10, &[0x22u8; 32], false);
+    let err = state.process_message_3(&wrong_nonce).unwrap_err();
+    assert!(err.to_string().contains("Key Nonce"), "{err}");
+
+    let bad_mic = build_msg3(&state, 10, &anonce, true);
+    let err = state.process_message_3(&bad_mic).unwrap_err();
+    assert!(err.to_string().contains("MIC mismatch"), "{err}");
+
+    let valid = build_msg3(&state, 2, &anonce, false);
+    state.process_message_3(&valid).unwrap();
+    let err = state.process_message_3(&valid).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::HandshakeFailed);
+}
+
+#[test]
+fn test_bad_group_rekey_mic_does_not_advance_replay_counter() {
+    let pmk = [0x11u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+    state.anonce = Some([0x05u8; 32]);
+    state.ptk = Some(state.derive_ptk());
+    let kck = state.kck().unwrap();
+    let kek = state.kek().unwrap();
+    let new_gtk = [0x99u8; 16];
+    let mut kde = vec![
+        0xDD,
+        (6 + new_gtk.len()) as u8,
+        0x00,
+        0x0F,
+        0xAC,
+        0x01,
+        0x02,
+        0x00,
+    ];
+    kde.extend_from_slice(&new_gtk);
+    let wrapped = aes_key_wrap(&kek, &kde).unwrap();
+    let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000;
+    let build = |counter: u64, corrupt_mic: bool| {
+        let mut g1 = Ieee80211EapolKeyFrame::build(
+            key_info, 16, counter, &[0u8; 32], &[0u8; 16], &[0u8; 8],
+            &[0u8; 8], &[0u8; 16], &wrapped,
+        );
+        let mut mic =
+            aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&g1))
+                .unwrap();
+        if corrupt_mic {
+            mic[0] ^= 1;
+        }
+        Ieee80211EapolKeyFrame::set_mic(&mut g1, &mic);
+        Ieee80211EapolKeyFrame::parse(&g1).unwrap()
+    };
+
+    let bad = build(10, true);
+    let err = state.process_group_rekey(&bad).unwrap_err();
+    assert!(err.to_string().contains("MIC mismatch"), "{err}");
+    let valid = build(2, true);
+    assert!(state.process_group_rekey(&valid).is_err());
+    let valid = build(2, false);
+    state.process_group_rekey(&valid).unwrap();
+}
+
 #[test]
 fn test_ocv_oci_in_msg2_and_msg3_verification() {
     let pmk = [0x01u8; 32];
@@ -615,7 +756,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         msg3_key_info,
         16,
         2,
-        &[0u8; 32],
+        &[0x55u8; 32],
         &[0u8; 16],
         &[0u8; 8],
         &[0u8; 8],
@@ -670,7 +811,7 @@ fn test_ocv_oci_in_msg2_and_msg3_verification() {
         msg3_key_info,
         16,
         2,
-        &[0u8; 32],
+        &[0x55u8; 32],
         &[0u8; 16],
         &[0u8; 8],
         &[0u8; 8],
@@ -746,7 +887,7 @@ fn test_extended_key_id_handshake() {
                 msg3_key_info,
                 16,
                 2,
-                &[0u8; 32],
+                &[0x55u8; 32],
                 &[0u8; 16],
                 &[0u8; 8],
                 &[0u8; 8],
@@ -839,7 +980,7 @@ fn test_sae_ext_key_handshake() {
         msg3_key_info,
         16,
         2,
-        &[0u8; 32],
+        &[0x55u8; 32],
         &[0u8; 16],
         &[0u8; 8],
         &[0u8; 8],

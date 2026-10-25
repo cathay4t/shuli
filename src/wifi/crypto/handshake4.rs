@@ -48,6 +48,9 @@ pub struct FourWayState {
     snonce: [u8; 32],
     pub(crate) ptk: Option<[u8; PTK_LEN]>,
     replay_counter: u64,
+    replay_counter_set: bool,
+    /// Replay counter of the Message 1 currently being negotiated.
+    pending_replay_counter: Option<u64>,
     rsne: Vec<u8>,
     /// The AP's RSNE as seen in the beacon/probe response, for the
     /// Message 3 downgrade check (802.11-2020 §12.7.6.4; empty when the
@@ -108,6 +111,8 @@ impl FourWayState {
             snonce,
             ptk: None,
             replay_counter: 0,
+            replay_counter_set: false,
+            pending_replay_counter: None,
             rsne,
             ap_rsne,
             ap_rsnxe,
@@ -150,6 +155,8 @@ impl FourWayState {
             snonce,
             ptk: None,
             replay_counter: 0,
+            replay_counter_set: false,
+            pending_replay_counter: None,
             rsne,
             ap_rsne,
             ap_rsnxe,
@@ -273,6 +280,7 @@ impl FourWayState {
     /// (`NL80211_CMD_SET_REKEY_OFFLOAD` MLME event).
     pub(crate) fn update_replay_counter(&mut self, replay_ctr: [u8; 8]) {
         self.replay_counter = u64::from_be_bytes(replay_ctr);
+        self.replay_counter_set = true;
     }
 
     /// Install a pre-computed PTK. Used after an FT roam, where the PTK
@@ -302,21 +310,40 @@ impl FourWayState {
     /// Returns the serialized Message 2 PDU to send back. Message 2 echoes the
     /// AP's replay counter (802.11-2020 §12.7.6.2).
     ///
-    /// A fresh SNonce is drawn for every Message 1: this covers both the
-    /// initial handshake and an AP-initiated PTK rekey, which arrives as a
-    /// new Message 1 mid-connection and must not reuse the old SNonce
-    /// (wpa_supplicant renews its SNonce the same way).
+    /// A retransmitted Message 1 with the same ANonce and replay counter
+    /// reuses the SNonce and returns the same Message 2.  A new Message 1
+    /// (AP-initiated PTK rekey) starts a fresh handshake with a new
+    /// SNonce/PTK (802.11-2024 §12.7.6.2).
     pub fn process_message_1(
         &mut self,
         anonce: &[u8; 32],
         replay_counter: u64,
         desc_version: u16,
     ) -> Result<Vec<u8>, WifiError> {
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut self.snonce)
-            .expect("RNG");
+        if self.replay_counter_set && replay_counter <= self.replay_counter {
+            return Err(WifiError::new(
+                ErrorKind::HandshakeFailed,
+                format!(
+                    "Message 1 replay counter {replay_counter} <= last                      accepted {}",
+                    self.replay_counter
+                ),
+            ));
+        }
+        let duplicate = self.pending_replay_counter == Some(replay_counter)
+            && self.anonce == Some(*anonce);
+        if self.pending_replay_counter == Some(replay_counter) && !duplicate {
+            return Err(WifiError::new(
+                ErrorKind::HandshakeFailed,
+                "Message 1 reused a replay counter with a new ANonce",
+            ));
+        }
+        if !duplicate {
+            aws_lc_rs::rand::SystemRandom::new()
+                .fill(&mut self.snonce)
+                .expect("RNG");
+        }
         self.anonce = Some(*anonce);
-        self.replay_counter = replay_counter;
+        self.pending_replay_counter = Some(replay_counter);
         // Echo the Key Descriptor Version the AP negotiated in Message 1:
         // 0 (AKM-defined) for SAE/OWE, 2 (HMAC-SHA1) for WPA2-PSK and
         // 3 (AES-128-CMAC) for FT-PSK (802.11-2020 §12.7.2); hostapd
@@ -336,7 +363,7 @@ impl FourWayState {
         }
         let mut msg2 = Ieee80211EapolKeyFrame::build_message_2(
             &self.snonce,
-            self.replay_counter,
+            replay_counter,
             &key_data,
             self.desc_version,
         );
@@ -358,17 +385,33 @@ impl FourWayState {
         &mut self,
         frame: &Ieee80211EapolKeyFrame,
     ) -> Result<(Vec<u8>, Ieee80211KeyDataKdes), WifiError> {
-        // 802.11-2020 §12.7.6.4: replay counter must be >= Message 1's.
-        if frame.replay_counter < self.replay_counter {
+        let pending_counter = self.pending_replay_counter.ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::HandshakeFailed,
+                "Message 3 without a preceding Message 1",
+            )
+        })?;
+        // 802.11-2020 §12.7.6.4: the replay counter must be at least the
+        // pending Message 1 counter, and an already accepted Message 3 is
+        // discarded.
+        if frame.replay_counter < pending_counter
+            || (self.replay_counter_set
+                && frame.replay_counter <= self.replay_counter)
+        {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 format!(
-                    "Message 3 replay counter {} < Message 1 counter {}",
-                    frame.replay_counter, self.replay_counter
+                    "Message 3 replay counter {} is not newer than the                      handshake counter {pending_counter}",
+                    frame.replay_counter
                 ),
             ));
         }
-        self.replay_counter = frame.replay_counter;
+        if self.anonce != Some(frame.key_nonce) {
+            return Err(WifiError::new(
+                ErrorKind::HandshakeFailed,
+                "Message 3 Key Nonce does not match the ANonce from                  Message 1",
+            ));
+        }
 
         let kck = self.kck().ok_or_else(|| {
             WifiError::new(ErrorKind::HandshakeFailed, "PTK not derived")
@@ -379,12 +422,20 @@ impl FourWayState {
             &kck,
             &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
         )?;
-        if expected != frame.key_mic {
+        if aws_lc_rs::constant_time::verify_slices_are_equal(
+            &expected,
+            &frame.key_mic,
+        )
+        .is_err()
+        {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "MIC mismatch",
             ));
         }
+        self.replay_counter = frame.replay_counter;
+        self.replay_counter_set = true;
+        self.pending_replay_counter = None;
 
         // Unwrap the key data and parse its KDEs: GTK plus (with PMF) the
         // IGTK / BIGTK and the AP's RSNE / RSNXE.
@@ -516,7 +567,6 @@ impl FourWayState {
                 ),
             ));
         }
-        self.replay_counter = frame.replay_counter;
 
         let kck = self.kck().ok_or_else(|| {
             WifiError::new(ErrorKind::HandshakeFailed, "PTK not derived")
@@ -527,12 +577,19 @@ impl FourWayState {
             &kck,
             &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
         )?;
-        if expected != frame.key_mic {
+        if aws_lc_rs::constant_time::verify_slices_are_equal(
+            &expected,
+            &frame.key_mic,
+        )
+        .is_err()
+        {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "group rekey MIC mismatch",
             ));
         }
+        self.replay_counter = frame.replay_counter;
+        self.replay_counter_set = true;
 
         // Decrypt/extract the new GTK from the key data KDEs.
         if frame.key_data.is_empty() {
