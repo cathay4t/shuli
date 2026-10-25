@@ -420,6 +420,7 @@ impl WifiIface {
     /// Disarm a pending post-connect scan (link lost before it ran).
     pub(crate) fn disarm_post_connect_scan(&mut self) {
         self.roam.post_connect_scan_at = None;
+        self.roam.post_connect_scan = false;
     }
 
     /// A `NL80211_CMD_NOTIFY_CQM` event from the kernel. On a LOW
@@ -498,6 +499,7 @@ impl WifiIface {
                     );
                     self.roam.roam_scan = false;
                     self.roam.background_scan = false;
+                    self.roam.post_connect_scan = false;
                     if let Some(prev) = self.roam.pre_roam_state.take() {
                         self.state = prev;
                     }
@@ -929,6 +931,8 @@ impl WifiIface {
         // post-connect scan is needed for this client run.
         self.roam.post_connect_scan_at = None;
         self.roam.post_connect_scan_done = true;
+        // The target association must arm CQM with its own threshold.
+        self.roam.cqm_armed = false;
         // An FT roam only applies within the connected network (the FT
         // context is bound to the current SSID); a different configured
         // SSID always goes through a full reconnection.

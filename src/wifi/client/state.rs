@@ -481,6 +481,8 @@ impl RoamEngine {
         self.pending_nr_dialog = None;
         self.neighbor_report_responses = 0;
         self.last_roam = None;
+        self.cqm_armed = false;
+        self.post_connect_scan = false;
     }
 }
 
@@ -589,7 +591,7 @@ pub(crate) struct WifiIface {
 #[cfg(test)]
 mod tests {
     use super::{
-        BssidIgnoreList, NetworkUpdate, ResumeAction, WifiState,
+        BssidIgnoreList, NetworkUpdate, ResumeAction, RoamEngine, WifiState,
         bssid_ignore_timeout_secs, connection_is_live, network_update_action,
         resume_action,
     };
@@ -616,6 +618,19 @@ mod tests {
             WifiState::Scanning,
             Some(WifiState::Init)
         ));
+    }
+
+    #[test]
+    fn roam_reset_clears_runtime_cqm_and_post_connect_flags() {
+        let mut roam = RoamEngine {
+            cqm_armed: true,
+            post_connect_scan: true,
+            post_connect_scan_at: Some(std::time::Instant::now()),
+            ..RoamEngine::default()
+        };
+        roam.reset();
+        assert!(!roam.cqm_armed);
+        assert!(!roam.post_connect_scan);
     }
 
     #[test]

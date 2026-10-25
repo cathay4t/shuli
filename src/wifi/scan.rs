@@ -664,6 +664,10 @@ impl WifiIface {
         };
         self.link.bss_info = bss_info;
         self.link.network = network;
+        // A new association must arm CQM with this network's threshold
+        // instead of inheriting the previous link's monitor state.
+        self.roam.cqm_armed = false;
+        self.roam.post_connect_scan = false;
         log::info!(
             "selected BSS: ssid={}, bssid={:02x?}, freq={} MHz, signal={} dBm",
             self.link.network.ssid,
