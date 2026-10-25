@@ -444,11 +444,13 @@ impl FourWayState {
             let kek = self.kek().ok_or_else(|| {
                 WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
             })?;
-            let plain = if frame.is_encrypted_data() {
-                aes_key_unwrap(&kek, &frame.key_data)?
-            } else {
-                frame.key_data.clone()
-            };
+            if !frame.is_encrypted_data() {
+                return Err(WifiError::new(
+                    ErrorKind::HandshakeFailed,
+                    "Message 3 key data is not encrypted",
+                ));
+            }
+            let plain = aes_key_unwrap(&kek, &frame.key_data)?;
             // verify the AP's OCI before accepting the
             // message.
             if self.ocv {
@@ -601,11 +603,13 @@ impl FourWayState {
         let kek = self.kek().ok_or_else(|| {
             WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
         })?;
-        let plain = if frame.is_encrypted_data() {
-            aes_key_unwrap(&kek, &frame.key_data)?
-        } else {
-            frame.key_data.clone()
-        };
+        if !frame.is_encrypted_data() {
+            return Err(WifiError::new(
+                ErrorKind::HandshakeFailed,
+                "group rekey key data is not encrypted",
+            ));
+        }
+        let plain = aes_key_unwrap(&kek, &frame.key_data)?;
         // verify the AP's OCI in the group rekey too.
         if self.ocv {
             crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;

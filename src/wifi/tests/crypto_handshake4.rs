@@ -648,6 +648,48 @@ fn test_bad_msg3_mic_does_not_advance_replay_counter() {
 }
 
 #[test]
+fn test_unencrypted_key_data_is_rejected() {
+    let pmk = [0x01u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let anonce = [0x11u8; 32];
+    state.process_message_1(&anonce, 1, 0).unwrap();
+    let kck = state.kck().unwrap();
+    let gtk = [0x77u8; 16];
+    let mut kde = vec![
+        0xDD,
+        (6 + gtk.len()) as u8,
+        0x00,
+        0x0F,
+        0xAC,
+        0x01,
+        0x01,
+        0x00,
+    ];
+    kde.extend_from_slice(&gtk);
+    // No encrypted-key-data bit: Message 3 must be rejected.
+    let key_info = 0x0008 | 0x0040 | 0x0080 | 0x0200;
+    let mut msg3 = Ieee80211EapolKeyFrame::build(
+        key_info, 16, 2, &anonce, &[0u8; 16], &[0u8; 8], &[0u8; 8], &[0u8; 16],
+        &kde,
+    );
+    let mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg3))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut msg3, &mic);
+    let msg3 = Ieee80211EapolKeyFrame::parse(&msg3).unwrap();
+    let err = state.process_message_3(&msg3).unwrap_err();
+    assert!(err.to_string().contains("not encrypted"), "{err}");
+}
+
+#[test]
 fn test_bad_group_rekey_mic_does_not_advance_replay_counter() {
     let pmk = [0x11u8; 32];
     let mut state = FourWayState::new_with_ap_ies(
