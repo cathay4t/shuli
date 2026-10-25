@@ -11,8 +11,9 @@ use wl_nl80211::{
 use crate::{
     nl80211::extract_signal_dbm,
     scan::{
-        SecurityType, detect_security, detect_security_with_privacy,
-        negotiate_group_mgmt_cipher, scan_results_from_bss_list,
+        SecurityType, best_scan_candidate_filtered, detect_security,
+        detect_security_with_privacy, negotiate_group_mgmt_cipher,
+        scan_results_from_bss_list,
     },
 };
 
@@ -349,5 +350,46 @@ fn group_mgmt_cipher_negotiation_roundtrip() {
         negotiate_group_mgmt_cipher(&[]),
         Ieee80211CipherSuite::BipCmac128,
         "missing group mgmt cipher defaults to BIP-CMAC-128"
+    );
+}
+
+#[test]
+fn scan_selection_rejects_bss_with_mismatched_credentials() {
+    use crate::{BssInfo, NetworkConfig};
+
+    let open = BssInfo {
+        bssid: [0x02, 0x00, 0x00, 0x00, 0x00, 0x10],
+        freq_mhz: 2412,
+        signal_dbm: -40,
+        security: SecurityType::Open,
+        ..BssInfo::default()
+    };
+    let mut secured = NetworkConfig::new("Home");
+    secured.set_password("secret");
+    assert!(
+        best_scan_candidate_filtered(
+            &[(open.clone(), secured.clone())],
+            |_| true
+        )
+        .is_none(),
+        "a password network must not join an open BSS"
+    );
+
+    let psk = BssInfo {
+        security: SecurityType::Wpa2Psk,
+        ..open.clone()
+    };
+    assert!(
+        best_scan_candidate_filtered(&[(psk, secured)], |_| true).is_some()
+    );
+
+    let eap = BssInfo {
+        security: SecurityType::Wpa2Ent,
+        ..open.clone()
+    };
+    let mut enterprise = NetworkConfig::new("Corp");
+    enterprise.set_eap(crate::EapConfig::default());
+    assert!(
+        best_scan_candidate_filtered(&[(eap, enterprise)], |_| true).is_some()
     );
 }

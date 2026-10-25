@@ -288,7 +288,7 @@ fn best_scan_candidate(
 /// list (wpa_supplicant's `bssid_ignore` ordering rule) while keeping the
 /// preferred-SSID logic intact. A network pinned to a BSSID only ever
 /// matches that BSS, whatever the predicate says.
-fn best_scan_candidate_filtered(
+pub(crate) fn best_scan_candidate_filtered(
     candidates: &[(BssInfo, NetworkConfig)],
     include: impl Fn(&BssInfo) -> bool,
 ) -> Option<(BssInfo, NetworkConfig)> {
@@ -297,6 +297,7 @@ fn best_scan_candidate_filtered(
         .filter(|(bss, network)| {
             include(bss)
                 && network.matches_bssid(&bss.bssid)
+                && network.accepts_security(bss.security)
                 && network.prefered
                 && bss.signal_dbm >= DEFAULT_SWITCH_SSID_LOWER_THAN_DBM
         })
@@ -305,7 +306,9 @@ fn best_scan_candidate_filtered(
             candidates
                 .iter()
                 .filter(|(bss, network)| {
-                    include(bss) && network.matches_bssid(&bss.bssid)
+                    include(bss)
+                        && network.matches_bssid(&bss.bssid)
+                        && network.accepts_security(bss.security)
                 })
                 .max_by(|a, b| a.0.cmp(&b.0))
         })
@@ -863,6 +866,20 @@ impl WifiIface {
             );
             let bss_security =
                 detect_security_with_privacy(ies, extract_privacy(bss));
+            if !network.accepts_security(bss_security.security) {
+                let reason = format!(
+                    "BSS uses {:?} but the configured credentials do not match",
+                    bss_security.security
+                );
+                log::info!(
+                    "BSS {bssid:02x?} (ssid={bss_ssid}): {reason}; skipping"
+                );
+                if self.scan.unsupported_security.is_none() {
+                    self.scan.unsupported_security =
+                        Some((bss_ssid.clone(), reason));
+                }
+                continue;
+            }
             // never present an AP shuli cannot actually join
             // (WPA1/TKIP, ...) as a connection candidate - classifying
             // it open would make the client associate without

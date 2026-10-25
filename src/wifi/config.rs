@@ -453,17 +453,38 @@ impl NetworkConfig {
     /// scan.
     pub(crate) fn scan_free_bss_info(&self) -> Option<BssInfo> {
         let bss = self.hints.bss_info()?;
-        self.matches_bssid(&bss.bssid).then_some(bss)
+        (self.matches_bssid(&bss.bssid) && self.accepts_security(bss.security))
+            .then_some(bss)
+    }
+
+    /// Whether this network has the credentials required by `security`.
+    /// Open and OWE networks need no credentials, PSK/SAE/FT networks
+    /// need a password, and enterprise networks need EAP.
+    pub(crate) fn accepts_security(&self, security: SecurityType) -> bool {
+        match security {
+            SecurityType::Unsupported => false,
+            SecurityType::Open | SecurityType::Owe => {
+                self.password.is_none() && self.eap.is_none()
+            }
+            SecurityType::Wpa2Psk
+            | SecurityType::Wpa2PskSha256
+            | SecurityType::Sae
+            | SecurityType::SaeExtKey
+            | SecurityType::FtPsk
+            | SecurityType::FtSae
+            | SecurityType::FtSaeExtKey => {
+                self.password.is_some() && self.eap.is_none()
+            }
+            SecurityType::Wpa2Ent | SecurityType::Wpa2EntSha256 => {
+                self.eap.is_some() && self.password.is_none()
+            }
+        }
     }
 
     /// Whether a cross-SSID roam may land on a BSS advertising
     /// `security`.
     pub(crate) fn can_roam_to_security(&self, security: SecurityType) -> bool {
-        match security {
-            SecurityType::Unsupported => false,
-            SecurityType::Open => self.password.is_none() && self.eap.is_none(),
-            _ => true,
-        }
+        self.accepts_security(security)
     }
 }
 

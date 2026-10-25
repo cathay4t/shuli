@@ -129,6 +129,7 @@ fn bssid_pin_only_matches_the_pinned_bssid() {
 #[test]
 fn scan_free_hints_respect_the_bssid_pin() {
     let mut network = NetworkConfig::new("Home-WIFI");
+    network.set_password("secret");
     network.set_hints(complete_hints());
     assert!(network.scan_free_bss_info().is_some());
 
@@ -305,4 +306,44 @@ fn ext_key_id_defaults_to_disabled_and_can_be_enabled() {
     assert!(network.ext_key_id);
     network.set_ext_key_id(false);
     assert!(!network.ext_key_id);
+}
+
+#[test]
+fn network_accepts_only_matching_security() {
+    use crate::scan::SecurityType;
+
+    let psk = NetworkConfig::new("PSK").set_password("secret").clone();
+    for security in [
+        SecurityType::Wpa2Psk,
+        SecurityType::Wpa2PskSha256,
+        SecurityType::Sae,
+        SecurityType::SaeExtKey,
+        SecurityType::FtPsk,
+        SecurityType::FtSae,
+        SecurityType::FtSaeExtKey,
+    ] {
+        assert!(psk.accepts_security(security), "{security:?}");
+    }
+    for security in [
+        SecurityType::Open,
+        SecurityType::Owe,
+        SecurityType::Wpa2Ent,
+        SecurityType::Wpa2EntSha256,
+        SecurityType::Unsupported,
+    ] {
+        assert!(!psk.accepts_security(security), "{security:?}");
+    }
+
+    let mut ent = NetworkConfig::new("ENT");
+    ent.set_eap(crate::EapConfig::default());
+    assert!(ent.accepts_security(SecurityType::Wpa2Ent));
+    assert!(ent.accepts_security(SecurityType::Wpa2EntSha256));
+    assert!(!ent.accepts_security(SecurityType::Wpa2Psk));
+    assert!(!ent.accepts_security(SecurityType::Open));
+
+    let open = NetworkConfig::new("OPEN");
+    assert!(open.accepts_security(SecurityType::Open));
+    assert!(open.accepts_security(SecurityType::Owe));
+    assert!(!open.accepts_security(SecurityType::Wpa2Psk));
+    assert!(!open.accepts_security(SecurityType::Wpa2Ent));
 }
