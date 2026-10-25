@@ -213,16 +213,25 @@ fn parse_hex(field: &str, value: &str) -> Result<Vec<u8>, WifiError> {
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != ':')
         .collect();
-    if !cleaned.len().is_multiple_of(2) {
+    let digits = cleaned.as_bytes();
+    if !digits.len().is_multiple_of(2) {
         return Err(WifiError::new(
             ErrorKind::InvalidConfig,
             format!("{field} must contain an even number of hex digits"),
         ));
     }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(|e| {
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(WifiError::new(
+            ErrorKind::InvalidConfig,
+            format!("invalid hex in {field}"),
+        ));
+    }
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .expect("ASCII hex digits are valid UTF-8");
+            u8::from_str_radix(pair, 16).map_err(|e| {
                 WifiError::new(
                     ErrorKind::InvalidConfig,
                     format!("invalid hex in {field}: {e}"),
@@ -1324,6 +1333,16 @@ ethernets:
         assert!(!text.contains("deadbeef"), "CKN leaked: {text}");
         assert!(text.contains("cak_len"));
         assert!(text.contains("ckn_len"));
+    }
+
+    #[test]
+    fn parse_hex_rejects_non_ascii_and_signed_values() {
+        assert!(parse_hex("macsec.cak", "🎉🎉").is_err());
+        assert!(parse_hex("macsec.cak", &"+f".repeat(16)).is_err());
+        assert_eq!(
+            parse_hex("macsec.cak", "00:11:22:33").unwrap(),
+            vec![0x00, 0x11, 0x22, 0x33]
+        );
     }
 
     #[test]
