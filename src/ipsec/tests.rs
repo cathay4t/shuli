@@ -552,7 +552,7 @@ fn esp_selection_returns_the_matching_proposal_number() {
             ChildProposal, DhGroup, EncryptionAlgorithm, IntegrityAlgorithm,
         },
         ikev2::{
-            codec::{self, Proposal, transform_type},
+            codec::{self, Proposal},
             proposal,
         },
     };
@@ -951,6 +951,69 @@ async fn certificate_point_to_point_self_connection() {
         ready,
         "certificate authentication did not establish a Child SA"
     );
+}
+
+#[tokio::test]
+async fn peer_delete_removes_child_sa() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let a = psk_config(
+        "a",
+        15400,
+        Some(15401),
+        Identity::Fqdn("a.example".into()),
+        Identity::Fqdn("b.example".into()),
+    );
+    let b = psk_config(
+        "b",
+        15401,
+        None,
+        Identity::Fqdn("b.example".into()),
+        Identity::Fqdn("a.example".into()),
+    );
+    let mut client_a = crate::IpsecClient::init(vec![a]).await.unwrap();
+    let mut client_b = crate::IpsecClient::init(vec![b]).await.unwrap();
+    let mut a_ready = false;
+    let mut b_ready = false;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !(a_ready && b_ready) {
+        tokio::select! {
+            event = client_a.run() => {
+                if let Ok(crate::IpsecEvent::ChildSaReady { .. }) = event {
+                    a_ready = true;
+                }
+            }
+            event = client_b.run() => {
+                if let Ok(crate::IpsecEvent::ChildSaReady { .. }) = event {
+                    b_ready = true;
+                }
+            }
+        }
+    }
+    assert!(a_ready && b_ready, "Child SA was not established");
+
+    client_a.shutdown().await;
+    let mut removed = false;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !removed {
+        if let Ok(crate::IpsecEvent::ChildSaRemoved { reason, .. }) =
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client_b.run(),
+            )
+            .await
+            .unwrap_or(Ok(crate::IpsecEvent::State {
+                connection: String::new(),
+                state: crate::IpsecState::Closed,
+            }))
+            && reason == crate::ChildSaRemovalReason::PeerDelete
+        {
+            removed = true;
+        }
+    }
+    client_b.shutdown().await;
+    assert!(removed, "peer Delete did not remove the Child SA");
 }
 
 #[tokio::test]

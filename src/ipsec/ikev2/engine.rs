@@ -1279,11 +1279,18 @@ impl Runner {
                 Payload::Delete { protocol, spis, .. }
                     if *protocol == codec::protocol_id::ESP =>
                 {
-                    if let Some(ike) = self.ike.as_ref()
-                        && ike.child.as_ref().is_some_and(|child| {
-                            spis.contains(&child.handle.local_spi)
+                    let local_spi = self.ike.as_ref().and_then(|ike| {
+                        ike.child.as_ref().and_then(|child| {
+                            spis.contains(&child.handle.remote_spi)
+                                .then_some(child.handle.local_spi)
                         })
-                    {
+                    });
+                    if let Some(local_spi) = local_spi {
+                        response.push(Payload::Delete {
+                            protocol: codec::protocol_id::ESP,
+                            spi_size: 4,
+                            spis: vec![local_spi],
+                        });
                         self.remove_child(
                             crate::client::ChildSaRemovalReason::PeerDelete,
                         )
