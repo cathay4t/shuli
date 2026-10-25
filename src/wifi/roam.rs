@@ -23,11 +23,12 @@ use wl_nl80211::{
     Ieee80211ActionFrameBtmResponse, Ieee80211ActionFrameNeighborReportRequest,
     Ieee80211ActionFrameNeighborReportResponse,
     Ieee80211AuthFrameFastBssTransition, Ieee80211BtmRequest,
-    Ieee80211BtmResponse, Ieee80211Frame, Ieee80211NeighborReportRequest,
-    Ieee80211NeighborReportResponse, Ieee80211OperatingClass,
-    Ieee80211StatusCode, Nl80211Associate, Nl80211AuthType,
-    Nl80211Authenticate, Nl80211Cqm, Nl80211CqmAttr, Nl80211CqmRssiEvent,
-    Nl80211CqmRssiThresholdEvent, Nl80211Event, Nl80211UseMfp, find_ie,
+    Ieee80211BtmResponse, Ieee80211CipherSuite, Ieee80211Frame,
+    Ieee80211NeighborReportRequest, Ieee80211NeighborReportResponse,
+    Ieee80211OperatingClass, Ieee80211StatusCode, Nl80211Associate,
+    Nl80211Attr, Nl80211AuthType, Nl80211Authenticate, Nl80211Cqm,
+    Nl80211CqmAttr, Nl80211CqmRssiEvent, Nl80211CqmRssiThresholdEvent,
+    Nl80211Event, Nl80211Key, Nl80211KeyAttr, Nl80211UseMfp, find_ie,
     find_ie_pos, ft_psk_ie_cipher, ft_psk_rsne_cipher,
     ft_sae_ext_key_ie_cipher, ft_sae_ext_key_rsne_cipher, ft_sae_ie_cipher,
     ft_sae_rsne_cipher, ftie_auth_request, ie_at, mdie, parse_ftie, parse_mdie,
@@ -1498,13 +1499,13 @@ impl WifiIface {
         }
         if let Some(ref igtk) = ftie.igtk {
             let key = unwrap_ft_key(&kek, igtk)?;
-            let attrs = wl_nl80211::Nl80211Key::new_igtk(
+            let attrs = ft_igtk_attrs(
                 self.core.nl.if_index,
                 key,
                 igtk.key_index,
                 igtk.rsc.clone(),
-            )
-            .build();
+                target.group_mgmt_cipher,
+            );
             if let Err(e) = self.core.nl.new_key(attrs).await {
                 log::warn!("FT roam: IGTK install failed: {e}");
             } else {
@@ -1513,13 +1514,13 @@ impl WifiIface {
         }
         if let Some(ref bigtk) = ftie.bigtk {
             let key = unwrap_ft_key(&kek, bigtk)?;
-            let attrs = wl_nl80211::Nl80211Key::new_bigtk(
+            let attrs = ft_bigtk_attrs(
                 self.core.nl.if_index,
                 key,
                 bigtk.key_index,
                 bigtk.rsc.clone(),
-            )
-            .build();
+                target.group_mgmt_cipher,
+            );
             if let Err(e) = self.core.nl.new_key(attrs).await {
                 log::warn!("FT roam: BIGTK install failed: {e}");
             } else {
@@ -1636,6 +1637,30 @@ impl WifiIface {
     }
 }
 
+fn ft_igtk_attrs(
+    if_index: u32,
+    key: Vec<u8>,
+    key_index: u8,
+    rsc: Vec<u8>,
+    cipher: Ieee80211CipherSuite,
+) -> Vec<Nl80211Attr> {
+    Nl80211Key::new_igtk(if_index, key, key_index, rsc)
+        .cipher(cipher)
+        .build()
+}
+
+fn ft_bigtk_attrs(
+    if_index: u32,
+    key: Vec<u8>,
+    key_index: u8,
+    rsc: Vec<u8>,
+    cipher: Ieee80211CipherSuite,
+) -> Vec<Nl80211Attr> {
+    Nl80211Key::new_bigtk(if_index, key, key_index, rsc)
+        .cipher(cipher)
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,5 +1724,44 @@ mod tests {
                  password_id={password_id:?}"
             );
         }
+    }
+
+    #[test]
+    fn ft_mgmt_keys_use_the_negotiated_bip_cipher() {
+        let attrs = ft_igtk_attrs(
+            1,
+            vec![0x11; 32],
+            4,
+            vec![0; 6],
+            Ieee80211CipherSuite::BipGmac256,
+        );
+        assert_eq!(
+            key_cipher(&attrs),
+            Some(u32::from(Ieee80211CipherSuite::BipGmac256).swap_bytes())
+        );
+
+        let attrs = ft_bigtk_attrs(
+            1,
+            vec![0x22; 32],
+            6,
+            vec![0; 6],
+            Ieee80211CipherSuite::BipCmac256,
+        );
+        assert_eq!(
+            key_cipher(&attrs),
+            Some(u32::from(Ieee80211CipherSuite::BipCmac256).swap_bytes())
+        );
+    }
+
+    fn key_cipher(attrs: &[Nl80211Attr]) -> Option<u32> {
+        attrs.iter().find_map(|attr| {
+            let Nl80211Attr::Key(key) = attr else {
+                return None;
+            };
+            key.iter().find_map(|attr| match attr {
+                Nl80211KeyAttr::Cipher(cipher) => Some(*cipher),
+                _ => None,
+            })
+        })
     }
 }
