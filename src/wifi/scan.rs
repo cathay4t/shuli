@@ -373,7 +373,7 @@ pub(crate) fn best_retry_candidate(
             bss.bssid != failed_bssid
                 && network.ssid == ssid
                 && network.matches_bssid(&bss.bssid)
-                && bss.security.base() == security_base
+                && bss.security.base() == security_base.base()
                 && !is_ignored(&bss.bssid)
         })
         .max_by(|a, b| a.0.cmp(&b.0))
@@ -1825,6 +1825,27 @@ mod tests {
         assert_eq!(network.ssid, "Same");
         assert_eq!(bss.signal_dbm, -55);
         assert_eq!(bss.security, SecurityType::Open);
+    }
+
+    #[test]
+    fn retry_candidate_matches_ft_bsses_of_the_same_ess() {
+        let mut first = candidate("FT", -40, 1, false);
+        first.0.security = SecurityType::FtPsk;
+        let failed = first.0.bssid;
+        let mut second = candidate("FT", -55, 2, false);
+        second.0.security = SecurityType::FtPsk;
+        let candidates = vec![first, second];
+
+        let (bss, _) = best_retry_candidate(
+            &candidates,
+            failed,
+            "FT",
+            SecurityType::FtPsk,
+            |_| false,
+        )
+        .expect("FT alternative selected");
+        assert_eq!(bss.signal_dbm, -55);
+        assert_eq!(bss.security, SecurityType::FtPsk);
     }
 
     #[test]
