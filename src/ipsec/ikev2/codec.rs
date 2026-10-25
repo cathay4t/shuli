@@ -627,26 +627,36 @@ fn encode_ts_selector(
     selector: &TsSelector,
     buffer: &mut Vec<u8>,
 ) -> Result<(), IpsecError> {
+    let (length, addresses) =
+        match (selector.ts_type, selector.start, selector.end) {
+            (7, std::net::IpAddr::V4(start), std::net::IpAddr::V4(end)) => {
+                let mut addresses = start.octets().to_vec();
+                addresses.extend_from_slice(&end.octets());
+                (16u16, addresses)
+            }
+            (8, std::net::IpAddr::V6(start), std::net::IpAddr::V6(end)) => {
+                let mut addresses = start.octets().to_vec();
+                addresses.extend_from_slice(&end.octets());
+                (40u16, addresses)
+            }
+            (7 | 8, _, _) => {
+                return Err(IpsecError::ike(
+                    "traffic selector type does not match its addresses",
+                ));
+            }
+            (other, _, _) => {
+                return Err(IpsecError::new(
+                    IpsecErrorKind::NoSupport,
+                    format!("unsupported traffic selector type {other}"),
+                ));
+            }
+        };
     buffer.push(selector.ts_type);
     buffer.push(selector.protocol);
-    buffer.extend_from_slice(&(16u16).to_be_bytes());
+    buffer.extend_from_slice(&length.to_be_bytes());
     buffer.extend_from_slice(&selector.start_port.to_be_bytes());
     buffer.extend_from_slice(&selector.end_port.to_be_bytes());
-    match (selector.start, selector.end) {
-        (std::net::IpAddr::V4(start), std::net::IpAddr::V4(end)) => {
-            buffer.extend_from_slice(&start.octets());
-            buffer.extend_from_slice(&end.octets());
-        }
-        (std::net::IpAddr::V6(start), std::net::IpAddr::V6(end)) => {
-            buffer.extend_from_slice(&start.octets());
-            buffer.extend_from_slice(&end.octets());
-        }
-        _ => {
-            return Err(IpsecError::ike(
-                "traffic selector address families differ",
-            ));
-        }
-    }
+    buffer.extend_from_slice(&addresses);
     Ok(())
 }
 
@@ -672,7 +682,7 @@ fn decode_ts(body: &[u8]) -> Result<Vec<TsSelector>, IpsecError> {
             u16::from_be_bytes([body[offset + 4], body[offset + 5]]);
         let end_port = u16::from_be_bytes([body[offset + 6], body[offset + 7]]);
         let (start, end) = match ts_type {
-            7 | 8 => {
+            7 => {
                 if length != 16 {
                     return Err(IpsecError::ike(
                         "invalid IPv4 traffic selector length",
@@ -693,7 +703,7 @@ fn decode_ts(body: &[u8]) -> Result<Vec<TsSelector>, IpsecError> {
                     )),
                 )
             }
-            9 | 10 => {
+            8 => {
                 if length != 40 {
                     return Err(IpsecError::ike(
                         "invalid IPv6 traffic selector length",

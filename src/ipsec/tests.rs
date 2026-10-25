@@ -113,6 +113,37 @@ fn codec_round_trip() {
 }
 
 #[test]
+fn codec_round_trips_ipv6_traffic_selectors() {
+    use std::net::Ipv6Addr;
+
+    let header = IkeHeader::new(1, 2, ExchangeType::IkeAuth, 0x08, 0);
+    let selectors = vec![codec::TsSelector {
+        ts_type: 8,
+        protocol: 6,
+        start_port: 1000,
+        end_port: 2000,
+        start: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        end: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1)),
+    }];
+    let message = codec::Message::new(
+        header,
+        vec![Payload::Ts {
+            initiator: true,
+            selectors: selectors.clone(),
+        }],
+    );
+    let encoded = message.encode().unwrap();
+    let decoded = codec::Message::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded.payloads,
+        vec![Payload::Ts {
+            initiator: true,
+            selectors,
+        }]
+    );
+}
+
+#[test]
 fn codec_rejects_truncated_payloads() {
     let header = IkeHeader::new(1, 2, ExchangeType::IkeSaInit, 0x08, 0);
     let message =
@@ -210,7 +241,10 @@ fn encrypted_payload_uses_rfc_7296_padding() {
     let encoded = codec::encode_chain(&payloads).unwrap();
 
     for (encryption, padding) in [
-        (EncryptionAlgorithm::AesCbc128, (16 - ((encoded.len() + 1) % 16)) % 16),
+        (
+            EncryptionAlgorithm::AesCbc128,
+            (16 - ((encoded.len() + 1) % 16)) % 16,
+        ),
         (EncryptionAlgorithm::AesGcm16_256, 3),
     ] {
         let mut plaintext = encoded.clone();
@@ -385,20 +419,22 @@ fn child_keys_follow_rfc_7296_pfs_order() {
     );
     assert_eq!(
         child.outbound_integrity_key.as_ref().unwrap().as_slice(),
-        hex_bytes("351a38ee7ec38cfdb02e96cdd80277c818f736300bfda51ed1096aa8bb780530")
+        hex_bytes(
+            "351a38ee7ec38cfdb02e96cdd80277c818f736300bfda51ed1096aa8bb780530"
+        )
     );
     assert_eq!(
         child.inbound_integrity_key.as_ref().unwrap().as_slice(),
-        hex_bytes("ec938eeae1fb04f1a760263edb1b48bb5fbb6694ff9d066bbdc807bed54c8855")
+        hex_bytes(
+            "ec938eeae1fb04f1a760263edb1b48bb5fbb6694ff9d066bbdc807bed54c8855"
+        )
     );
 }
 
 #[test]
 fn ike_keys_follow_rfc_7296_skeyseed() {
     use crate::{
-        config::{
-            EncryptionAlgorithm, IntegrityAlgorithm, PrfAlgorithm,
-        },
+        config::{EncryptionAlgorithm, IntegrityAlgorithm, PrfAlgorithm},
         ikev2::sa::{IkeKeys, Role},
     };
 
@@ -419,11 +455,15 @@ fn ike_keys_follow_rfc_7296_skeyseed() {
     // SKEYSEED = prf(Ni | Nr, g^ir) per RFC 7296 section 2.14.
     assert_eq!(
         keys.sk_d.as_slice(),
-        hex_bytes("8bfd98e2b8add5d8036166e2c4c406a900fda72ae71550c2753f85b5761b6213")
+        hex_bytes(
+            "8bfd98e2b8add5d8036166e2c4c406a900fda72ae71550c2753f85b5761b6213"
+        )
     );
     assert_eq!(
         keys.sk_ai.as_slice(),
-        hex_bytes("f21aab0e94311308c72416ed94d555230272459b300fb6dbe751a701be460c55")
+        hex_bytes(
+            "f21aab0e94311308c72416ed94d555230272459b300fb6dbe751a701be460c55"
+        )
     );
     assert_eq!(
         keys.sk_ei.as_slice(),
