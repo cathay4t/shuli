@@ -83,6 +83,7 @@ async fn apply_dhcpv4_lease(
     handle
         .address()
         .add(if_index, ip, lease.prefix_length())
+        .replace()
         .execute()
         .await
         .map_err(|e| {

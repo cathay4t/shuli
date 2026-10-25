@@ -84,6 +84,7 @@ async fn apply_static_ip(
         handle
             .address()
             .add(if_index, ip, addr.prefix_length)
+            .replace()
             .execute()
             .await
             .map_err(|e| {
