@@ -767,7 +767,6 @@ impl WifiIface {
     /// other reason is transient (`Failed`, short backoff). `None`
     /// means no reason was available (missing frame); treat it as
     /// transient.
-    ///
     /// A transient disconnect of an established link arms the one-shot
     /// fast recovery: mirroring wpa_supplicant, an AP-generated
     /// recoverable reason (4/6/7) re-authenticates to the same BSS
@@ -854,9 +853,13 @@ impl WifiIface {
             self.roam.pre_roam_state = None;
             self.roam.roam_target = None;
             self.mark_link_lost(FastReconnect::ScanNow).await;
-        } else if self.state == WifiState::Authenticating
-            && self.is_psk_4way_in_progress()
-        {
+        } else if could_be_psk_mismatch(
+            self.state,
+            self.link.bss_info.security,
+            self.link.pmksa_in_use.is_some(),
+            self.link.fourway.is_some(),
+            from_ap,
+        ) {
             // wpa_supplicant's `could_be_psk_mismatch()` treats an AP
             // disconnect during the initial PSK 4-way handshake as a
             // wrong passphrase. Surface it as `WrongPassword` instead of
@@ -920,7 +923,8 @@ impl WifiIface {
     /// FT-PSK 4-way handshake (i.e. the passphrase is verified by the
     /// handshake, not by an earlier SAE/PMKSA exchange).
     pub(crate) fn is_psk_4way_in_progress(&self) -> bool {
-        self.link.pmksa_in_use.is_none()
+        self.link.fourway.is_some()
+            && self.link.pmksa_in_use.is_none()
             && matches!(
                 self.link.bss_info.security,
                 SecurityType::Wpa2Psk
@@ -1935,6 +1939,25 @@ fn rekey_akm(security: SecurityType) -> Ieee80211AkmSuite {
     }
 }
 
+fn could_be_psk_mismatch(
+    state: WifiState,
+    security: SecurityType,
+    pmksa_in_use: bool,
+    fourway_started: bool,
+    from_ap: Option<bool>,
+) -> bool {
+    state == WifiState::Authenticating
+        && from_ap == Some(true)
+        && !pmksa_in_use
+        && fourway_started
+        && matches!(
+            security,
+            SecurityType::Wpa2Psk
+                | SecurityType::Wpa2PskSha256
+                | SecurityType::FtPsk
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2105,5 +2128,52 @@ mod tests {
             rekey_akm(SecurityType::FtSaeExtKey),
             Ieee80211AkmSuite::FtSaeGroupDependentHash
         );
+    }
+
+    #[test]
+    fn psk_mismatch_requires_fourway_and_ap_origin() {
+        let psk = SecurityType::Wpa2Psk;
+        assert!(could_be_psk_mismatch(
+            WifiState::Authenticating,
+            psk,
+            false,
+            true,
+            Some(true)
+        ));
+        assert!(!could_be_psk_mismatch(
+            WifiState::Authenticating,
+            psk,
+            false,
+            false,
+            Some(true)
+        ));
+        assert!(!could_be_psk_mismatch(
+            WifiState::Authenticating,
+            psk,
+            false,
+            true,
+            Some(false)
+        ));
+        assert!(!could_be_psk_mismatch(
+            WifiState::Authenticating,
+            psk,
+            true,
+            true,
+            Some(true)
+        ));
+        assert!(!could_be_psk_mismatch(
+            WifiState::Scanning,
+            psk,
+            false,
+            true,
+            Some(true)
+        ));
+        assert!(!could_be_psk_mismatch(
+            WifiState::Authenticating,
+            SecurityType::Sae,
+            false,
+            true,
+            Some(true)
+        ));
     }
 }
