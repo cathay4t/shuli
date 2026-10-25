@@ -8,6 +8,7 @@ use netlink_packet_xfrm::{
     XFRM_ALG_AUTH_NAME_LEN, XFRM_ALG_NAME_LEN, XfrmAttrs, XfrmMessage,
     constants::{
         AF_INET, AF_INET6, IPPROTO_ESP, XFRM_MODE_TRANSPORT, XFRM_MODE_TUNNEL,
+        XFRM_STATE_ESN,
     },
     nlas::{Alg, AlgAead, AlgAuth, EncapTmpl, ReplayEsn},
     state::{DelGetMessage, ModifyMessage},
@@ -54,7 +55,11 @@ pub(crate) fn build(
         ChildMode::Tunnel => XFRM_MODE_TUNNEL,
     };
     info.reqid = spec.reqid;
-    info.replay_window = spec.replay_window.min(u8::MAX as u32) as u8;
+    info.replay_window = if child.esn {
+        0
+    } else {
+        spec.replay_window.min(u8::MAX as u32) as u8
+    };
     info.lifetime_cfg.hard_add_expires_seconds = spec.lifetime.as_secs();
     info.lifetime_cfg.soft_add_expires_seconds =
         soft_lifetime(spec.lifetime).as_secs();
@@ -74,14 +79,16 @@ pub(crate) fn build(
         nlas.push(integrity_transform(integrity.0, integrity.1)?);
     }
     if child.esn {
-        let bmp_len = spec.replay_window.div_ceil(32).max(1);
+        info.flags |= XFRM_STATE_ESN;
+        let window = spec.replay_window.min(4096);
+        let bmp_len = window.div_ceil(32).max(1);
         nlas.push(XfrmAttrs::ReplayStateEsn(ReplayEsn {
             bmp_len,
             oseq: 0,
             seq: 0,
             oseq_hi: 0,
             seq_hi: 0,
-            replay_window: spec.replay_window,
+            replay_window: window,
             bmp: vec![0; bmp_len as usize],
         }));
     }
@@ -343,6 +350,19 @@ mod tests {
             inbound.user_sa_info.selector.daddr,
             Address::from_ip(&IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)))
         );
+    }
+
+    #[test]
+    fn esn_state_sets_flag_and_zero_legacy_replay_window() {
+        let mut child = child();
+        child.esn = true;
+        let outbound = build(&child, &spec(ChildMode::Tunnel), true).unwrap();
+        assert_eq!(outbound.user_sa_info.replay_window, 0);
+        assert_ne!(outbound.user_sa_info.flags & XFRM_STATE_ESN, 0);
+        assert!(outbound.nlas.iter().any(|nla| matches!(
+            nla,
+            XfrmAttrs::ReplayStateEsn(state) if state.replay_window == 32
+        )));
     }
 
     #[test]

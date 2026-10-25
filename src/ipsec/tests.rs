@@ -782,7 +782,7 @@ async fn xfrm_install_and_remove_owned_state() {
         remote_spi: 0x5566_7788,
         encryption: crate::config::EncryptionAlgorithm::AesGcm16_256,
         integrity: None,
-        esn: false,
+        esn: true,
         mode: crate::config::ChildMode::Tunnel,
         local_selectors: vec![crate::config::TrafficSelector::net(
             crate::config::IpNet::new(
