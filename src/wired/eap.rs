@@ -58,8 +58,11 @@ impl EapClient {
     /// peer with the given credentials.
     pub fn init(iface_name: &str, eap: &EapConfig) -> Result<Self, WifiError> {
         let (fd, if_index, mac) = open_eapol_socket(iface_name)?;
+        // SAFETY: the cloned `OwnedFd` stays open and keeps the same
+        // descriptor for the entire lifetime of the `AsyncFd`.
+        let cloned_fd = fd.try_clone().map_err(io_err)?;
         let async_fd =
-            AsyncFd::new(fd.try_clone().map_err(io_err)?).map_err(|e| {
+            unsafe { AsyncFd::register(cloned_fd) }.map_err(|e| {
                 WifiError::new(ErrorKind::Io, format!("EAPOL socket: {e}"))
             })?;
 

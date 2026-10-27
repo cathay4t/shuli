@@ -816,11 +816,13 @@ impl MkaSession {
     ) -> Result<Self, WifiError> {
         config.validate()?;
         let (fd, if_index, mac) = open_eapol_socket(iface_name)?;
-        let async_fd = AsyncFd::new(
-            fd.try_clone()
-                .map_err(|e| mka_err(format!("EAPOL socket: {e}")))?,
-        )
-        .map_err(|e| mka_err(format!("EAPOL socket: {e}")))?;
+        let cloned_fd = fd
+            .try_clone()
+            .map_err(|e| mka_err(format!("EAPOL socket: {e}")))?;
+        // SAFETY: the cloned `OwnedFd` stays open and keeps the same
+        // descriptor for the entire lifetime of the `AsyncFd`.
+        let async_fd = unsafe { AsyncFd::register(cloned_fd) }
+            .map_err(|e| mka_err(format!("EAPOL socket: {e}")))?;
         let kek = derive_kek(&config.cak, &config.ckn)?;
         let ick = derive_ick(&config.cak, &config.ckn)?;
         let mut mi = [0u8; MI_LEN];

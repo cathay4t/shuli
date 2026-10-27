@@ -1024,6 +1024,7 @@ fn security_name(security: SecurityType) -> &'static str {
 /// must never fall through to `Open`, which would make the client
 /// associate without encryption. `unsupported_reason` carries a
 /// user-facing explanation for the caller to surface.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn detect_security(ies: &[u8]) -> BssScanSecurity {
     detect_security_with_privacy(ies, false)
 }

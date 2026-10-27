@@ -225,6 +225,7 @@ impl SaeAuth {
 
     /// Process peer's commit (scalar + element). Derives KCK/PMK/PMKID and
     /// returns our confirm value (32-byte CN output).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn process_commit(
         &mut self,
         peer_scalar_bytes: &[u8],
