@@ -24,7 +24,7 @@ shuli-ipsec = { path = "src/ipsec" }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
-rmsd_yaml = "0.1"
+rmsd_yaml = "0.2.0"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 futures = "0.3"
