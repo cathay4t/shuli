@@ -1,11 +1,5 @@
 ## Design decisions (need a policy/API decision before fixing)
 
-- WiFi PMKSA cache: entries currently live for the full 12-hour
-  lifetime and are reused indefinitely while reconnecting; the 70%
-  reauthentication threshold is not enforced and entries are keyed only
-  by (SSID, BSSID), not AKM/credentials. Decide whether to mirror
-  wpa_supplicant (preserve original expiry, force reauth) and how to
-  invalidate entries on password/EAP changes.
 - WiFi multi-interface `WifiClient::run()`: every call builds fresh
   per-interface futures and drops the others when one returns; the
   handlers are not cancellation-safe across awaits. Choose persistent

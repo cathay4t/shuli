@@ -18,7 +18,7 @@ use super::{
     WifiEventReceiver, WifiEventSender, WifiIface, WifiState, WiphyCaps,
     WowlanState, best_retry_candidate, connection_is_live, drain_request,
     format_ssids, is_eopnotsupp, network_update_action, next_sched_scan_ssids,
-    resume_action, wiphy_mlme_caps, wiphy_sched_scan_caps,
+    pmksa_stale_ssids, resume_action, wiphy_mlme_caps, wiphy_sched_scan_caps,
     wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
@@ -1484,6 +1484,13 @@ impl WifiIface {
         networks: Vec<NetworkConfig>,
     ) -> Result<(), WifiError> {
         let current_target = self.link.network.clone();
+        // A PMKSA is bound to the credentials that derived it. Drop the
+        // entries of removed networks and of networks whose
+        // password/EAP settings changed before the new list is adopted;
+        // unchanged networks (and mere reordering) keep their cache.
+        for ssid in pmksa_stale_ssids(&self.core.config.networks, &networks) {
+            self.invalidate_pmksa_for_ssid(&ssid).await;
+        }
         match network_update_action(
             &self.core.config.networks,
             &networks,

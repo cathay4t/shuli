@@ -997,10 +997,11 @@ impl WifiIface {
         // is meaningless across an SSID switch (different PMK), so it is
         // skipped there.
         if !switching_network
-            && self
-                .pmksa_cache
-                .lookup(&self.link.network.ssid, target.bssid)
-                .is_none()
+            && !self.pmksa_cache.contains(
+                &self.link.network.ssid,
+                target.bssid,
+                target.security,
+            )
         {
             self.synthesize_okc_entry(&target);
         }
@@ -1026,8 +1027,8 @@ impl WifiIface {
         let Some(pmk) = self.auth.psk_pmk else {
             return;
         };
-        let (pmkid, mic_alg) = match self.link.bss_info.security {
-            SecurityType::Wpa2Psk => (
+        let (pmkid, mic_alg) = match target.security {
+            SecurityType::Wpa2Psk | SecurityType::FtPsk => (
                 crate::crypto::kdf::pmkid_sha1(
                     &pmk,
                     &target.bssid,
@@ -1049,17 +1050,14 @@ impl WifiIface {
             "OKC: offering cloned PMKID {pmkid:02x?} to {:02x?}",
             target.bssid
         );
-        self.pmksa_cache.insert(crate::pmksa::PmksaEntry {
-            ssid: self.link.network.ssid.clone(),
-            bssid: target.bssid,
+        self.pmksa_cache.insert(crate::pmksa::PmksaEntry::new(
+            self.link.network.ssid.clone(),
+            target.bssid,
+            target.security,
             pmkid,
             pmk,
             mic_alg,
-            expires: std::time::Instant::now()
-                + std::time::Duration::from_secs(
-                    crate::pmksa::PMK_LIFETIME_SECS,
-                ),
-        });
+        ));
     }
 
     /// FT roam step 1: FT Authentication request to the target AP.

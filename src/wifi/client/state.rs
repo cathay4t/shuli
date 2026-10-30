@@ -147,6 +147,35 @@ pub(crate) fn network_update_action(
     NetworkUpdate::Restart
 }
 
+/// SSIDs whose cached PMKSAs must be dropped after a network-list
+/// update because the credentials that derived the PMK changed, or the
+/// network was removed entirely.
+///
+/// Only PMK-relevant settings are compared: reordering the list, or
+/// changing scan/roam/WoWLAN settings, keeps the cache. A changed
+/// password, EAP configuration or SAE password identifier, or a
+/// removed network, could otherwise resurrect a PMKSA derived from the
+/// old credentials (wpa_supplicant flushes its PMKSA cache on network
+/// removal and on almost every network setting change too).
+pub(crate) fn pmksa_stale_ssids(
+    current: &[NetworkConfig],
+    new: &[NetworkConfig],
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for network in current {
+        let still_valid = new.iter().any(|candidate| {
+            candidate.ssid == network.ssid
+                && candidate.password == network.password
+                && candidate.eap == network.eap
+                && candidate.sae_password_id == network.sae_password_id
+        });
+        if !still_valid && !stale.iter().any(|ssid| ssid == &network.ssid) {
+            stale.push(network.ssid.clone());
+        }
+    }
+    stale
+}
+
 /// Whether the client still holds a live association.
 ///
 /// Besides the connected states this includes a roam scan that is in
@@ -633,9 +662,9 @@ mod tests {
     use super::{
         BssidIgnoreList, NetworkUpdate, ResumeAction, RoamEngine, WifiState,
         bssid_ignore_timeout_secs, connection_is_live, network_update_action,
-        resume_action,
+        pmksa_stale_ssids, resume_action,
     };
-    use crate::NetworkConfig;
+    use crate::{EapConfig, NetworkConfig};
 
     fn network(ssid: &str) -> NetworkConfig {
         NetworkConfig::new(ssid)
@@ -837,6 +866,66 @@ mod tests {
         assert_eq!(
             resume_action(WifiState::SchedScanWait, None),
             ResumeAction::RetryNow
+        );
+    }
+
+    #[test]
+    fn pmksa_cache_survives_unrelated_network_updates() {
+        let mut a = network("A");
+        a.set_password("secret");
+        let b = network("B");
+
+        // Reordering, adding a network, and changing scan/roam-only
+        // settings keep the PMKSA derived from unchanged credentials.
+        let mut tuned = a.clone();
+        tuned.roaming = false;
+        tuned.roaming_threshold = -75;
+        tuned.hidden = true;
+        assert!(pmksa_stale_ssids(&[a.clone()], &[a.clone()]).is_empty());
+        assert!(
+            pmksa_stale_ssids(&[a.clone()], &[b.clone(), a.clone()]).is_empty()
+        );
+        assert!(pmksa_stale_ssids(&[a.clone()], &[tuned]).is_empty());
+    }
+
+    #[test]
+    fn pmksa_cache_drops_entries_on_credential_change_or_removal() {
+        let mut old = network("A");
+        old.set_password("old-secret");
+        let mut new = old.clone();
+        new.set_password("new-secret");
+        assert_eq!(
+            pmksa_stale_ssids(&[old.clone()], &[new]),
+            vec!["A".to_string()]
+        );
+
+        let mut old_eap_config = EapConfig::default();
+        old_eap_config.identity = "old".to_string();
+        let mut eap_old = network("E");
+        eap_old.set_eap(old_eap_config);
+        let mut new_eap_config = EapConfig::default();
+        new_eap_config.identity = "new".to_string();
+        let mut eap_new = eap_old.clone();
+        eap_new.set_eap(new_eap_config);
+        assert_eq!(
+            pmksa_stale_ssids(&[eap_old], &[eap_new]),
+            vec!["E".to_string()]
+        );
+
+        let mut sae = network("S");
+        sae.set_password("secret");
+        sae.set_sae_password_id(Some("old-id"));
+        let mut sae_new = sae.clone();
+        sae_new.set_sae_password_id(Some("new-id"));
+        assert_eq!(
+            pmksa_stale_ssids(&[sae], &[sae_new]),
+            vec!["S".to_string()]
+        );
+
+        assert_eq!(
+            pmksa_stale_ssids(&[old], &[]),
+            vec!["A".to_string()],
+            "removing a network drops its cache"
         );
     }
 

@@ -8,20 +8,30 @@ use crate::{
         kdf::{pmkid_sha1, pmkid_sha256},
     },
     pmksa::{PMK_LIFETIME_SECS, PmksaCache, PmksaEntry},
+    scan::SecurityType,
 };
 
 const SSID: &str = "Test-WIFI";
 const BSSID: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
 
-fn entry(ssid: &str, bssid: [u8; 6], pmkid: [u8; 16]) -> PmksaEntry {
-    PmksaEntry {
-        ssid: ssid.to_string(),
+fn entry_with_security(
+    ssid: &str,
+    bssid: [u8; 6],
+    pmkid: [u8; 16],
+    security: SecurityType,
+) -> PmksaEntry {
+    PmksaEntry::new(
+        ssid.to_string(),
         bssid,
+        security,
         pmkid,
-        pmk: [0x42; 32],
-        mic_alg: MicAlg::AesCmac,
-        expires: Instant::now() + Duration::from_secs(PMK_LIFETIME_SECS),
-    }
+        [0x42; 32],
+        MicAlg::AesCmac,
+    )
+}
+
+fn entry(ssid: &str, bssid: [u8; 6], pmkid: [u8; 16]) -> PmksaEntry {
+    entry_with_security(ssid, bssid, pmkid, SecurityType::Sae)
 }
 
 #[test]
@@ -52,14 +62,42 @@ fn test_pmksa_insert_lookup() {
     let mut cache = PmksaCache::default();
     cache.insert(entry(SSID, BSSID, [0x11; 16]));
 
-    let hit = cache.lookup(SSID, BSSID).expect("cache hit");
+    let hit = cache
+        .lookup(SSID, BSSID, SecurityType::Sae)
+        .expect("cache hit");
     assert_eq!(hit.pmkid, [0x11; 16]);
     assert_eq!(hit.pmk, [0x42; 32]);
     assert_eq!(hit.mic_alg, MicAlg::AesCmac);
 
-    // Different BSSID / SSID must not match.
-    assert!(cache.lookup(SSID, [0xff; 6]).is_none());
-    assert!(cache.lookup("Other", BSSID).is_none());
+    // Different BSSID / SSID / AKM must not match.
+    assert!(cache.lookup(SSID, [0xff; 6], SecurityType::Sae).is_none());
+    assert!(cache.lookup("Other", BSSID, SecurityType::Sae).is_none());
+    assert!(
+        cache.lookup(SSID, BSSID, SecurityType::Wpa2Psk).is_none(),
+        "a SAE PMK must never satisfy a PSK lookup"
+    );
+}
+
+#[test]
+fn test_pmksa_akm_families() {
+    let mut cache = PmksaCache::default();
+    cache.insert(entry_with_security(
+        SSID,
+        BSSID,
+        [0x11; 16],
+        SecurityType::Wpa2Psk,
+    ));
+    // FT and non-FT variants share the PMK/PMKID derivation.
+    assert!(
+        cache.lookup(SSID, BSSID, SecurityType::FtPsk).is_some(),
+        "FT-PSK must reuse the WPA2-PSK entry"
+    );
+    assert!(
+        cache
+            .lookup(SSID, BSSID, SecurityType::Wpa2PskSha256)
+            .is_none(),
+        "PSK-SHA256 uses a different PMKID derivation"
+    );
 }
 
 #[test]
@@ -67,7 +105,10 @@ fn test_pmksa_refresh_replaces() {
     let mut cache = PmksaCache::default();
     cache.insert(entry(SSID, BSSID, [0x11; 16]));
     cache.insert(entry(SSID, BSSID, [0x22; 16]));
-    assert_eq!(cache.lookup(SSID, BSSID).unwrap().pmkid, [0x22; 16]);
+    assert_eq!(
+        cache.lookup(SSID, BSSID, SecurityType::Sae).unwrap().pmkid,
+        [0x22; 16]
+    );
 }
 
 #[test]
@@ -78,8 +119,47 @@ fn test_pmksa_expiry() {
     expired.expires = Instant::now() - Duration::from_secs(1);
     cache.insert(expired);
     assert!(
-        cache.lookup(SSID, BSSID).is_none(),
+        cache.lookup(SSID, BSSID, SecurityType::Sae).is_none(),
         "expired entry must miss"
+    );
+}
+
+#[test]
+fn test_pmksa_reauth_threshold() {
+    let mut cache = PmksaCache::default();
+    let mut due = entry(SSID, BSSID, [0x44; 16]);
+    due.reauth_at = Instant::now() - Duration::from_secs(1);
+    cache.insert(due);
+
+    assert!(
+        cache.lookup(SSID, BSSID, SecurityType::Sae).is_none(),
+        "an entry past the reauth threshold must not be offered"
+    );
+    assert!(
+        cache
+            .lookup_past_reauth(SSID, BSSID, SecurityType::Sae)
+            .is_some(),
+        "the entry is kept until it expires"
+    );
+    assert!(
+        cache.contains(SSID, BSSID, SecurityType::Sae),
+        "OKC must not resurrect a threshold-expired entry"
+    );
+}
+
+#[test]
+fn test_pmksa_remaining_values_for_driver_offload() {
+    let entry = entry(SSID, BSSID, [0x55; 16]);
+    let lifetime = entry.remaining_lifetime_secs();
+    assert!(
+        lifetime <= PMK_LIFETIME_SECS as u32
+            && lifetime + 5 >= PMK_LIFETIME_SECS as u32,
+        "unexpected remaining lifetime {lifetime}"
+    );
+    let reauth = entry.remaining_reauth_percent();
+    assert!(
+        (69..=70).contains(&reauth),
+        "unexpected remaining reauth threshold {reauth}%"
     );
 }
 
@@ -87,10 +167,29 @@ fn test_pmksa_expiry() {
 fn test_pmksa_invalidate() {
     let mut cache = PmksaCache::default();
     cache.insert(entry(SSID, BSSID, [0x11; 16]));
-    let removed = cache.invalidate(SSID, BSSID).expect("entry removed");
+    let removed = cache
+        .invalidate(SSID, BSSID, SecurityType::Sae)
+        .expect("entry removed");
     assert_eq!(removed.pmkid, [0x11; 16]);
-    assert!(cache.lookup(SSID, BSSID).is_none());
-    assert!(cache.invalidate(SSID, BSSID).is_none());
+    assert!(cache.lookup(SSID, BSSID, SecurityType::Sae).is_none());
+    assert!(cache.invalidate(SSID, BSSID, SecurityType::Sae).is_none());
+}
+
+#[test]
+fn test_pmksa_remove_ssid() {
+    let mut cache = PmksaCache::default();
+    cache.insert(entry(SSID, BSSID, [0x11; 16]));
+    cache.insert(entry(
+        SSID,
+        [0x02, 0x00, 0x00, 0x00, 0x01, 0x01],
+        [0x12; 16],
+    ));
+    cache.insert(entry("Other", BSSID, [0x13; 16]));
+
+    let removed = cache.remove_ssid(SSID);
+    assert_eq!(removed.len(), 2);
+    assert!(!cache.contains(SSID, BSSID, SecurityType::Sae));
+    assert!(cache.contains("Other", BSSID, SecurityType::Sae));
 }
 
 #[test]
@@ -104,13 +203,21 @@ fn test_pmksa_capacity() {
     // earliest got evicted.
     assert!(
         cache
-            .lookup(SSID, [0x02, 0x00, 0x00, 0x00, 0x01, 39])
+            .lookup(
+                SSID,
+                [0x02, 0x00, 0x00, 0x00, 0x01, 39],
+                SecurityType::Sae,
+            )
             .is_some()
     );
     let survivors = (0u8..40)
         .filter(|i| {
             cache
-                .lookup(SSID, [0x02, 0x00, 0x00, 0x00, 0x01, *i])
+                .lookup(
+                    SSID,
+                    [0x02, 0x00, 0x00, 0x00, 0x01, *i],
+                    SecurityType::Sae,
+                )
                 .is_some()
         })
         .count();

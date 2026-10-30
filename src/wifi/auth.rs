@@ -337,10 +337,11 @@ impl WifiIface {
                 | SecurityType::FtSae
                 | SecurityType::FtSaeExtKey
                 | SecurityType::FtPsk
-        ) && let Some(entry) = self
-            .pmksa_cache
-            .lookup(&self.link.network.ssid, self.link.bss_info.bssid)
-        {
+        ) && let Some(entry) = self.pmksa_cache.lookup(
+            &self.link.network.ssid,
+            self.link.bss_info.bssid,
+            self.link.bss_info.security,
+        ) {
             log::info!(
                 "PMKSA cache hit for BSSID {:02x?} (pmkid {:02x?}); skipping \
                  full authentication",
@@ -348,6 +349,21 @@ impl WifiIface {
                 entry.pmkid
             );
             self.link.pmksa_in_use = Some(entry);
+        } else if let Some(entry) = self.pmksa_cache.lookup_past_reauth(
+            &self.link.network.ssid,
+            self.link.bss_info.bssid,
+            self.link.bss_info.security,
+        ) {
+            // wpa_supplicant withdraws the PMKID from the driver once
+            // the reauthentication threshold passed; the userspace
+            // entry is kept until it expires so its original lifetime
+            // is never extended.
+            log::info!(
+                "PMKSA for BSSID {:02x?} passed its 70% reauthentication \
+                 threshold; running full authentication",
+                self.link.bss_info.bssid
+            );
+            self.driver_del_pmksa(&entry).await;
         }
 
         // PSK/FT-PSK derive the PMK from the passphrase before the

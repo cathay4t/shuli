@@ -8,10 +8,7 @@ use wl_nl80211::{
     wpa2_psk_ie_with_pmkid_cipher, wpa2_psk_sha256_ie_with_pmkid_cipher,
 };
 
-use super::{
-    ControlPortMode, MicAlg, PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT,
-    PmksaEntry, WifiIface, entry_with_fresh_lifetime, kdf,
-};
+use super::{ControlPortMode, MicAlg, PmksaEntry, WifiIface, kdf};
 use crate::{
     SecurityType, WifiError, WifiState, crypto::handshake4::FourWayState,
     nl80211::extract_rsn_from_ies,
@@ -209,7 +206,11 @@ impl WifiIface {
     /// with full authentication.
     pub(crate) async fn pmksa_fallback(&mut self) {
         if let Some(entry) = self.link.pmksa_in_use.take() {
-            self.pmksa_cache.invalidate(&entry.ssid, entry.bssid);
+            self.pmksa_cache.invalidate(
+                &entry.ssid,
+                entry.bssid,
+                entry.security,
+            );
             self.driver_del_pmksa(&entry).await;
         }
         if let Err(e) = self.send_out_auth_request().await {
@@ -222,10 +223,12 @@ impl WifiIface {
 
     /// the 4-way handshake proved the PMK - remember the PMKSA for
     /// the next reconnect/roam and hand it to the driver's PMKSA cache.
-    /// A reused entry simply gets a fresh lifetime.
+    /// A reused entry keeps its original lifetime (wpa_supplicant
+    /// behaviour): only a full authentication refreshes it.
     pub(crate) async fn cache_pmksa(&mut self) {
+        let reused = self.link.pmksa_in_use.is_some();
         let entry = match self.link.pmksa_in_use.take() {
-            Some(entry) => entry_with_fresh_lifetime(entry),
+            Some(entry) => entry,
             None => {
                 let (pmk, pmkid, mic_alg) = match self.link.bss_info.security {
                     // SAE: the PMKID is derived by the SAE exchange
@@ -288,23 +291,33 @@ impl WifiIface {
                     }
                     _ => return,
                 };
-                PmksaEntry {
-                    ssid: self.link.network.ssid.clone(),
-                    bssid: self.link.bss_info.bssid,
+                PmksaEntry::new(
+                    self.link.network.ssid.clone(),
+                    self.link.bss_info.bssid,
+                    self.link.bss_info.security,
                     pmkid,
                     pmk,
                     mic_alg,
-                    expires: std::time::Instant::now()
-                        + std::time::Duration::from_secs(PMK_LIFETIME_SECS),
-                }
+                )
             }
         };
+        // Offload with the *remaining* lifetime so a reused entry (e.g.
+        // one synthesized for OKC and never given to the driver) cannot
+        // outlive its userspace expiry in the driver cache.
         self.driver_set_pmksa(&entry).await;
-        log::info!(
-            "PMKSA cached: ssid={}, bssid={:02x?}",
-            entry.ssid,
-            entry.bssid
-        );
+        if reused {
+            log::info!(
+                "PMKSA reused: ssid={}, bssid={:02x?} (lifetime kept)",
+                entry.ssid,
+                entry.bssid
+            );
+        } else {
+            log::info!(
+                "PMKSA cached: ssid={}, bssid={:02x?}",
+                entry.ssid,
+                entry.bssid
+            );
+        }
         self.pmksa_cache.insert(entry);
     }
 
@@ -317,12 +330,37 @@ impl WifiIface {
             .pmkid(entry.pmkid.to_vec())
             .mac(entry.bssid)
             .pmk(entry.pmk.to_vec())
-            .pmk_lifetime(PMK_LIFETIME_SECS as u32)
-            .pmk_reauth_threshold(PMK_REAUTH_THRESHOLD_PERCENT)
+            .pmk_lifetime(entry.remaining_lifetime_secs())
+            .pmk_reauth_threshold(entry.remaining_reauth_percent())
             .build();
         match self.core.nl.set_pmksa(attrs).await {
             Ok(()) => log::info!("PMKSA offloaded to driver"),
             Err(e) => log::debug!("driver PMKSA cache not available: {e}"),
+        }
+    }
+
+    /// Drop every cached PMKSA for `ssid` from both the userspace and
+    /// the driver/firmware cache, e.g. because the network's password or
+    /// EAP credentials changed (or the network was removed). Keeping an
+    /// entry derived from the old credentials could otherwise be offered
+    /// to the AP on the next connection.
+    pub(crate) async fn invalidate_pmksa_for_ssid(&mut self, ssid: &str) {
+        let removed = self.pmksa_cache.remove_ssid(ssid);
+        if self
+            .link
+            .pmksa_in_use
+            .as_ref()
+            .is_some_and(|entry| entry.ssid == ssid)
+        {
+            self.link.pmksa_in_use = None;
+        }
+        for entry in removed {
+            log::info!(
+                "dropping cached PMKSA for ssid={}, bssid={:02x?}",
+                entry.ssid,
+                entry.bssid
+            );
+            self.driver_del_pmksa(&entry).await;
         }
     }
 

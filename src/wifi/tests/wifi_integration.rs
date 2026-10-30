@@ -1983,6 +1983,14 @@ async fn wifi_client_sae_pmksa_reconnect() {
     );
     let cached_bssid =
         client.ifaces.values().next().unwrap().link.bss_info.bssid;
+    let security = client
+        .ifaces
+        .values()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .security;
     assert!(
         client
             .ifaces
@@ -1990,7 +1998,7 @@ async fn wifi_client_sae_pmksa_reconnect() {
             .next()
             .unwrap()
             .pmksa_cache
-            .lookup("Test-WIFI", cached_bssid)
+            .lookup("Test-WIFI", cached_bssid, security)
             .is_some(),
         "PMKSA must be cached after the first connection"
     );
@@ -2085,6 +2093,14 @@ async fn wifi_client_sae_pmksa_rejected_falls_back_to_sae() {
             | WifiState::ConnectedWithOffloadRekey
     ));
     let bssid = client.ifaces.values().next().unwrap().link.bss_info.bssid;
+    let security = client
+        .ifaces
+        .values()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .security;
     assert!(
         client
             .ifaces
@@ -2092,7 +2108,7 @@ async fn wifi_client_sae_pmksa_rejected_falls_back_to_sae() {
             .next()
             .unwrap()
             .pmksa_cache
-            .lookup("Test-WIFI", bssid)
+            .lookup("Test-WIFI", bssid, security)
             .is_some(),
         "PMKSA must be cached after the first connection"
     );
@@ -2164,7 +2180,7 @@ async fn wifi_client_sae_pmksa_rejected_falls_back_to_sae() {
             .next()
             .unwrap()
             .pmksa_cache
-            .lookup("Test-WIFI", bssid)
+            .lookup("Test-WIFI", bssid, security)
             .is_some(),
         "the full SAE fallback must cache a fresh PMKSA"
     );
@@ -2213,6 +2229,14 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
     );
     let cached_bssid =
         client.ifaces.values().next().unwrap().link.bss_info.bssid;
+    let security = client
+        .ifaces
+        .values()
+        .next()
+        .unwrap()
+        .link
+        .bss_info
+        .security;
     assert!(
         client
             .ifaces
@@ -2220,7 +2244,7 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
             .next()
             .unwrap()
             .pmksa_cache
-            .lookup("Test-WIFI-PSK", cached_bssid)
+            .lookup("Test-WIFI-PSK", cached_bssid, security)
             .is_some(),
         "PMKSA must be cached after the first connection"
     );

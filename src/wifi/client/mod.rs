@@ -30,10 +30,7 @@ use crate::{
         owe::{self, OweAuth},
     },
     eap::{EapAction, EapPacket, EapPeer},
-    pmksa::{
-        PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaCache,
-        PmksaEntry, entry_with_fresh_lifetime,
-    },
+    pmksa::{PmksaCache, PmksaEntry},
     scan::{SecurityType, best_retry_candidate, format_ssids},
 };
 
@@ -137,7 +134,7 @@ pub(crate) use state::{
     AuthSession, BssidIgnoreList, ControlPortMode, FastReconnect, IfaceCore,
     Link, MlmeMode, NetworkUpdate, ResumeAction, RoamEngine, ScanEngine,
     WifiIface, WiphyCaps, WowlanState, connection_is_live,
-    network_update_action, resume_action,
+    network_update_action, pmksa_stale_ssids, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]
