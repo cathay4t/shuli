@@ -38,10 +38,21 @@ use crate::{
 };
 
 type Nl80211EventMsg = NetlinkMessage<genetlink::message::RawGenlMessage>;
-type Nl80211EventSender =
-    futures::channel::mpsc::UnboundedSender<Nl80211EventMsg>;
-type Nl80211EventReceiver =
-    futures::channel::mpsc::UnboundedReceiver<Nl80211EventMsg>;
+pub(crate) type WifiEventSender =
+    futures::channel::mpsc::UnboundedSender<WifiEvent>;
+pub(crate) type WifiEventReceiver =
+    futures::channel::mpsc::UnboundedReceiver<WifiEvent>;
+
+/// One event delivered to a [`WifiIface`].
+///
+/// Kernel multicast events come from the shared dispatcher; raw EAPOL
+/// frames come from the interface's own PAE reader task when the wiphy
+/// cannot use `NL80211_CMD_CONTROL_PORT_FRAME`.
+#[derive(Debug)]
+pub(crate) enum WifiEvent {
+    Kernel(Nl80211EventMsg),
+    Eapol(control_port::RawEapolFrame),
+}
 
 /// Initial scan-retry backoff (seconds) used while hunting for the
 /// configured SSID. Doubles after each failed scan, capped at
@@ -112,17 +123,21 @@ const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 2;
 const SAE_SYNC_MAX: u8 = 3;
 
 mod associate;
+mod connect;
+mod control_port;
 mod events;
 mod state;
 mod wifi_client;
 mod wifi_iface;
 mod wiphy;
 
+pub(crate) use control_port::ControlPort;
 pub use state::WifiState;
 pub(crate) use state::{
-    AuthSession, BssidIgnoreList, FastReconnect, IfaceCore, Link,
-    NetworkUpdate, ResumeAction, RoamEngine, ScanEngine, WifiIface, WiphyCaps,
-    WowlanState, connection_is_live, network_update_action, resume_action,
+    AuthSession, BssidIgnoreList, ControlPortMode, FastReconnect, IfaceCore,
+    Link, MlmeMode, NetworkUpdate, ResumeAction, RoamEngine, ScanEngine,
+    WifiIface, WiphyCaps, WowlanState, connection_is_live,
+    network_update_action, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]
@@ -132,8 +147,8 @@ pub(crate) use wifi_iface::{
     wowlan_wakeup_requires_reconnect,
 };
 pub(crate) use wiphy::{
-    is_eopnotsupp, next_sched_scan_ssids, wiphy_sched_scan_caps,
-    wiphy_wowlan_support,
+    is_eopnotsupp, next_sched_scan_ssids, wiphy_mlme_caps,
+    wiphy_sched_scan_caps, wiphy_wowlan_support,
 };
 
 pub(crate) use crate::nl80211::drain_request;

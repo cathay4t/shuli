@@ -14,14 +14,16 @@ use wl_nl80211::{
 
 use super::{
     AuthAction, AuthMethod, EapAction, EapPacket, ErrorKind, FastReconnect,
-    Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, Nl80211Authenticate,
-    Nl80211Event, Nl80211EventMsg, Nl80211Key, Nl80211KeyDefaultType,
-    Nl80211RekeyOffload, OweAuth, RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX,
-    SecurityType, WifiError, WifiIface, WifiState, fatal_disconnect_error,
-    fmt_transition_disable, is_fatal_disconnect_reason, owe,
-    wowlan_wakeup_requires_reconnect,
+    Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, MlmeMode,
+    Nl80211Authenticate, Nl80211Event, Nl80211EventMsg, Nl80211Key,
+    Nl80211KeyDefaultType, Nl80211RekeyOffload, OweAuth,
+    RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError, WifiEvent,
+    WifiIface, WifiState, fatal_disconnect_error, fmt_transition_disable,
+    is_fatal_disconnect_reason, owe, wowlan_wakeup_requires_reconnect,
 };
-use crate::{ETH_ALEN, crypto::handshake4::FourWayState};
+use crate::{
+    ETH_ALEN, crypto::handshake4::FourWayState, nl80211::extract_rsn_from_ies,
+};
 
 /// `NL80211_ATTR_DISCONNECTED_BY_AP`: present on a `NL80211_CMD_DISCONNECT`
 /// event when the AP initiated the disconnect. wl-nl80211 does not model
@@ -201,6 +203,52 @@ impl WifiIface {
         }
     }
 
+    /// Dispatch one item from the interface event queue.
+    pub(crate) async fn handle_wifi_event(&mut self, event: WifiEvent) {
+        match event {
+            WifiEvent::Kernel(raw_msg) => {
+                let info = self.disconnect_info(&raw_msg);
+                if let Some(event) = Nl80211Event::parse(raw_msg) {
+                    self.handle_client_event(event, info).await;
+                }
+            }
+            WifiEvent::Eapol(frame) => self.handle_raw_eapol(frame).await,
+        }
+    }
+
+    /// Feed a raw PAE frame into the 4-way/EAP state machine.
+    ///
+    /// The socket sees every EAPOL frame on the interface, including
+    /// our own transmissions; only frames from the AP we are currently
+    /// working with belong to this attempt.
+    pub(crate) async fn handle_raw_eapol(
+        &mut self,
+        frame: super::control_port::RawEapolFrame,
+    ) {
+        if frame.src != self.link.bss_info.bssid {
+            log::trace!(
+                "ignoring raw EAPOL from {:02x?} (expected BSSID {:02x?})",
+                frame.src,
+                self.link.bss_info.bssid
+            );
+            return;
+        }
+        if !matches!(
+            self.state,
+            WifiState::Authenticating
+                | WifiState::ConnectedWithoutOffloadRekey
+                | WifiState::ConnectedWithOffloadRekey
+        ) {
+            log::debug!(
+                "ignoring raw EAPOL in state {:?} ({} bytes)",
+                self.state,
+                frame.payload.len()
+            );
+            return;
+        }
+        self.handle_control_port_frame(&frame.payload).await;
+    }
+
     /// The driver completed a GTK rekey (typically while the host was
     /// suspended) and reports the replay counter it used. Keep the
     /// userspace 4-way state in sync so the next rekey is not rejected as
@@ -258,6 +306,10 @@ impl WifiIface {
             }
 
             Nl80211Event::Authenticated(event) => {
+                if self.caps.mlme == MlmeMode::FullMac {
+                    log::debug!("AUTHENTICATE event ignored in FullMAC mode");
+                    return;
+                }
                 let status = event.status;
                 let frame = event.frame;
                 if self.roam.ft_roam.is_some() {
@@ -492,6 +544,10 @@ impl WifiIface {
             }
 
             Nl80211Event::Associated(event) => {
+                if self.caps.mlme == MlmeMode::FullMac {
+                    log::debug!("ASSOCIATE event ignored in FullMAC mode");
+                    return;
+                }
                 let status = event.status;
                 let ies = event.ies;
                 if self.roam.ft_roam.is_some() {
@@ -519,59 +575,7 @@ impl WifiIface {
                         self.state = WifiState::Failed;
                     }
                 } else if status == Ieee80211StatusCode::Success {
-                    if self.link.bss_info.security == SecurityType::Open {
-                        log::info!(
-                            "ASSOCIATED - open network, connection established"
-                        );
-                        self.fast_reconnect = None;
-                        self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
-                        self.state = WifiState::ConnectedWithoutOffloadRekey;
-                        self.arm_wowlan_if_enabled().await;
-                    } else if self.link.bss_info.security == SecurityType::Owe {
-                        if self.process_owe_assoc_response(ies.as_deref()) {
-                            log::info!(
-                                "ASSOCIATED - OWE PMK derived, waiting for \
-                                 4-way handshake"
-                            );
-                        } else {
-                            self.state = WifiState::Failed;
-                        }
-                    } else if self.link.bss_info.security.is_ft() {
-                        // Initial association with an FT AKM: record the
-                        // mobility domain and R0/R1 key holders from the
-                        // response IEs and derive the FT key hierarchy;
-                        // the 4-way handshake that follows runs with the
-                        // PMK-R1-derived PTK.
-                        if let Err(e) = self
-                            .setup_ft_context(ies.as_deref().unwrap_or(&[]))
-                            .await
-                        {
-                            log::warn!("FT setup failed: {e}");
-                            self.state = WifiState::Failed;
-                        } else {
-                            log::info!(
-                                "ASSOCIATED (FT) - waiting for 4-way handshake"
-                            );
-                            // A Message 1 may have raced ahead of this
-                            // association event; feed it now.
-                            if let Some(frame) =
-                                self.link.pending_ft_msg1.take()
-                            {
-                                self.handle_control_port_frame(&frame).await;
-                            }
-                        }
-                    } else {
-                        if self.link.pmksa_in_use.is_some() {
-                            log::info!(
-                                "ASSOCIATED with cached PMKID - the AP \
-                                 accepted the PMKSA; awaiting 4-way handshake"
-                            );
-                        } else {
-                            log::info!(
-                                "ASSOCIATED - waiting for 4-way handshake"
-                            );
-                        }
-                    }
+                    self.handle_association_success(ies.as_deref()).await;
                 } else if self.link.pmksa_in_use.is_some() {
                     // The AP rejected the association with the cached
                     // PMKID (no matching PMKSA on the AP side): fall back
@@ -600,7 +604,44 @@ impl WifiIface {
                 // marker here so it can never leak into a later attempt.
                 let stale =
                     std::mem::take(&mut self.link.stale_connect_failure);
-                if status == Ieee80211StatusCode::Success {
+                if self.caps.mlme == MlmeMode::FullMac {
+                    if status == Ieee80211StatusCode::Success {
+                        // The driver may rewrite the association request
+                        // IEs; use the actual RSNE in the 4-way Message 2.
+                        if let Some(req_ie) = event.req_ie.as_deref()
+                            && let Some(rsne) = extract_rsn_from_ies(req_ie)
+                        {
+                            if !self.link.assoc_wpa_ie.is_empty()
+                                && self.link.assoc_wpa_ie != rsne
+                            {
+                                log::debug!(
+                                    "driver rewrote the RSNE in the CONNECT \
+                                     request; using the reported element for \
+                                     the 4-way handshake"
+                                );
+                            }
+                            self.link.assoc_wpa_ie = rsne;
+                        }
+                        self.handle_association_success(
+                            event.resp_ie.as_deref(),
+                        )
+                        .await;
+                    } else if stale {
+                        log::debug!(
+                            "stale CONNECT failure (status={status}) ignored"
+                        );
+                    } else if self.link.pmksa_in_use.is_some() {
+                        log::warn!(
+                            "CONNECT with cached PMKID failed: \
+                             status={status}; retrying with full \
+                             authentication"
+                        );
+                        self.pmksa_fallback().await;
+                    } else {
+                        log::warn!("CONNECT failed: status={status}");
+                        self.state = WifiState::Failed;
+                    }
+                } else if status == Ieee80211StatusCode::Success {
                     log::debug!(
                         "CONNECT event (associated); awaiting 4-way handshake"
                     );
@@ -632,6 +673,16 @@ impl WifiIface {
             },
 
             Nl80211Event::PortAuthorized => {
+                if self.caps.mlme == MlmeMode::FullMac {
+                    // Firmware 4-way offload is not enabled in this
+                    // implementation; a userspace handshake marks the
+                    // connection ready itself via SET_STATION.
+                    log::debug!(
+                        "PORT_AUTHORIZED ignored in FullMac mode (offload not \
+                         requested)"
+                    );
+                    return;
+                }
                 if port_authorized_applies(self.state) {
                     log::info!("PORT_AUTHORIZED - connection ready");
                     self.fast_reconnect = None;
@@ -718,6 +769,19 @@ impl WifiIface {
                     // lands outside SchedScanWait (e.g. while
                     // authenticating).
                     self.scan.sched_scan_stop_pending = false;
+                } else if cmd == Nl80211Command::Roam {
+                    if self.caps.mlme == MlmeMode::FullMac {
+                        // Firmware roaming is not driven or tracked by
+                        // shuli yet. Rebuild the link instead of letting
+                        // userspace keep keys/BSSID state for the old AP.
+                        log::warn!(
+                            "firmware ROAM event; reconnecting to resync \
+                             userspace state"
+                        );
+                        self.mark_link_lost(FastReconnect::ScanNow).await;
+                    } else {
+                        log::debug!("ROAM event ignored in SoftMAC mode");
+                    }
                 } else if matches!(
                     cmd,
                     Nl80211Command::Deauthenticate
@@ -760,6 +824,52 @@ impl WifiIface {
             _ => {
                 log::debug!("unhandled nl80211 event: {event:?}");
             }
+        }
+    }
+
+    /// Common association-success path for both the userspace-SME
+    /// `ASSOCIATE` event and the FullMAC `CONNECT` result.
+    pub(crate) async fn handle_association_success(
+        &mut self,
+        ies: Option<&[u8]>,
+    ) {
+        if self.link.bss_info.security == SecurityType::Open {
+            log::info!("ASSOCIATED - open network, connection established");
+            self.fast_reconnect = None;
+            self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
+            self.state = WifiState::ConnectedWithoutOffloadRekey;
+            self.arm_wowlan_if_enabled().await;
+        } else if self.link.bss_info.security == SecurityType::Owe {
+            if self.process_owe_assoc_response(ies) {
+                log::info!(
+                    "ASSOCIATED - OWE PMK derived, waiting for 4-way handshake"
+                );
+            } else {
+                self.state = WifiState::Failed;
+            }
+        } else if self.link.bss_info.security.is_ft() {
+            // Initial association with an FT AKM: record the mobility
+            // domain and R0/R1 key holders from the response IEs and
+            // derive the FT key hierarchy; the 4-way handshake that
+            // follows runs with the PMK-R1-derived PTK.
+            if let Err(e) = self.setup_ft_context(ies.unwrap_or(&[])).await {
+                log::warn!("FT setup failed: {e}");
+                self.state = WifiState::Failed;
+            } else {
+                log::info!("ASSOCIATED (FT) - waiting for 4-way handshake");
+                // A Message 1 may have raced ahead of this association
+                // event; feed it now.
+                if let Some(frame) = self.link.pending_ft_msg1.take() {
+                    self.handle_control_port_frame(&frame).await;
+                }
+            }
+        } else if self.link.pmksa_in_use.is_some() {
+            log::info!(
+                "ASSOCIATED with cached PMKID - the AP accepted the PMKSA; \
+                 awaiting 4-way handshake"
+            );
+        } else {
+            log::info!("ASSOCIATED - waiting for 4-way handshake");
         }
     }
 
@@ -1350,13 +1460,25 @@ impl WifiIface {
                     fw.set_ext_key_id(self.ext_key_id_enabled());
                     self.link.fourway = Some(fw);
                 } else {
+                    // The RSNE must be byte-identical to the one the
+                    // association/connect request carried: the AP verifies
+                    // it in Message 2.  FullMAC drivers may rewrite the
+                    // request IEs, so the stored value wins over a locally
+                    // rebuilt element.
+                    let assoc_wpa_ie = if self.link.assoc_wpa_ie.is_empty() {
+                        None
+                    } else {
+                        Some(self.link.assoc_wpa_ie.clone())
+                    };
                     let (pmk, mut rsne, mic_alg) = if let Some(entry) =
                         self.link.pmksa_in_use.as_ref()
                     {
                         // 4-way over a cached PMK. The RSNE must be
                         // the same one the association request carried
                         // (with the PMKID) - the AP verifies that.
-                        let rsne = self.rsne_with_pmkid(Some(entry.pmkid));
+                        let rsne = assoc_wpa_ie.clone().unwrap_or_else(|| {
+                            self.rsne_with_pmkid(Some(entry.pmkid))
+                        });
                         (entry.pmk, rsne, entry.mic_alg)
                     } else {
                         match self.link.bss_info.security {
@@ -1375,9 +1497,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    owe_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        owe_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::HmacSha256,
                                 )
                             }
@@ -1391,9 +1517,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    wpa2_psk_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        wpa2_psk_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::HmacSha1,
                                 )
                             }
@@ -1407,9 +1537,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    wpa2_psk_sha256_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        wpa2_psk_sha256_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1423,9 +1557,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    wpa2_ent_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        wpa2_ent_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::HmacSha1,
                                 )
                             }
@@ -1439,9 +1577,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    wpa2_ent_sha256_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        wpa2_ent_sha256_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1461,9 +1603,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    sae_ext_key_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        sae_ext_key_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::HmacSha256,
                                 )
                             }
@@ -1481,9 +1627,13 @@ impl WifiIface {
                                 };
                                 (
                                     pmk,
-                                    sae_ie_cipher(
-                                        self.link.bss_info.group_mgmt_cipher,
-                                    ),
+                                    assoc_wpa_ie.clone().unwrap_or_else(|| {
+                                        sae_ie_cipher(
+                                            self.link
+                                                .bss_info
+                                                .group_mgmt_cipher,
+                                        )
+                                    }),
                                     MicAlg::AesCmac,
                                 )
                             }
@@ -1529,9 +1679,7 @@ impl WifiIface {
                 }
             };
             if let Err(e) = self
-                .core
-                .nl
-                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg2)
+                .send_control_port_frame(self.link.bss_info.bssid, &msg2)
                 .await
             {
                 log::warn!("send msg2 failed: {e}");
@@ -1624,9 +1772,7 @@ impl WifiIface {
             }
 
             if let Err(e) = self
-                .core
-                .nl
-                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg4)
+                .send_control_port_frame(self.link.bss_info.bssid, &msg4)
                 .await
             {
                 log::warn!("send msg4 failed: {e}");
@@ -1736,6 +1882,28 @@ impl WifiIface {
             // next reconnect/roam (and hand it to the driver's cache).
             self.cache_pmksa().await;
 
+            // FullMAC CONNECT requests carry NL80211_ATTR_CONTROL_PORT,
+            // which keeps the data port closed until userspace authorizes
+            // the station after the 4-way handshake.
+            if self.caps.mlme == MlmeMode::FullMac {
+                match self
+                    .core
+                    .nl
+                    .set_station_authorized(self.link.bss_info.bssid)
+                    .await
+                {
+                    Ok(()) => {
+                        log::info!("station authorized for the data path");
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "authorizing the station after the 4-way \
+                             handshake failed: {e}"
+                        );
+                    }
+                }
+            }
+
             // Try to offload GTK rekey to the driver/firmware.
             // Falls back to userspace rekey when unsupported
             // (e.g. mac80211_hwsim returns -EOPNOTSUPP).
@@ -1789,9 +1957,7 @@ impl WifiIface {
             };
 
             if let Err(e) = self
-                .core
-                .nl
-                .send_ctrl_port_frame(self.link.bss_info.bssid, &msg2)
+                .send_control_port_frame(self.link.bss_info.bssid, &msg2)
                 .await
             {
                 log::warn!("send group rekey reply failed: {e}");
@@ -1848,9 +2014,7 @@ impl WifiIface {
             Ok(EapAction::Respond(response)) => {
                 let frame = EapolEapFrame::build(&response);
                 if let Err(e) = self
-                    .core
-                    .nl
-                    .send_ctrl_port_frame(self.link.bss_info.bssid, &frame)
+                    .send_control_port_frame(self.link.bss_info.bssid, &frame)
                     .await
                 {
                     log::warn!("send EAP response failed: {e}");

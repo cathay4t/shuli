@@ -3,8 +3,9 @@
 use wl_nl80211::Nl80211WowlanTriggersSupport;
 
 use super::{
-    AuthMethod, EapPeer, FourWayState, Nl80211EventReceiver, OweAuth,
-    PmksaCache, PmksaEntry, SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_WATCHDOG_SECS,
+    AuthMethod, ControlPort, EapPeer, FourWayState, OweAuth, PmksaCache,
+    PmksaEntry, SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_WATCHDOG_SECS,
+    WifiEventReceiver, WifiEventSender,
 };
 use crate::{
     BssInfo, ETH_ALEN, NetworkConfig, ShuliNl80211Connection, WifiConfig,
@@ -193,13 +194,38 @@ pub(crate) fn resume_action(
 
 pub(crate) struct IfaceCore {
     pub(crate) nl: ShuliNl80211Connection,
-    pub(crate) event_receiver: Nl80211EventReceiver,
+    pub(crate) event_receiver: WifiEventReceiver,
     pub(crate) config: WifiConfig,
+}
+
+/// Which MLME implementation the wiphy expects shuli to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MlmeMode {
+    /// `NL80211_CMD_AUTHENTICATE` + `NL80211_CMD_ASSOCIATE`: mac80211 /
+    /// SoftMAC. shuli performs the pre-association exchange and
+    /// association itself.
+    SoftMac,
+    /// `NL80211_CMD_CONNECT` without the userspace-SME commands: the
+    /// driver/firmware performs authentication and association (FullMAC).
+    FullMac,
+}
+
+/// How EAPOL frames are exchanged with the driver/firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlPortMode {
+    /// `NL80211_CMD_CONTROL_PORT_FRAME` (mac80211).
+    Nl80211,
+    /// Raw `AF_PACKET` / `ETH_P_PAE` (in-tree FullMAC drivers).
+    RawEapol,
 }
 
 /// Capabilities probed once from the wiphy and shared by every scan,
 /// PNO and WoWLAN operation on this interface.
 pub(crate) struct WiphyCaps {
+    /// MLME ownership detected from `NL80211_ATTR_SUPPORTED_COMMANDS`.
+    pub(crate) mlme: MlmeMode,
+    /// EAPOL transport detected from the wiphy extension features.
+    pub(crate) control_port: ControlPortMode,
     /// Whether the driver advertises hardware scheduled scan (PNO)
     /// support.
     pub(crate) sched_scan_supported: bool,
@@ -303,6 +329,12 @@ pub(crate) struct Link {
     pub(crate) network: NetworkConfig,
     /// Best BSS found by the scan phase.
     pub(crate) bss_info: BssInfo,
+    /// WPA/RSN information elements actually sent in the association or
+    /// connect request.  The 4-way Message 2 must echo them (SAE also
+    /// sends an RSNXE); FullMAC drivers are allowed to rewrite the
+    /// request IEs, so the value is refreshed from
+    /// `NL80211_ATTR_REQ_IE` when the CONNECT result arrives.
+    pub(crate) assoc_wpa_ie: Vec<u8>,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
     /// The PMKSA entry of the connection attempt in flight, when the
@@ -451,6 +483,7 @@ impl Link {
     pub(crate) fn reset_for_update(&mut self, network: NetworkConfig) {
         self.network = network;
         self.bss_info = BssInfo::default();
+        self.assoc_wpa_ie.clear();
         self.fourway = None;
         self.pmksa_in_use = None;
         self.ft = None;
@@ -560,6 +593,13 @@ impl BssidIgnoreList {
 pub(crate) struct WifiIface {
     pub(crate) core: IfaceCore,
     pub(crate) caps: WiphyCaps,
+    /// EAPOL transport selected for this interface.  Raw sockets are
+    /// opened lazily by [`WifiIface`] when a connection needs them.
+    pub(crate) control_port: ControlPort,
+    /// Event queue sender used by the raw EAPOL reader task.
+    pub(crate) event_tx: WifiEventSender,
+    /// Reader task lifetime for the raw EAPOL socket.
+    pub(crate) raw_task: Option<tokio::task::JoinHandle<()>>,
     pub(crate) scan: ScanEngine,
     pub(crate) link: Link,
     pub(crate) auth: AuthSession,

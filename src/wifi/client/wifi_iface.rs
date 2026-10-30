@@ -5,19 +5,20 @@ use wl_nl80211::{Ieee80211ReasonCode, Nl80211Command, Nl80211WowlanWakeup};
 
 use super::{
     AUTH_EVENT_TIMEOUT_SECS, AuthMethod, AuthSession, BssidIgnoreList,
-    ErrorKind, FAST_RECONNECT_DELAY_MS, FastReconnect, IfaceCore, Link,
-    MAX_SCHED_SCAN_SSIDS, NetworkConfig, NetworkUpdate, Nl80211Attr,
-    Nl80211Disconnect, Nl80211Event, Nl80211EventReceiver,
+    ControlPort, ControlPortMode, ErrorKind, FAST_RECONNECT_DELAY_MS,
+    FastReconnect, IfaceCore, Link, MAX_SCHED_SCAN_SSIDS, MlmeMode,
+    NetworkConfig, NetworkUpdate, Nl80211Attr, Nl80211Disconnect, Nl80211Event,
     Nl80211SchedScanMatch, Nl80211SchedScanMatchAttr, Nl80211SchedScanPlan,
     Nl80211SchedScanPlanAttr, Nl80211Wowlan, Nl80211WowlanTriggersSupport,
     PmksaCache, RETRY_AUTH_SEC, RETRY_BACKOFF_INIT_SEC, RETRY_BACKOFF_MAX_SEC,
     ResumeAction, RoamEngine, SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS, SAE_SYNC_MAX,
     SCHED_SCAN_INTERVAL_SEC, SCHED_SCAN_STOP_ECHO_TIMEOUT_SECS,
     SCHED_SCAN_WATCHDOG_SECS, STARTUP_RETRY_SEC, ScanEngine,
-    ShuliNl80211Connection, WifiConfig, WifiError, WifiIface, WifiState,
-    WiphyCaps, WowlanState, best_retry_candidate, connection_is_live,
-    drain_request, format_ssids, is_eopnotsupp, network_update_action,
-    next_sched_scan_ssids, resume_action, wiphy_sched_scan_caps,
+    ShuliNl80211Connection, WifiConfig, WifiError, WifiEvent,
+    WifiEventReceiver, WifiEventSender, WifiIface, WifiState, WiphyCaps,
+    WowlanState, best_retry_candidate, connection_is_live, drain_request,
+    format_ssids, is_eopnotsupp, network_update_action, next_sched_scan_ssids,
+    resume_action, wiphy_mlme_caps, wiphy_sched_scan_caps,
     wiphy_wowlan_support,
 };
 use crate::{BssInfo, ETH_ALEN};
@@ -29,6 +30,9 @@ impl WifiIface {
     fn scan_free_target(&self) -> Option<(NetworkConfig, BssInfo)> {
         self.core.config.networks.iter().find_map(|network| {
             let bss_info = network.scan_free_bss_info()?;
+            if self.mlme_security_unsupported(bss_info.security).is_some() {
+                return None;
+            }
             Some((network.clone(), bss_info))
         })
     }
@@ -38,7 +42,8 @@ impl WifiIface {
     /// parent [`WifiClient`].
     pub(crate) async fn init(
         mut nl: ShuliNl80211Connection,
-        event_receiver: Nl80211EventReceiver,
+        event_receiver: WifiEventReceiver,
+        event_tx: WifiEventSender,
         resume_rx: tokio::sync::watch::Receiver<u64>,
         config: WifiConfig,
     ) -> Result<Self, WifiError> {
@@ -50,6 +55,42 @@ impl WifiIface {
             "interface {} if_index={}, mac={mac:02x?}, wiphy={wiphy_idx}",
             config.iface_name,
             if_index
+        );
+
+        // Decide whether the MLME lives in userspace (SoftMAC) or in the
+        // driver/firmware (FullMAC), and how EAPOL is transported.  This
+        // must be probed before the first connection attempt: the
+        // commands are mutually exclusive in practice and picking the
+        // wrong one merely loops on -EOPNOTSUPP.
+        let mlme_caps = wiphy_mlme_caps(&nl.handle, wiphy_idx).await?;
+        #[allow(unused_mut)]
+        let mut mlme = mlme_caps.mlme;
+        #[allow(unused_mut)]
+        let mut control_port_mode = mlme_caps.control_port;
+        #[cfg(test)]
+        if let Some(test_override) = config.test_mode_override {
+            if let Some(forced_mlme) = test_override.mlme {
+                mlme = forced_mlme;
+                log::warn!("test override: forcing MLME mode {mlme:?}");
+            }
+            if let Some(forced_port) = test_override.control_port {
+                control_port_mode = forced_port;
+                log::warn!(
+                    "test override: forcing EAPOL control port \
+                     {control_port_mode:?}"
+                );
+            }
+        }
+        log::info!(
+            "MLME mode: {}; EAPOL transport: {}",
+            match mlme {
+                MlmeMode::SoftMac => "SoftMAC (userspace SME)",
+                MlmeMode::FullMac => "FullMAC (driver SME)",
+            },
+            match control_port_mode {
+                ControlPortMode::Nl80211 => "nl80211 control port",
+                ControlPortMode::RawEapol => "raw AF_PACKET EAPOL",
+            }
         );
 
         // Detect hardware scheduled scan (PNO) support and its caps
@@ -161,11 +202,17 @@ impl WifiIface {
         }
 
         let caps = WiphyCaps {
+            mlme,
+            control_port: control_port_mode,
             sched_scan_supported,
             max_sched_scan_ssids,
             max_match_sets,
             max_scan_ssids,
             wowlan_supported_triggers,
+        };
+        let control_port = match control_port_mode {
+            ControlPortMode::Nl80211 => ControlPort::Nl80211,
+            ControlPortMode::RawEapol => ControlPort::Raw { port: None },
         };
         let scan = ScanEngine {
             scan_retry_interval: RETRY_BACKOFF_INIT_SEC,
@@ -187,6 +234,7 @@ impl WifiIface {
         let link = Link {
             network,
             bss_info: BssInfo::default(),
+            assoc_wpa_ie: Vec::new(),
             fourway: None,
             pmksa_in_use: None,
             ft: None,
@@ -198,6 +246,9 @@ impl WifiIface {
         let mut client = WifiIface {
             core,
             caps,
+            control_port,
+            event_tx,
+            raw_task: None,
             scan,
             link,
             auth: AuthSession::default(),
@@ -212,10 +263,53 @@ impl WifiIface {
             last_error: None,
         };
 
-        // Receive WNM action frames (BTM Requests) for roaming.
-        client.register_roam_frames().await;
+        // Receive WNM action frames (BTM Requests) for roaming.  FullMAC
+        // firmware owns roaming; shuli never drives it to another BSS.
+        if client.caps.mlme == MlmeMode::SoftMac {
+            client.register_roam_frames().await;
+        }
 
         Ok(client)
+    }
+
+    /// Open the raw EAPOL socket on first use.
+    ///
+    /// Open networks and (eventually) firmware-offloaded handshakes do not
+    /// need it, so the socket is only created when a connection actually
+    /// requires userspace EAPOL/4-way.
+    pub(crate) fn ensure_control_port(&mut self) -> Result<(), WifiError> {
+        match &mut self.control_port {
+            ControlPort::Nl80211 => Ok(()),
+            ControlPort::Raw { port: Some(_) } => Ok(()),
+            ControlPort::Raw { port } => {
+                let raw = super::control_port::RawControlPort::open(
+                    self.core.nl.if_index,
+                )?;
+                self.raw_task = Some(raw.spawn_reader(self.event_tx.clone()));
+                *port = Some(raw);
+                log::debug!("raw EAPOL control port opened and reader started");
+                Ok(())
+            }
+        }
+    }
+
+    /// Send an EAPOL frame over the interface's selected control port.
+    pub(crate) async fn send_control_port_frame(
+        &mut self,
+        bssid: [u8; ETH_ALEN],
+        frame: &[u8],
+    ) -> Result<(), WifiError> {
+        if !self.control_port.is_raw() {
+            return self.core.nl.send_ctrl_port_frame(bssid, frame).await;
+        }
+        match &self.control_port {
+            ControlPort::Raw { port: Some(port) } => port.send(bssid, frame),
+            ControlPort::Raw { port: None } => Err(WifiError::new(
+                ErrorKind::NoSupport,
+                "raw EAPOL control port is not initialized",
+            )),
+            ControlPort::Nl80211 => unreachable!(),
+        }
     }
 
     /// Drive the connection flow until a state change worth reporting
@@ -402,12 +496,7 @@ impl WifiIface {
             )
             .await
             {
-                Ok(Some(raw_msg)) => {
-                    let info = self.disconnect_info(&raw_msg);
-                    if let Some(event) = Nl80211Event::parse(raw_msg) {
-                        self.handle_client_event(event, info).await;
-                    }
-                }
+                Ok(Some(event)) => self.handle_wifi_event(event).await,
                 Ok(None) | Err(_) => break,
             }
         }
@@ -649,7 +738,10 @@ impl WifiIface {
                     }
                 };
                 match timed {
-                    Ok(Some(raw_msg)) => {
+                    Ok(Some(WifiEvent::Eapol(frame))) => {
+                        self.handle_raw_eapol(frame).await;
+                    }
+                    Ok(Some(WifiEvent::Kernel(raw_msg))) => {
                         let info = self.disconnect_info(&raw_msg);
                         if let Some(event) = Nl80211Event::parse(raw_msg) {
                             match event {
@@ -759,11 +851,8 @@ impl WifiIface {
                     )
                     .await;
                     match timed {
-                        Ok(Some(raw_msg)) => {
-                            let info = self.disconnect_info(&raw_msg);
-                            if let Some(event) = Nl80211Event::parse(raw_msg) {
-                                self.handle_client_event(event, info).await;
-                            }
+                        Ok(Some(event)) => {
+                            self.handle_wifi_event(event).await;
                             break;
                         }
                         Ok(None) => {
@@ -881,7 +970,8 @@ impl WifiIface {
                 // CQM support fall back to polling the signal. Neither
                 // runs for an AP that does not advertise a managed-roaming
                 // capability (the wait is unbounded).
-                let ap_roams = self.link.network.roaming
+                let ap_roams = self.caps.mlme == MlmeMode::SoftMac
+                    && self.link.network.roaming
                     && self.link.bss_info.ap_supports_signal_roam();
                 if !self.roam.cqm_armed && ap_roams {
                     self.roam.cqm_armed = self.arm_cqm().await;
@@ -927,12 +1017,7 @@ impl WifiIface {
                     return Ok(());
                 }
                 match next {
-                    Ok(Some(raw_msg)) => {
-                        let info = self.disconnect_info(&raw_msg);
-                        if let Some(event) = Nl80211Event::parse(raw_msg) {
-                            self.handle_client_event(event, info).await;
-                        }
-                    }
+                    Ok(Some(event)) => self.handle_wifi_event(event).await,
                     Ok(None) => {
                         return Err(WifiError::new(
                             ErrorKind::Nl80211,
@@ -1029,11 +1114,8 @@ impl WifiIface {
                         None => break,
                     };
                     match timed {
-                        Ok(Some(raw_msg)) => {
-                            let info = self.disconnect_info(&raw_msg);
-                            if let Some(event) = Nl80211Event::parse(raw_msg) {
-                                self.handle_client_event(event, info).await;
-                            }
+                        Ok(Some(event)) => {
+                            self.handle_wifi_event(event).await;
                             if !matches!(
                                 self.state,
                                 WifiState::Failed
@@ -1599,11 +1681,17 @@ impl WifiIface {
         if let Err(e) = self.core.nl.disconnect().await {
             log::debug!("disconnect on shutdown: {e}");
         }
+        if let Some(task) = self.raw_task.take() {
+            task.abort();
+        }
     }
 }
 
 impl Drop for WifiIface {
     fn drop(&mut self) {
+        if let Some(task) = self.raw_task.take() {
+            task.abort();
+        }
         let mut conn_handle = self.core.nl.conn_handle.clone();
         let handle = self.core.nl.handle.clone();
         let if_index = self.core.nl.if_index;

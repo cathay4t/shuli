@@ -32,10 +32,21 @@ use wl_nl80211::Ieee80211EapolKeyFrame;
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
-    client::{FastReconnect, RETRY_BACKOFF_INIT_SEC},
+    client::{
+        ControlPortMode, FastReconnect, MlmeMode, RETRY_BACKOFF_INIT_SEC,
+    },
+    config::TestModeOverride,
 };
 
 static WIFI_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Force the FullMAC CONNECT path on the mac80211 hwsim radio.
+fn force_fullmac(config: &mut WifiConfig, control_port: ControlPortMode) {
+    config.set_test_mode_override(TestModeOverride {
+        mlme: Some(MlmeMode::FullMac),
+        control_port: Some(control_port),
+    });
+}
 
 /// Initialise `env_logger` once per test process when `RUST_LOG` is set.
 /// Defaults to `trace` so the full client flow is captured and printed by
@@ -204,6 +215,21 @@ rsn_pairwise=CCMP
 ieee80211w=2
 sae_pwe=2
 sae_password=12345678
+ctrl_interface=/var/run/hostapd
+";
+
+/// OWE (Enhanced Open) AP. FullMAC does not support it yet; the scan
+/// must reject it with NoSupport instead of attempting CONNECT.
+const OWE_HOSTAPD_CONF: &str = r"
+interface=wifi_ap
+driver=nl80211
+hw_mode=g
+channel=1
+ssid=Test-WIFI-OWE
+wpa=2
+wpa_key_mgmt=OWE
+rsn_pairwise=CCMP
+ieee80211w=2
 ctrl_interface=/var/run/hostapd
 ";
 
@@ -609,6 +635,37 @@ async fn run_until_scan_started(
         }
     }
     panic!("client did not enter Scanning state");
+}
+
+/// Push an ICMP echo through the encrypted data path. Used by the
+/// FullMAC tests to prove the 4-way keys were installed and
+/// `SET_STATION` authorized the port.
+fn ping_ap_via(iface: &str) {
+    sh_ok(&format!("ip addr add 192.0.2.100/24 dev {iface}"));
+    let mut ponged = false;
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("ping -I {iface} -c 1 -W 1 192.0.2.1"))
+            .output()
+            .expect("spawn ping");
+        if out.status.success() {
+            ponged = true;
+            break;
+        }
+        last_err = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    sh_allow_fail(&format!("ip addr del 192.0.2.100/24 dev {iface}"));
+    assert!(
+        ponged,
+        "ICMP echo through the {iface} data path never succeeded:\n{last_err}"
+    );
 }
 
 /// Pump events until the socket goes quiet: the kernel delivers a few
@@ -3784,4 +3841,224 @@ fn get_phy_id(nic: &str) -> String {
         }
     }
     panic!("no wiphy found for {nic}");
+}
+
+/// Forced FullMAC `NL80211_CMD_CONNECT` path with the nl80211 control
+/// port (cfg80211 SME on hwsim).
+#[tokio::test]
+async fn wifi_client_fullmac_open_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_open_connect: test binary not \
+             running as root"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OPEN_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-NOPASS", None);
+    force_fullmac(&mut config, ControlPortMode::Nl80211);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    client.shutdown().await;
+}
+
+/// Forced FullMAC CONNECT + WPA2-PSK userspace 4-way over the nl80211
+/// control port. The data path proves SET_STATION authorization ran.
+#[tokio::test]
+async fn wifi_client_fullmac_wpa2_psk_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_wpa2_psk_connect: test binary not \
+             running as root"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    force_fullmac(&mut config, ControlPortMode::Nl80211);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    ping_ap_via(TEST_NIC);
+    client.shutdown().await;
+}
+
+/// Forced FullMAC CONNECT + WPA2-PSK userspace 4-way over a raw AF_PACKET
+/// EAPOL socket. This is the transport real FullMAC drivers require.
+#[tokio::test]
+async fn wifi_client_fullmac_wpa2_psk_raw_eapol_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_wpa2_psk_raw_eapol_connect: test \
+             binary not running as root"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(WPA2_PSK_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-PSK", Some("12345678"));
+    force_fullmac(&mut config, ControlPortMode::RawEapol);
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    ping_ap_via(TEST_NIC);
+    client.shutdown().await;
+}
+
+/// Forced FullMAC CONNECT + WPA2-Enterprise: EAP-TLS and the 4-way
+/// handshake both run in userspace over the raw PAE socket.
+#[tokio::test]
+async fn wifi_client_fullmac_wpa2_eap_raw_eapol_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_wpa2_eap_raw_eapol_connect: test \
+             binary not running as root"
+        );
+        return;
+    }
+    write_test_certs();
+    let cert_dir = "/tmp/shuli_rs_test_certs";
+
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(wpa2_eap_hostapd_conf());
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-EAP", None);
+    let mut eap = crate::EapConfig::default();
+    eap.identity = "shuli-test".to_string();
+    eap.ca_cert = Some(format!("{cert_dir}/ca.pem").into());
+    eap.client_cert = Some(format!("{cert_dir}/client.pem").into());
+    eap.client_key = Some(format!("{cert_dir}/client.key").into());
+    eap.server_name = Some("eap-tls.test".to_string());
+    config.networks[0].eap = Some(eap);
+    force_fullmac(&mut config, ControlPortMode::RawEapol);
+
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    ping_ap_via(TEST_NIC);
+    client.shutdown().await;
+}
+
+/// Forced FullMAC + WPA3-Enterprise baseline (AKM 5, mandatory PMF).
+#[tokio::test]
+async fn wifi_client_fullmac_wpa3_eap_connect() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_wpa3_eap_connect: test binary not \
+             running as root"
+        );
+        return;
+    }
+    write_test_certs();
+    let cert_dir = "/tmp/shuli_rs_test_certs";
+
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(wpa3_eap_hostapd_conf());
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-EAP3", None);
+    let mut eap = crate::EapConfig::default();
+    eap.identity = "shuli-test".to_string();
+    eap.ca_cert = Some(format!("{cert_dir}/ca.pem").into());
+    eap.client_cert = Some(format!("{cert_dir}/client.pem").into());
+    eap.client_key = Some(format!("{cert_dir}/client.key").into());
+    eap.server_name = Some("eap-tls.test".to_string());
+    config.networks[0].eap = Some(eap);
+    force_fullmac(&mut config, ControlPortMode::RawEapol);
+
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    ping_ap_via(TEST_NIC);
+    client.shutdown().await;
+}
+
+/// SAE must be rejected on a FullMAC wiphy with a clear NoSupport error
+/// instead of looping on `CMD_AUTHENTICATE`.
+#[tokio::test]
+async fn wifi_client_fullmac_rejects_sae() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_rejects_sae: test binary not \
+             running as root"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    force_fullmac(&mut config, ControlPortMode::Nl80211);
+
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let err = run_until_connected(&mut client, 5)
+        .await
+        .expect_err("SAE must not connect on a FullMAC wiphy");
+    assert_eq!(err.kind, ErrorKind::NoSupport, "unexpected error: {err}");
+    assert!(err.msg.contains("SAE"), "unexpected error message: {err}");
+    client.shutdown().await;
+}
+
+/// OWE must be rejected on a FullMAC wiphy with a clear NoSupport error.
+#[tokio::test]
+async fn wifi_client_fullmac_rejects_owe() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_fullmac_rejects_owe: test binary not \
+             running as root"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(OWE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI-OWE", None);
+    force_fullmac(&mut config, ControlPortMode::Nl80211);
+
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let err = run_until_connected(&mut client, 5)
+        .await
+        .expect_err("OWE must not connect on a FullMAC wiphy");
+    assert_eq!(err.kind, ErrorKind::NoSupport, "unexpected error: {err}");
+    assert!(err.msg.contains("OWE"), "unexpected error message: {err}");
+    client.shutdown().await;
 }

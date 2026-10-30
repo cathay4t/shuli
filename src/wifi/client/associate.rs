@@ -9,11 +9,12 @@ use wl_nl80211::{
 };
 
 use super::{
-    MicAlg, PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT, PmksaEntry,
-    WifiIface, entry_with_fresh_lifetime, kdf,
+    ControlPortMode, MicAlg, PMK_LIFETIME_SECS, PMK_REAUTH_THRESHOLD_PERCENT,
+    PmksaEntry, WifiIface, entry_with_fresh_lifetime, kdf,
 };
 use crate::{
     SecurityType, WifiError, WifiState, crypto::handshake4::FourWayState,
+    nl80211::extract_rsn_from_ies,
 };
 
 impl WifiIface {
@@ -91,6 +92,18 @@ impl WifiIface {
         if self.link.network.ext_key_id {
             rsne_set_ext_key_id(&mut ie, true);
         }
+        // The 4-way Message 2 must echo the WPA/RSN element sent in
+        // the association request.  SAE also sends an RSNXE, and OWE
+        // sends a DH element that must *not* appear in Message 2.
+        self.link.assoc_wpa_ie =
+            if self.link.bss_info.security == SecurityType::Owe {
+                extract_rsn_from_ies(&ie).unwrap_or_default()
+            } else if self.link.bss_info.security.is_ft() {
+                // FT Message 2 is built from the FT key hierarchy below.
+                Vec::new()
+            } else {
+                ie.clone()
+            };
         let mut builder = Nl80211Associate::new(self.core.nl.if_index)
             .ssid(&self.link.network.ssid)
             .mac(self.link.bss_info.bssid)
@@ -103,9 +116,11 @@ impl WifiIface {
         }
         // Tie every association to this socket so the kernel tears it down
         // if shuli dies without a clean shutdown. Encrypted networks
-        // additionally carry EAPOL over nl80211.
+        // additionally carry EAPOL over the wiphy's control port.
         builder = builder.socket_owner(true);
-        if self.link.bss_info.security != SecurityType::Open {
+        if self.link.bss_info.security != SecurityType::Open
+            && self.caps.control_port == ControlPortMode::Nl80211
+        {
             builder = builder.control_port_over_nl80211(true);
         }
         let attrs = builder.build();

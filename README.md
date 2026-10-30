@@ -15,6 +15,11 @@ entirely in Rust.
 * **WPA3-OWE** - WPA3 open networks.
 * **WPA2-Enterprise and WPA3-Enterprise** - 802.1X / EAP-TLS (rustls,
   TLS 1.3, RFC 9190 MSK), mandatory PMF for WPA3.
+* **SoftMAC and FullMAC drivers** - SoftMAC (mac80211) uses
+  `NL80211_CMD_AUTHENTICATE`/`ASSOCIATE`; FullMAC drivers use
+  `NL80211_CMD_CONNECT` for open, WPA2-PSK/PSK-SHA256 and
+  WPA2/WPA3-Enterprise, with the 4-way handshake in userspace over
+  nl80211 or raw EAPOL as advertised by the wiphy.
 * **Roaming** - 802.11r fast BSS transition (FT-PSK / FT-SAE), 802.11v
   BTM, 802.11k Neighbor Reports before quick roam scans, and
   signal-triggered roam scans; PMKSA caching and OKC.
@@ -229,6 +234,7 @@ We deliberately skip these features due to extensive development cost and
 lacking of user request:
 
 - SAE/WPA3 on `FullMAC/NL80211_CMD_CONNECT` via external auth
+- OWE on `FullMAC/NL80211_CMD_CONNECT`
 - FT roaming on `FullMAC/NL80211_CMD_CONNECT`
 - SAE-PK
 

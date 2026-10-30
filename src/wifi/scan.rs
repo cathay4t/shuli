@@ -21,6 +21,7 @@ use wl_nl80211::{
 use crate::{
     DEFAULT_SWITCH_SSID_LOWER_THAN_DBM, ETH_ALEN, ErrorKind, NetworkConfig,
     ShuliNl80211Connection, WifiClient, WifiError, WifiIface, WifiState,
+    client::{MlmeMode, WifiEvent},
     nl80211::{
         extract_bssid, extract_freq, extract_ies, extract_privacy,
         extract_signal_dbm, extract_ssid_from_ies,
@@ -381,6 +382,31 @@ pub(crate) fn best_retry_candidate(
 }
 
 impl WifiIface {
+    /// Why `security` cannot be joined on the detected MLME path.
+    pub(crate) fn mlme_security_unsupported(
+        &self,
+        security: SecurityType,
+    ) -> Option<&'static str> {
+        if self.caps.mlme == MlmeMode::SoftMac {
+            return None;
+        }
+        match security {
+            SecurityType::Sae
+            | SecurityType::SaeExtKey
+            | SecurityType::FtSae
+            | SecurityType::FtSaeExtKey => Some(
+                "WPA3-SAE requires a SoftMAC driver (NL80211_CMD_AUTHENTICATE)",
+            ),
+            SecurityType::FtPsk => {
+                Some("802.11r FT-PSK requires a SoftMAC driver")
+            }
+            SecurityType::Owe => {
+                Some("OWE is not supported on FullMAC drivers yet")
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) async fn send_out_scan_request(
         &mut self,
     ) -> Result<(), WifiError> {
@@ -492,7 +518,10 @@ impl WifiIface {
             )
             .await
             {
-                Ok(Some(raw_msg)) => {
+                Ok(Some(WifiEvent::Eapol(frame))) => {
+                    self.handle_raw_eapol(frame).await;
+                }
+                Ok(Some(WifiEvent::Kernel(raw_msg))) => {
                     let info = self.disconnect_info(&raw_msg);
                     if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {
@@ -901,6 +930,18 @@ impl WifiIface {
                 if self.scan.unsupported_security.is_none() {
                     self.scan.unsupported_security =
                         Some((bss_ssid.clone(), reason));
+                }
+                continue;
+            }
+            if let Some(reason) =
+                self.mlme_security_unsupported(bss_security.security)
+            {
+                log::info!(
+                    "BSS {bssid:02x?} (ssid={bss_ssid}) cannot be joined on                      the detected MLME path: {reason}; skipping"
+                );
+                if self.scan.unsupported_security.is_none() {
+                    self.scan.unsupported_security =
+                        Some((bss_ssid.clone(), reason.to_string()));
                 }
                 continue;
             }

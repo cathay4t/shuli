@@ -9,8 +9,12 @@
 //! passphrase) and EAP/802.1X plug in here without touching the client flow.
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiError, WifiIface, crypto::sae::SaeAuth,
-    eap::EapPeer, eap_tls::EapTlsMethod, scan::SecurityType,
+    ETH_ALEN, ErrorKind, WifiError, WifiIface,
+    client::{ControlPortMode, MlmeMode},
+    crypto::sae::SaeAuth,
+    eap::EapPeer,
+    eap_tls::EapTlsMethod,
+    scan::SecurityType,
 };
 
 /// What the client should do after processing an authentication frame.
@@ -297,6 +301,7 @@ impl WifiIface {
         self.auth.eap_peer = None;
         self.auth.eap_pmk = None;
         self.link.stale_connect_failure = false;
+        self.link.assoc_wpa_ie.clear();
 
         // WPA2-Enterprise runs EAP over the control port
         // after association.  Prepare the EAP peer + EAP-TLS method
@@ -345,6 +350,43 @@ impl WifiIface {
             self.link.pmksa_in_use = Some(entry);
         }
 
+        // PSK/FT-PSK derive the PMK from the passphrase before the
+        // association so the 4-way handshake can start immediately (and
+        // so FullMAC CONNECT can pass it to firmware when offload is
+        // enabled).
+        if self.link.pmksa_in_use.is_none()
+            && matches!(
+                self.link.bss_info.security,
+                SecurityType::Wpa2Psk
+                    | SecurityType::Wpa2PskSha256
+                    | SecurityType::FtPsk
+            )
+        {
+            let password =
+                self.link.network.password.as_deref().ok_or_else(|| {
+                    WifiError::new(
+                        ErrorKind::InvalidConfig,
+                        "password required for WPA2-PSK",
+                    )
+                })?;
+            self.auth.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
+                password,
+                &self.link.network.ssid,
+            ));
+        }
+
+        if self.link.bss_info.security != SecurityType::Open
+            && self.caps.control_port == ControlPortMode::RawEapol
+        {
+            // A SoftMAC wiphy without CONTROL_PORT_OVER_NL80211 also
+            // needs the raw PAE socket; open it before the first frame.
+            self.ensure_control_port()?;
+        }
+
+        if self.caps.mlme == MlmeMode::FullMac {
+            return self.send_out_connect_request().await;
+        }
+
         if self.link.pmksa_in_use.is_some()
             || !matches!(
                 self.link.bss_info.security,
@@ -358,26 +400,6 @@ impl WifiIface {
             // and cached-PMKSA connections. OWE's DH exchange happens in
             // the association request/response; the PSK AKMs derive the
             // PMK from the passphrase via PBKDF2.
-            if self.link.pmksa_in_use.is_none()
-                && matches!(
-                    self.link.bss_info.security,
-                    SecurityType::Wpa2Psk
-                        | SecurityType::Wpa2PskSha256
-                        | SecurityType::FtPsk
-                )
-            {
-                let password =
-                    self.link.network.password.as_deref().ok_or_else(|| {
-                        WifiError::new(
-                            ErrorKind::InvalidConfig,
-                            "password required for WPA2-PSK",
-                        )
-                    })?;
-                self.auth.psk_pmk = Some(crate::crypto::kdf::pbkdf2_pmk(
-                    password,
-                    &self.link.network.ssid,
-                ));
-            }
             log::info!(
                 "open-system AUTHENTICATE ({:?} network)",
                 self.link.bss_info.security

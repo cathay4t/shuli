@@ -1,8 +1,3 @@
-- Query wiphy command support and store SoftMAC vs FullMAC
-  capability
-- Only when `NL80211_CMD_AUTHENTICATE` is not supported, we use
-  `NL80211_CMD_CONNECT` for open, WPA2-PSK, WPA2/3-Enterprise and OWE
-
 ## Design decisions (need a policy/API decision before fixing)
 
 - WiFi PMKSA cache: entries currently live for the full 12-hour

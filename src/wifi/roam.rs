@@ -37,6 +37,7 @@ use wl_nl80211::{
 
 use crate::{
     ETH_ALEN, ErrorKind, NetworkConfig, WifiError, WifiIface, WifiState,
+    client::{MlmeMode, WifiEvent},
     config::SaePwe,
     crypto::{
         ft::{
@@ -160,6 +161,9 @@ impl WifiIface {
     /// Radio Measurement Neighbor Report Response (category 5, action 5)
     /// so the active neighbor-report path sees the AP's answer.
     pub(crate) async fn register_roam_frames(&mut self) {
+        if self.caps.mlme == MlmeMode::FullMac {
+            return;
+        }
         let attrs =
             wl_nl80211::Nl80211RegisterFrame::new(self.core.nl.if_index)
                 .frame_type(Ieee80211ActionFrame::FRAME_TYPE)
@@ -379,6 +383,9 @@ impl WifiIface {
     /// support (802.11v BTM or 802.11k neighbor report) qualifies; the
     /// scan then runs once per client run, shortly after the link is up.
     pub(crate) fn arm_post_connect_scan(&mut self) {
+        if self.caps.mlme == MlmeMode::FullMac {
+            return;
+        }
         if self.roam.post_connect_scan_done
             || self.roam.post_connect_scan_at.is_some()
         {
@@ -644,6 +651,10 @@ impl WifiIface {
         &mut self,
         frame: &Ieee80211ActionFrameBtmRequest,
     ) {
+        if self.caps.mlme == MlmeMode::FullMac {
+            log::debug!("BTM Request ignored: FullMAC firmware owns roaming");
+            return;
+        }
         if !matches!(
             self.state,
             WifiState::ConnectedWithoutOffloadRekey
@@ -811,7 +822,10 @@ impl WifiIface {
             )
             .await
             {
-                Ok(Some(raw_msg)) => {
+                Ok(Some(WifiEvent::Eapol(frame))) => {
+                    self.handle_raw_eapol(frame).await;
+                }
+                Ok(Some(WifiEvent::Kernel(raw_msg))) => {
                     let info = self.disconnect_info(&raw_msg);
                     if let Some(event) = Nl80211Event::parse(raw_msg) {
                         match event {

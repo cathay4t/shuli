@@ -254,6 +254,19 @@ pub struct WifiConfig {
     /// for authentication. Roaming is configured per network (see
     /// [`NetworkConfig::roaming`]).
     pub networks: Vec<NetworkConfig>,
+    /// Test-only override of the wiphy-probed connection mode.  Lets the
+    /// hwsim integration tests exercise the FullMAC CONNECT path and the
+    /// raw EAPOL transport on mac80211 hardware.
+    #[cfg(test)]
+    pub(crate) test_mode_override: Option<TestModeOverride>,
+}
+
+/// Test-only connection-mode override; compiled out of release builds.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TestModeOverride {
+    pub(crate) mlme: Option<crate::client::MlmeMode>,
+    pub(crate) control_port: Option<crate::client::ControlPortMode>,
 }
 
 /// A single WiFi network: an SSID with an optional passphrase and its
@@ -496,7 +509,19 @@ impl WifiConfig {
         Self {
             iface_name: iface_name.to_string(),
             networks: Vec::new(),
+            #[cfg(test)]
+            test_mode_override: None,
         }
+    }
+
+    /// Force a connection mode in tests (e.g. run the FullMAC CONNECT
+    /// path on mac80211_hwsim).
+    #[cfg(test)]
+    pub(crate) fn set_test_mode_override(
+        &mut self,
+        test_mode_override: TestModeOverride,
+    ) {
+        self.test_mode_override = Some(test_mode_override);
     }
 
     /// Add a network to scan for and connect to.

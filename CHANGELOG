@@ -11,6 +11,12 @@
  - Add an `examples/nipart_flow` consumer that demonstrates the complete
    public-API flow: negotiate, ensure the XFRM interface, install SAs and
    policies, refresh on rekey, and clean up on exit.
+ - WiFi: detect SoftMAC (userspace SME) versus FullMAC (driver SME) from
+   the wiphy's supported commands. FullMAC wiphys now connect through
+   `NL80211_CMD_CONNECT` for open, WPA2-PSK/PSK-SHA256 and
+   WPA2/WPA3-Enterprise, running the 4-way handshake in userspace over
+   nl80211 or a raw EAPOL socket and authorizing the station afterwards.
+   SAE, OWE and FT remain SoftMAC-only.
 
 ## [0.3.0] - 2026-10-01
 ### Breaking changes

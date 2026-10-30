@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use futures::{TryStream, TryStreamExt};
-use netlink_packet_core::{EthernetProtocol, Parseable};
+use netlink_packet_core::{
+    DefaultNla, EthernetProtocol, NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage,
+    NetlinkPayload, Parseable,
+};
 use netlink_packet_generic::GenlMessage;
 use wl_nl80211::{
     Ieee80211CapabilityInfo, Ieee80211Element, Ieee80211Elements, Nl80211Attr,
-    Nl80211BssInfo, Nl80211ConnectionHandle, Nl80211ControlPortFrame,
-    Nl80211Error, Nl80211Handle, Nl80211Message,
+    Nl80211BssInfo, Nl80211Command, Nl80211ConnectionHandle,
+    Nl80211ControlPortFrame, Nl80211Error, Nl80211Handle, Nl80211Message,
 };
 
 use crate::{ETH_ALEN, ErrorKind, WifiError};
+
+/// `NL80211_ATTR_STA_FLAGS2` (the driver must authorize the station for
+/// data after a userspace 4-way handshake).
+const NL80211_ATTR_STA_FLAGS2: u16 = 67;
+/// `NL80211_ATTR_CONTROL_PORT`: keep the data port closed until
+/// userspace authorizes the station.
+pub(crate) const NL80211_ATTR_CONTROL_PORT: u16 = 68;
+/// `BIT(NL80211_STA_FLAG_AUTHORIZED)`.
+const NL80211_STA_FLAG_AUTHORIZED: u32 = 1 << 1;
 
 /// Drain a nl80211 request stream until the kernel ACK/response is
 /// consumed, converting errors into [`WifiError`].
@@ -220,6 +232,80 @@ impl ShuliNl80211Connection {
         drain_request(self.conn_handle.associate(attrs).execute().await).await
     }
 
+    /// Send `NL80211_CMD_CONNECT`, recovering from a stale kernel
+    /// association the same way `authenticate()` does.
+    pub(crate) async fn connect(
+        &mut self,
+        attrs: Vec<Nl80211Attr>,
+    ) -> Result<(), WifiError> {
+        match self.connect_raw(attrs.clone()).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_ealready(&e) => {
+                log::warn!(
+                    "CONNECT rejected with -EALREADY (stale kernel \
+                     association); disconnecting and retrying"
+                );
+                if let Err(e) = self.disconnect().await {
+                    log::debug!(
+                        "disconnect before the -EALREADY retry failed: {e}"
+                    );
+                }
+                self.connect_raw(attrs).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn connect_raw(
+        &mut self,
+        attrs: Vec<Nl80211Attr>,
+    ) -> Result<(), Nl80211Error> {
+        let mut stream = self.conn_handle.connect(attrs).execute().await;
+        while let Some(_msg) = stream.try_next().await? {}
+        Ok(())
+    }
+
+    /// Authorize the station (`NL80211_CMD_SET_STATION`) so the driver
+    /// opens the data port after a userspace 4-way handshake.
+    pub(crate) async fn set_station_authorized(
+        &mut self,
+        bssid: [u8; ETH_ALEN],
+    ) -> Result<(), WifiError> {
+        let mut flags = Vec::with_capacity(8);
+        flags.extend_from_slice(&NL80211_STA_FLAG_AUTHORIZED.to_ne_bytes());
+        flags.extend_from_slice(&NL80211_STA_FLAG_AUTHORIZED.to_ne_bytes());
+        let attrs = vec![
+            Nl80211Attr::IfIndex(self.if_index),
+            Nl80211Attr::Mac(bssid),
+            Nl80211Attr::Other(DefaultNla::new(NL80211_ATTR_STA_FLAGS2, flags)),
+        ];
+        self.set_station_raw(attrs).await.map_err(Into::into)
+    }
+
+    async fn set_station_raw(
+        &mut self,
+        attrs: Vec<Nl80211Attr>,
+    ) -> Result<(), Nl80211Error> {
+        let nl_msg = Nl80211Message {
+            cmd: Nl80211Command::SetStation,
+            attributes: attrs,
+        };
+        let mut msg = NetlinkMessage::from(GenlMessage::from_payload(nl_msg));
+        msg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+        let mut stream = self.handle.request(msg).await?;
+        while let Some(response) = stream
+            .try_next()
+            .await
+            .map_err(Nl80211Error::DecodeFailed)?
+        {
+            if let NetlinkPayload::Error(err) = response.payload {
+                return Err(Nl80211Error::NetlinkError(err));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn register_frame(
         &mut self,
         attrs: Vec<Nl80211Attr>,
@@ -318,6 +404,26 @@ impl ShuliNl80211Connection {
         )
         .await
     }
+}
+
+/// Extract the RSN element (ID 48) from a raw information-elements
+/// buffer, including its ID and length octets.
+pub(crate) fn extract_rsn_from_ies(ies: &[u8]) -> Option<Vec<u8>> {
+    const ELEMENT_ID_RSN: u8 = 48;
+    let mut offset = 0usize;
+    while offset + 2 <= ies.len() {
+        let id = ies[offset];
+        let len = ies[offset + 1] as usize;
+        let end = offset + 2 + len;
+        if end > ies.len() {
+            break;
+        }
+        if id == ELEMENT_ID_RSN {
+            return Some(ies[offset..end].to_vec());
+        }
+        offset = end;
+    }
+    None
 }
 
 /// Extract the SSID from a raw information-elements buffer.

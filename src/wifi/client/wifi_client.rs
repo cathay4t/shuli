@@ -12,7 +12,7 @@ use wl_nl80211::{
     Nl80211Attr, Nl80211Handle, Nl80211Message, Nl80211MulticastGroup,
 };
 
-use super::{Nl80211EventMsg, Nl80211EventSender, WifiIface};
+use super::{Nl80211EventMsg, WifiEvent, WifiEventSender, WifiIface};
 use crate::{
     ETH_ALEN, ErrorKind, KnownBss, NetworkConfig, NetworkConfigHints,
     ShuliNl80211Connection, WifiConfig, WifiError, WifiState,
@@ -45,7 +45,7 @@ pub struct WifiClient {
     /// Event queue per kernel `if_index`, shared with the dispatcher
     /// task: `add_iface`/`remove_iface` (un)register routes on the fly
     /// while the dispatcher keeps routing the other interfaces.
-    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, Nl80211EventSender>>>,
+    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, WifiEventSender>>>,
     dispatcher_shutdown_tx: UnboundedSender<()>,
     /// Generation counter bumped by [`WifiClient::notify_resume`].
     resume_tx: tokio::sync::watch::Sender<u64>,
@@ -86,9 +86,8 @@ impl WifiClient {
         tokio::spawn(conn);
 
         let mut ifaces = HashMap::new();
-        let iface_tx_by_if_index: Arc<
-            RwLock<HashMap<u32, Nl80211EventSender>>,
-        > = Arc::new(RwLock::new(HashMap::new()));
+        let iface_tx_by_if_index: Arc<RwLock<HashMap<u32, WifiEventSender>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let (resume_tx, resume_rx) = tokio::sync::watch::channel(0u64);
         for config in configs {
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
@@ -97,9 +96,14 @@ impl WifiClient {
                 &config.iface_name,
             )
             .await?;
-            let iface =
-                WifiIface::init(nl, event_rx, resume_rx.clone(), config)
-                    .await?;
+            let iface = WifiIface::init(
+                nl,
+                event_rx,
+                event_tx.clone(),
+                resume_rx.clone(),
+                config,
+            )
+            .await?;
             iface_tx_by_if_index
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -160,10 +164,16 @@ impl WifiClient {
         self.iface_tx_by_if_index
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(if_index, event_tx);
+            .insert(if_index, event_tx.clone());
         let iface_name = config.iface_name.clone();
-        match WifiIface::init(nl, event_rx, self.resume_tx.subscribe(), config)
-            .await
+        match WifiIface::init(
+            nl,
+            event_rx,
+            event_tx,
+            self.resume_tx.subscribe(),
+            config,
+        )
+        .await
         {
             Ok(iface) => {
                 self.ifaces.insert(iface_name, iface);
@@ -370,7 +380,7 @@ fn run_event_dispatcher(
         Nl80211EventMsg,
         netlink_sys::SocketAddr,
     )>,
-    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, Nl80211EventSender>>>,
+    iface_tx_by_if_index: Arc<RwLock<HashMap<u32, WifiEventSender>>>,
     mut shutdown_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -389,14 +399,19 @@ fn run_event_dispatcher(
                         // A few events may lack IFINDEX; keep the old
                         // broadcast behaviour for those rare messages.
                         for tx in routes.values() {
-                            if tx.unbounded_send(raw_msg.clone()).is_err() {
+                            if tx
+                                .unbounded_send(WifiEvent::Kernel(
+                                    raw_msg.clone(),
+                                ))
+                                .is_err()
+                            {
                                 log::debug!("wifi event queue closed");
                             }
                         }
                         continue;
                     };
                     if let Some(tx) = routes.get(&if_index)
-                        && tx.unbounded_send(raw_msg).is_err()
+                        && tx.unbounded_send(WifiEvent::Kernel(raw_msg)).is_err()
                     {
                         log::debug!(
                             "wifi event queue closed for if_index {if_index}"
