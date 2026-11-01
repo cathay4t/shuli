@@ -1162,22 +1162,10 @@ impl WifiIface {
                 auth_data.extend_from_slice(&1u16.to_le_bytes());
                 auth_data.extend_from_slice(&confirm);
 
-                let attrs = Nl80211Authenticate::new(self.core.nl.if_index)
-                    .ssid(&self.link.network.ssid)
-                    .mac(self.link.bss_info.bssid)
-                    .frequency(self.link.bss_info.freq_mhz)
-                    .auth_type(Nl80211AuthType::Sae)
-                    .auth_data(auth_data)
-                    .build();
-                if let Err(e) = self.core.nl.authenticate(attrs).await {
-                    log::warn!("send SAE confirm failed: {e}");
-                    self.state = WifiState::Failed;
-                } else {
-                    log::info!("SAE confirm sent");
-                    // The commit exchange is done; only the confirm wait
-                    // remains, which is not retransmitted.
-                    self.auth.sae_commit_sent = false;
-                }
+                // The SAE exchange moved to the Confirmed state: restart
+                // the Sync counter for the confirm's own retransmissions.
+                self.auth.sae_sync = 0;
+                self.send_sae_confirm(auth_data).await;
             }
             AuthAction::SendCommitWithToken(token) => {
                 // the AP demanded an anti-clogging token - re-send
@@ -1229,6 +1217,8 @@ impl WifiIface {
             }
             AuthAction::Complete => {
                 log::info!("SAE completed - sending ASSOCIATE");
+                self.auth.sae_confirm_sent = false;
+                self.auth.sae_confirm_auth_data.clear();
                 let rsne = match self.link.bss_info.security {
                     SecurityType::FtSae => ft_sae_ie_cipher(
                         None,
@@ -1282,9 +1272,35 @@ impl WifiIface {
             self.state = WifiState::Failed;
             return;
         }
+        self.auth.sae_confirm_sent = false;
+        self.auth.sae_confirm_auth_data.clear();
         self.auth.sae_commit_sent = true;
         self.auth.sae_commit_auth_data = auth_data.to_vec();
         log::info!("SAE commit sent");
+    }
+
+    /// Send an SAE confirm via `NL80211_CMD_AUTHENTICATE` and record it so
+    /// a lost confirm can be re-sent on the SAE retransmission timer.
+    /// The caller owns the Sync counter (a first send resets it, a
+    /// retransmission has already incremented it).
+    pub(crate) async fn send_sae_confirm(&mut self, auth_data: Vec<u8>) {
+        let attrs = Nl80211Authenticate::new(self.core.nl.if_index)
+            .ssid(&self.link.network.ssid)
+            .mac(self.link.bss_info.bssid)
+            .frequency(self.link.bss_info.freq_mhz)
+            .auth_type(Nl80211AuthType::Sae)
+            .auth_data(auth_data.clone())
+            .build();
+        if let Err(e) = self.core.nl.authenticate(attrs).await {
+            log::warn!("send SAE confirm failed: {e}");
+            self.state = WifiState::Failed;
+            return;
+        }
+        self.auth.sae_commit_sent = false;
+        self.auth.sae_commit_auth_data.clear();
+        self.auth.sae_confirm_sent = true;
+        self.auth.sae_confirm_auth_data = auth_data;
+        log::info!("SAE confirm sent");
     }
 
     /// the AP rejected the H2E commit (an HnP-only AP); restart the

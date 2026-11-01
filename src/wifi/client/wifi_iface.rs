@@ -839,13 +839,14 @@ impl WifiIface {
                 // lost: re-send the same commit (SAE Sync counter, max 3)
                 // instead of failing over to a full rescan cycle.
                 loop {
-                    let wait_secs = if self.auth.sae_commit_sent
-                        && self.auth.sae_sync < SAE_SYNC_MAX
-                    {
-                        SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS
-                    } else {
-                        AUTH_EVENT_TIMEOUT_SECS
-                    };
+                    let sae_pending =
+                        self.auth.sae_commit_sent || self.auth.sae_confirm_sent;
+                    let wait_secs =
+                        if sae_pending && self.auth.sae_sync < SAE_SYNC_MAX {
+                            SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS
+                        } else {
+                            AUTH_EVENT_TIMEOUT_SECS
+                        };
                     let timed = tokio::time::timeout(
                         std::time::Duration::from_secs(wait_secs),
                         self.core.event_receiver.next(),
@@ -863,21 +864,38 @@ impl WifiIface {
                             ));
                         }
                         Err(_) => {
-                            if self.auth.sae_commit_sent
+                            if (self.auth.sae_commit_sent
+                                || self.auth.sae_confirm_sent)
                                 && self.auth.sae_sync < SAE_SYNC_MAX
                             {
-                                // retransmit the pending SAE commit.
+                                // Retransmit the pending SAE frame: the
+                                // commit while awaiting the AP's commit,
+                                // the confirm while awaiting the AP's
+                                // confirm (802.11-2020 §12.4.8.6.5).
                                 self.auth.sae_sync += 1;
-                                log::info!(
-                                    "SAE commit timed out - retransmitting \
-                                     (sync {}/{})",
-                                    self.auth.sae_sync,
-                                    SAE_SYNC_MAX
-                                );
-                                self.send_sae_commit(
-                                    &self.auth.sae_commit_auth_data.clone(),
-                                )
-                                .await;
+                                if self.auth.sae_commit_sent {
+                                    log::info!(
+                                        "SAE commit timed out - \
+                                         retransmitting (sync {}/{})",
+                                        self.auth.sae_sync,
+                                        SAE_SYNC_MAX
+                                    );
+                                    self.send_sae_commit(
+                                        &self.auth.sae_commit_auth_data.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    log::info!(
+                                        "SAE confirm timed out - \
+                                         retransmitting (sync {}/{})",
+                                        self.auth.sae_sync,
+                                        SAE_SYNC_MAX
+                                    );
+                                    self.send_sae_confirm(
+                                        self.auth.sae_confirm_auth_data.clone(),
+                                    )
+                                    .await;
+                                }
                                 // The retransmission latches
                                 // `WifiState::Failed` when the kernel rejects
                                 // the frame, e.g. `-ENOENT` because mac80211
@@ -894,9 +912,12 @@ impl WifiIface {
                             // Some APs silently drop the H2E commit
                             // instead of answering with a rejection
                             // status.  Retry once with
-                            // hunting-and-pecking before giving up.
-                            if let Some(AuthMethod::Sae(sae)) =
-                                self.auth.method.as_ref()
+                            // hunting-and-pecking before giving up. A
+                            // confirm timeout is not an H2E problem, so
+                            // only fall back while the commit is pending.
+                            if self.auth.sae_commit_sent
+                                && let Some(AuthMethod::Sae(sae)) =
+                                    self.auth.method.as_ref()
                                 && sae.is_h2e()
                                 && sae.hnp_fallback_allowed()
                                 && !self.auth.sae_hnp_attempted

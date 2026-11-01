@@ -407,6 +407,13 @@ pub(crate) struct AuthSession {
     pub(crate) sae_sync: u8,
     /// The last SAE commit auth_data, re-sent verbatim on a timeout.
     pub(crate) sae_commit_auth_data: Vec<u8>,
+    /// SAE confirm retransmission state. `sae_confirm_sent` is true while
+    /// we await the AP's confirm; on a timeout the same confirm is
+    /// re-sent (the t0 retransmission timer of the Confirmed state,
+    /// 802.11-2020 §12.4.8.6.5) instead of failing the whole connection.
+    pub(crate) sae_confirm_sent: bool,
+    /// The last SAE confirm auth_data, re-sent verbatim on a timeout.
+    pub(crate) sae_confirm_auth_data: Vec<u8>,
     /// An H2E commit was rejected and the exchange restarted with
     /// hunting-and-pecking (never retried a second time).
     pub(crate) sae_hnp_attempted: bool,

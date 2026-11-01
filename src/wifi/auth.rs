@@ -325,6 +325,8 @@ impl WifiIface {
         self.auth.sae_commit_sent = false;
         self.auth.sae_sync = 0;
         self.auth.sae_commit_auth_data.clear();
+        self.auth.sae_confirm_sent = false;
+        self.auth.sae_confirm_auth_data.clear();
         self.auth.sae_hnp_attempted = false;
         self.auth.eap_peer = None;
         self.auth.eap_pmk = None;
