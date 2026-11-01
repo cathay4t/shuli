@@ -230,21 +230,22 @@ pub(crate) fn seal_message(
     let mut iv = vec![0u8; iv_len];
     crypto::random_bytes(&mut iv)?;
     let ciphertext = crypto::encrypt(encryption, key_e, &iv, &plaintext, &aad)?;
-    let mut body = iv;
-    body.extend_from_slice(&ciphertext);
-    if integrity != IntegrityAlgorithm::None {
-        let mut signed = Vec::with_capacity(aad.len() + body.len());
-        signed.extend_from_slice(&aad);
-        signed.extend_from_slice(&body);
-        let icv = crypto::integrity(integrity, key_a, &signed)?;
-        body.extend_from_slice(&icv);
-    }
 
+    // RFC 7296 section 3.14: for non-AEAD suites the ICV covers the
+    // entire message except the ICV itself, including the SK generic
+    // header and the IV.  Build that prefix first, authenticate it,
+    // then append the ICV.
     let mut message = aad;
     message.push(payloads.first().map(Payload::payload_type).unwrap_or(0));
     message.push(0);
-    message.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
-    message.extend_from_slice(&body);
+    message
+        .extend_from_slice(&((4 + iv.len() + ciphertext.len() + icv_len) as u16).to_be_bytes());
+    message.extend_from_slice(&iv);
+    message.extend_from_slice(&ciphertext);
+    if integrity != IntegrityAlgorithm::None {
+        let icv = crypto::integrity(integrity, key_a, &message)?;
+        message.extend_from_slice(&icv);
+    }
     if message.len() != total {
         return Err(IpsecError::internal(
             "IKE encrypted message length mismatch",

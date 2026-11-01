@@ -306,6 +306,70 @@ fn encrypted_payload_uses_rfc_7296_padding() {
 }
 
 #[test]
+fn encrypted_payload_icv_covers_the_sk_header() {
+    use crate::{
+        config::{EncryptionAlgorithm, IntegrityAlgorithm},
+        ikev2::sa::{open_message, seal_message},
+    };
+
+    let header = IkeHeader::new(1, 2, ExchangeType::IkeAuth, 0x08, 1);
+    let payloads = vec![Payload::Nonce(vec![0x33; 32])];
+    let encryption = EncryptionAlgorithm::AesCbc128;
+    let integrity = IntegrityAlgorithm::HmacSha2_256_128;
+    let key_e = vec![0x42; encryption.key_len() + encryption.salt_len()];
+    let key_a = vec![0x24; integrity.output_len()];
+
+    let sealed = seal_message(
+        &header,
+        &payloads,
+        encryption,
+        integrity,
+        &key_e,
+        &key_a,
+    )
+    .unwrap();
+    let decoded = codec::Message::decode(&sealed).unwrap();
+    let Payload::Encrypted { next, data } = &decoded.payloads[0] else {
+        panic!("expected an encrypted payload");
+    };
+    let opened = open_message(
+        &decoded.header,
+        &Payload::Encrypted {
+            next: *next,
+            data: data.clone(),
+        },
+        encryption,
+        integrity,
+        &key_e,
+        &key_a,
+    )
+    .unwrap();
+    assert_eq!(opened, payloads);
+
+    // A changed ciphertext byte must invalidate the ICV.
+    let mut tampered = sealed;
+    tampered[48] ^= 1;
+    let decoded = codec::Message::decode(&tampered).unwrap();
+    let Payload::Encrypted { next, data } = &decoded.payloads[0] else {
+        panic!("expected an encrypted payload");
+    };
+    assert!(
+        open_message(
+            &decoded.header,
+            &Payload::Encrypted {
+                next: *next,
+                data: data.clone(),
+            },
+            encryption,
+            integrity,
+            &key_e,
+            &key_a,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn crypto_round_trip_cbc_and_gcm() {
     for algorithm in [
         crate::config::EncryptionAlgorithm::AesCbc128,
