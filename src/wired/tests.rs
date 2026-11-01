@@ -178,7 +178,10 @@ fn run_wired_authenticator() {
         }
 
         if !server.is_handshaking() {
-            // Deliver any remaining server data, then authorize.
+            // RFC 9190 section 2.5: TLS 1.3 sends the protected success
+            // indication as one octet of application data.
+            std::io::Write::write_all(&mut server.writer(), &[0]).unwrap();
+            server.write_tls(&mut tx).unwrap();
             if !tx.is_empty() {
                 let msg = EapPacket::build(
                     CODE_REQUEST,
@@ -197,7 +200,8 @@ fn run_wired_authenticator() {
                 // Client ACKs the final flight.
                 let _ack = recv_wired_auth(&fd);
             }
-            let success = EapPacket::build(CODE_SUCCESS, 3, None, b"");
+            // The identifier matches the last Request, as in hostapd.
+            let success = EapPacket::build(CODE_SUCCESS, 2, None, b"");
             send_eapol_frame(
                 fd.as_raw_fd(),
                 if_index,

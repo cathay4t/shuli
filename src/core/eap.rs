@@ -208,6 +208,10 @@ impl EapPeer {
                     .as_ref()
                     .is_some_and(|method| !method.success_indication_received())
                 {
+                    log::debug!(
+                        "ignoring EAP-Success before the TLS 1.3 protected \
+                         success indication"
+                    );
                     return Ok(EapAction::Wait);
                 }
                 return Ok(EapAction::Success);

@@ -418,6 +418,7 @@ impl EapMethod for EapTlsMethod {
                     }
                 }
                 if plain == [0] {
+                    log::debug!("received TLS 1.3 protected success indication");
                     self.protected_success = true;
                 }
             }
