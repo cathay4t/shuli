@@ -389,8 +389,13 @@ impl EapMethod for EapTlsMethod {
                     break;
                 }
                 self.rx_buf.drain(..used);
+                // rustls requires process_new_packets() after every
+                // successful read_tls() and before the next read: its
+                // deframer buffer is bounded (MAX_WIRE_SIZE), so a
+                // multi-record flight read in one go would otherwise
+                // fail with "message buffer full".
+                conn.process_new_packets().map_err(tls_err)?;
             }
-            conn.process_new_packets().map_err(tls_err)?;
         }
 
         // Collect the TLS records the connection wants to send.

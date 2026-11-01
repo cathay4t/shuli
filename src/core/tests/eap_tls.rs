@@ -449,3 +449,79 @@ fn test_eap_tls_handshake_with_fragmented_server_flights() {
         .expect("server exporter");
     assert_eq!(&client_msk[..], &km[..64]);
 }
+
+/// A single EAP-TLS message carrying more than rustls' deframer buffer
+/// limit must be read and processed incrementally instead of failing
+/// with "message buffer full".
+#[test]
+fn test_large_tls_message_is_read_incrementally() {
+    use std::io::Write;
+
+    let mut client = client_method();
+    let mut server = server_connection();
+    let mut server_tx = Vec::new();
+    let mut first = true;
+    let mut rounds = 0;
+    loop {
+        let request = if first {
+            first = false;
+            vec![EAP_TLS_FLAG_START]
+        } else {
+            build_tls_message(&server_tx)
+        };
+        server_tx.clear();
+        let mut next_request = request;
+        loop {
+            let response = client
+                .handle_request(1, &next_request)
+                .expect("client handshake");
+            let (_, tls_data) =
+                parse_tls_message(&response).expect("parse response");
+            if !tls_data.is_empty() {
+                server.read_tls(&mut Cursor::new(tls_data)).expect("read");
+            }
+            server.process_new_packets().expect("server process");
+            server.write_tls(&mut server_tx).expect("server write");
+            if tls_data.is_empty() || server_tx.is_empty() {
+                break;
+            }
+            next_request = vec![0];
+        }
+        if !server_tx.is_empty() {
+            let request = build_tls_message(&server_tx);
+            server_tx.clear();
+            let response = client
+                .handle_request(1, &request)
+                .expect("server flight");
+            let (_, tls_data) =
+                parse_tls_message(&response).expect("parse response");
+            if !tls_data.is_empty() {
+                server.read_tls(&mut Cursor::new(tls_data)).expect("read");
+                server.process_new_packets().expect("server process");
+            }
+        }
+        rounds += 1;
+        assert!(rounds < 30, "TLS handshake did not converge");
+        if !server.is_handshaking() && client.msk().is_some() {
+            break;
+        }
+    }
+
+    // Application data larger than MAX_WIRE_SIZE (18,437 bytes).
+    let big = vec![0xa5u8; 20_000];
+    server
+        .writer()
+        .write_all(&big)
+        .expect("server write plaintext");
+    server.write_tls(&mut server_tx).expect("server write tls");
+    assert!(
+        server_tx.len() > 19_000,
+        "test flight must exceed the rustls deframer limit"
+    );
+
+    let response = client
+        .handle_request(1, &build_tls_message(&server_tx))
+        .expect("large TLS flight");
+    parse_tls_message(&response).expect("parse response");
+    assert!(client.msk().is_some(), "handshake stays complete");
+}
