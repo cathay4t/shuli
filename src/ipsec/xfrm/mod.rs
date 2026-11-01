@@ -473,31 +473,66 @@ impl XfrmManager {
                     spec,
                     child,
                 )?;
-                policy::add(&self.handle, &out).await?;
+                if let Err(error) = policy::add(&self.handle, &out).await {
+                    self.rollback_policies(installed).await;
+                    return Err(error);
+                }
                 installed.local_policies.push(out);
                 if let Err(error) = policy::add(&self.handle, &in_).await {
-                    for record in &installed.local_policies {
-                        let _ = policy::delete(&self.handle, record).await;
-                    }
-                    installed.local_policies.clear();
+                    self.rollback_policies(installed).await;
                     return Err(error);
                 }
                 installed.remote_policies.push(in_);
 
                 if spec.forward && spec.mode == ChildMode::Tunnel {
-                    let forward = policy::build(
-                        policy::Direction::Forward,
-                        *remote,
-                        *local,
-                        spec,
-                        child,
-                    )?;
-                    policy::add(&self.handle, &forward).await?;
-                    installed.forward_policies.push(forward);
+                    // Forwarded traffic needs both directions: local->remote
+                    // (LAN into the tunnel) and remote->local (tunnel out to
+                    // the LAN).
+                    let forwards = [
+                        policy::build(
+                            policy::Direction::Forward,
+                            *local,
+                            *remote,
+                            spec,
+                            child,
+                        )?,
+                        policy::build(
+                            policy::Direction::Forward,
+                            *remote,
+                            *local,
+                            spec,
+                            child,
+                        )?,
+                    ];
+                    for forward in forwards {
+                        if let Err(error) =
+                            policy::add(&self.handle, &forward).await
+                        {
+                            self.rollback_policies(installed).await;
+                            return Err(error);
+                        }
+                        installed.forward_policies.push(forward);
+                    }
                 }
             }
             Ok(())
         })
+    }
+
+    /// Delete every policy this install attempt added.
+    async fn rollback_policies(&self, installed: &mut InstalledChildSa) {
+        for record in &installed.local_policies {
+            let _ = policy::delete(&self.handle, record).await;
+        }
+        for record in &installed.remote_policies {
+            let _ = policy::delete(&self.handle, record).await;
+        }
+        for record in &installed.forward_policies {
+            let _ = policy::delete(&self.handle, record).await;
+        }
+        installed.local_policies.clear();
+        installed.remote_policies.clear();
+        installed.forward_policies.clear();
     }
 
     fn state_message(
