@@ -543,11 +543,11 @@ fn test_ptk_rekey_fresh_snonce() {
 
     // Initial handshake Message 1.
     let msg2_1 = state.process_message_1(&[0x11u8; 32], 1, 0).unwrap();
-    let ptk_1 = state.ptk.unwrap();
+    let ptk_1 = state.tptk.unwrap();
 
     // PTK rekey: new ANonce, new replay counter.
     let msg2_2 = state.process_message_1(&[0x22u8; 32], 2, 0).unwrap();
-    let ptk_2 = state.ptk.unwrap();
+    let ptk_2 = state.tptk.unwrap();
 
     assert_ne!(ptk_1, ptk_2, "rekey must derive a fresh PTK");
 
@@ -562,6 +562,43 @@ fn test_ptk_rekey_fresh_snonce() {
     assert_eq!(m2.key_mic, mic);
     let m2_1 = Ieee80211EapolKeyFrame::parse(&msg2_1).unwrap();
     assert_eq!(m2_1.replay_counter, 1);
+}
+
+#[test]
+fn test_unverified_msg1_does_not_replace_live_ptk() {
+    let pmk = [0x01u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    let anonce = [0x11u8; 32];
+    state.process_message_1(&anonce, 1, 0).unwrap();
+    let valid = build_msg3(&state, 1, &anonce, false);
+    state.process_message_3(&valid).unwrap();
+    let live_ptk = state.ptk.unwrap();
+    let live_tk = state.tk().unwrap();
+
+    // An unauthenticated Message 1 must not touch the live keys.
+    state.process_message_1(&[0x22u8; 32], 2, 0).unwrap();
+    assert_eq!(state.ptk.unwrap(), live_ptk);
+    assert_eq!(state.tk().unwrap(), live_tk);
+
+    // A Message 3 with a bad MIC must not promote the staged PTK either.
+    let bad = build_msg3(&state, 2, &[0x22u8; 32], true);
+    assert!(state.process_message_3(&bad).is_err());
+    assert_eq!(state.ptk.unwrap(), live_ptk);
+    assert_eq!(state.tk().unwrap(), live_tk);
+
+    // The authentic Message 3 finally promotes it.
+    let good = build_msg3(&state, 2, &[0x22u8; 32], false);
+    state.process_message_3(&good).unwrap();
+    assert_ne!(state.ptk.unwrap(), live_ptk);
 }
 
 /// with OCV enabled, Message 2 carries our OCI KDE and

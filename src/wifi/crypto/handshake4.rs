@@ -47,6 +47,11 @@ pub struct FourWayState {
     pub(crate) anonce: Option<[u8; 32]>,
     snonce: [u8; 32],
     pub(crate) ptk: Option<[u8; PTK_LEN]>,
+    /// PTK derived from the Message 1 being negotiated. It becomes the
+    /// live `ptk` only after Message 3's MIC proves the AP knows the
+    /// PMK, so an unauthenticated/spoofed Message 1 cannot replace the
+    /// keys of an established connection.
+    pub(crate) tptk: Option<[u8; PTK_LEN]>,
     replay_counter: u64,
     replay_counter_set: bool,
     /// Replay counter of the Message 1 currently being negotiated.
@@ -110,6 +115,7 @@ impl FourWayState {
             anonce: None,
             snonce,
             ptk: None,
+            tptk: None,
             replay_counter: 0,
             replay_counter_set: false,
             pending_replay_counter: None,
@@ -154,6 +160,7 @@ impl FourWayState {
             anonce: None,
             snonce,
             ptk: None,
+            tptk: None,
             replay_counter: 0,
             replay_counter_set: false,
             pending_replay_counter: None,
@@ -255,8 +262,14 @@ impl FourWayState {
         }
     }
 
+    /// The key of the handshake currently in progress (staged PTK) or,
+    /// when none is pending, the live PTK.
+    fn handshake_ptk(&self) -> Option<[u8; PTK_LEN]> {
+        self.tptk.or(self.ptk)
+    }
+
     pub fn kck(&self) -> Option<[u8; KCK_LEN]> {
-        self.ptk.map(|p| {
+        self.handshake_ptk().map(|p| {
             let mut k = [0u8; KCK_LEN];
             k.copy_from_slice(&p[..KCK_LEN]);
             k
@@ -264,6 +277,24 @@ impl FourWayState {
     }
 
     pub fn kek(&self) -> Option<[u8; KEK_LEN]> {
+        self.handshake_ptk().map(|p| {
+            let mut k = [0u8; KEK_LEN];
+            k.copy_from_slice(&p[KCK_LEN..KCK_LEN + KEK_LEN]);
+            k
+        })
+    }
+
+    /// KCK of the established PTK (ignores an unverified staged rekey).
+    fn committed_kck(&self) -> Option<[u8; KCK_LEN]> {
+        self.ptk.map(|p| {
+            let mut k = [0u8; KCK_LEN];
+            k.copy_from_slice(&p[..KCK_LEN]);
+            k
+        })
+    }
+
+    /// KEK of the established PTK (ignores an unverified staged rekey).
+    fn committed_kek(&self) -> Option<[u8; KEK_LEN]> {
         self.ptk.map(|p| {
             let mut k = [0u8; KEK_LEN];
             k.copy_from_slice(&p[KCK_LEN..KCK_LEN + KEK_LEN]);
@@ -288,6 +319,7 @@ impl FourWayState {
     /// the group key handshake still needs the KCK/KEK from it.
     pub(crate) fn set_ptk(&mut self, ptk: [u8; PTK_LEN]) {
         self.ptk = Some(ptk);
+        self.tptk = None;
     }
 
     pub fn tk(&self) -> Option<[u8; TK_LEN]> {
@@ -349,7 +381,9 @@ impl FourWayState {
         // 3 (AES-128-CMAC) for FT-PSK (802.11-2020 §12.7.2); hostapd
         // rejects a Message 2 that uses another version.
         self.desc_version = desc_version;
-        self.ptk = Some(self.derive_ptk());
+        // Stage the new PTK; Message 3's MIC is verified with it before
+        // it replaces the live key.
+        self.tptk = Some(self.derive_ptk());
 
         let kck = self.kck().unwrap();
 
@@ -487,6 +521,11 @@ impl FourWayState {
             }
         }
 
+        // Message 3 is authentic: promote the staged PTK.
+        if let Some(tptk) = self.tptk.take() {
+            self.ptk = Some(tptk);
+        }
+
         // Build Message 4 (zeroed MIC) and compute its MIC.
         let mut msg4 = Ieee80211EapolKeyFrame::build_message_4(
             &self.snonce,
@@ -570,7 +609,7 @@ impl FourWayState {
             ));
         }
 
-        let kck = self.kck().ok_or_else(|| {
+        let kck = self.committed_kck().ok_or_else(|| {
             WifiError::new(ErrorKind::HandshakeFailed, "PTK not derived")
         })?;
 
@@ -600,7 +639,7 @@ impl FourWayState {
                 "group rekey carries no key data",
             ));
         }
-        let kek = self.kek().ok_or_else(|| {
+        let kek = self.committed_kek().ok_or_else(|| {
             WifiError::new(ErrorKind::HandshakeFailed, "KEK not derived")
         })?;
         if !frame.is_encrypted_data() {
