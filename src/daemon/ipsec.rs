@@ -158,12 +158,6 @@ async fn apply_child(
         None
     };
 
-    let local_address = lease
-        .local_address
-        .or(config.local.address)
-        .ok_or_else(|| {
-            ipsec_config_error("IPsec local underlay address is unknown")
-        })?;
     let remote_address = lease.remote_address.or_else(|| {
         config
             .peers
@@ -173,6 +167,12 @@ async fn apply_child(
     let remote_address = remote_address.ok_or_else(|| {
         ipsec_config_error("IPsec remote underlay address is unknown")
     })?;
+    // `local.address` is optional: when it is absent, let the kernel
+    // pick the source address of the route to the peer.
+    let local_address = match lease.local_address.or(config.local.address) {
+        Some(address) => address,
+        None => route_source_ip(remote_address)?,
+    };
 
     let install = InstallSpec {
         interface: interface.clone(),
@@ -195,20 +195,52 @@ async fn apply_child(
         .map_err(ipsec_error)?;
 
     let mut routes = Vec::new();
-    if let Some(interface) = &interface {
-        apply_link_addresses(interface, lease).await?;
-        for selector in &lease.remote_selectors {
-            if let Some(route) = add_route(interface.if_index, selector).await?
-            {
-                routes.push(route);
+    let setup = async {
+        if let Some(interface) = &interface {
+            apply_link_addresses(interface, lease).await?;
+            for selector in &lease.remote_selectors {
+                if let Some(route) =
+                    add_route(interface.if_index, selector).await?
+                {
+                    routes.push(route);
+                }
             }
         }
+        Ok::<(), WifiError>(())
+    }
+    .await;
+    if let Err(error) = setup {
+        // The Child SA was installed before the address/route setup:
+        // undo it so a failed apply leaves no untracked XFRM state.
+        if let Some(interface) = &interface {
+            remove_routes(interface.if_index, &routes).await;
+        }
+        let _ = manager.remove(&installed).await;
+        return Err(error);
     }
     Ok(Applied {
         installed,
         interface,
         routes,
     })
+}
+
+/// Source address the kernel would use to reach `remote`.
+fn route_source_ip(remote: IpAddr) -> Result<IpAddr, WifiError> {
+    let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = std::net::UdpSocket::bind(bind).map_err(|e| {
+        ipsec_config_error(&format!("probe local address: {e}"))
+    })?;
+    // Connecting a UDP socket performs a route lookup without sending.
+    socket.connect((remote, 500)).map_err(|e| {
+        ipsec_config_error(&format!("probe local address for {remote}: {e}"))
+    })?;
+    socket
+        .local_addr()
+        .map(|address| address.ip())
+        .map_err(|e| {
+            ipsec_config_error(&format!("probe local address: {e}"))
+        })
 }
 
 async fn remove_child(
@@ -259,11 +291,7 @@ async fn apply_link_addresses(
             if error.to_string().contains("File exists") {
                 continue;
             }
-            log::warn!(
-                "add address {} to {}: {error}",
-                address,
-                interface.name
-            );
+            return Err(netlink_error(error));
         }
     }
     Ok(())
@@ -357,4 +385,20 @@ fn ipsec_config_error(message: impl Into<String>) -> WifiError {
 
 fn netlink_error(error: impl std::fmt::Display) -> WifiError {
     WifiError::new(ErrorKind::Nl80211, error.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn route_source_ip_picks_the_loopback_address() {
+        assert_eq!(
+            route_source_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
 }
