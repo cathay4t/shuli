@@ -668,6 +668,15 @@ pub(crate) struct WifiIface {
     /// authentication attempt is expensive; the parsed result is reused
     /// until the configured EAP settings change.
     pub(crate) eap_tls_config: Option<(EapConfig, EapTlsConfig)>,
+    /// Absolute deadline of the wait currently in flight, tagged with the
+    /// state that armed it.
+    ///
+    /// [`WifiClient::run`](crate::WifiClient::run) polls every interface
+    /// with `select_all`, so one interface completing a state change
+    /// drops the other interfaces' futures mid-wait. Keeping the deadline
+    /// on the interface (rather than in a local of `_run`) lets a resumed
+    /// wait use the remaining time instead of restarting the timer.
+    pub(crate) wait_deadline: Option<(WifiState, std::time::Instant)>,
 }
 
 #[cfg(test)]

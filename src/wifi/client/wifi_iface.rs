@@ -24,6 +24,32 @@ use super::{
 use crate::{BssInfo, ETH_ALEN};
 
 impl WifiIface {
+    /// Remaining time until the current state's wait expires, arming it
+    /// with `wait` when this state has no deadline yet.
+    ///
+    /// The deadline lives on the interface so a cancelled and re-polled
+    /// `run()` future resumes the same timer instead of restarting it.
+    pub(crate) fn wait_remaining(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        match self.wait_deadline {
+            Some((state, deadline)) if state == self.state => {
+                deadline.saturating_duration_since(now)
+            }
+            _ => {
+                self.wait_deadline = Some((self.state, now + wait));
+                wait
+            }
+        }
+    }
+
+    /// Drop the current wait deadline so the next wait arms a fresh one.
+    pub(crate) fn clear_wait_deadline(&mut self) {
+        self.wait_deadline = None;
+    }
+
     /// Pick the first configured network whose hints are complete
     /// enough for a scan-free connection attempt (and, when the network
     /// is pinned to a BSSID, describe that pinned BSS).
@@ -262,6 +288,7 @@ impl WifiIface {
             pmksa_cache: PmksaCache::default(),
             last_error: None,
             eap_tls_config: None,
+            wait_deadline: None,
         };
 
         // Receive WNM action frames (BTM Requests) for roaming.  FullMAC
@@ -718,9 +745,11 @@ impl WifiIface {
                 } else {
                     SCHED_SCAN_WATCHDOG_SECS
                 };
+                let wait = self
+                    .wait_remaining(std::time::Duration::from_secs(wait_secs));
                 let step = tokio::select! {
                     result = tokio::time::timeout(
-                        std::time::Duration::from_secs(wait_secs),
+                        wait,
                         self.core.event_receiver.next(),
                     ) => Some(result),
                     changed = self.resume_rx.changed() => {
@@ -733,11 +762,15 @@ impl WifiIface {
                 let timed = match step {
                     Some(timed) => timed,
                     None => {
+                        self.clear_wait_deadline();
                         self.consume_resume();
                         self.handle_resume().await;
                         return Ok(());
                     }
                 };
+                // The wait completed (event or timeout): the next wait in
+                // this state starts with a fresh deadline.
+                self.clear_wait_deadline();
                 match timed {
                     Ok(Some(WifiEvent::Eapol(frame))) => {
                         self.handle_raw_eapol(frame).await;
@@ -850,14 +883,18 @@ impl WifiIface {
                     } else {
                         AUTH_EVENT_TIMEOUT_SECS
                     };
-                    let timed = tokio::time::timeout(
+                    let wait = self.wait_remaining(
                         std::time::Duration::from_secs(wait_secs),
+                    );
+                    let timed = tokio::time::timeout(
+                        wait,
                         self.core.event_receiver.next(),
                     )
                     .await;
                     match timed {
                         Ok(Some(event)) => {
                             self.handle_wifi_event(event).await;
+                            self.clear_wait_deadline();
                             break;
                         }
                         Ok(None) => {
@@ -867,6 +904,9 @@ impl WifiIface {
                             ));
                         }
                         Err(_) => {
+                            // A new wait (retransmission, fallback or
+                            // failure) starts with a fresh deadline.
+                            self.clear_wait_deadline();
                             if (self.auth.sae_commit_sent
                                 || self.auth.sae_confirm_sent)
                                 && self.auth.sae_sync < SAE_SYNC_MAX
@@ -1011,6 +1051,7 @@ impl WifiIface {
                 );
                 let mut resumed = false;
                 let next = if let Some(wait) = wait {
+                    let wait = self.wait_remaining(wait);
                     tokio::select! {
                         result = tokio::time::timeout(
                             wait,
@@ -1025,6 +1066,7 @@ impl WifiIface {
                         }
                     }
                 } else {
+                    self.clear_wait_deadline();
                     tokio::select! {
                         message = self.core.event_receiver.next() => Ok(message),
                         changed = self.resume_rx.changed() => {
@@ -1036,6 +1078,7 @@ impl WifiIface {
                         }
                     }
                 };
+                self.clear_wait_deadline();
                 if resumed {
                     self.consume_resume();
                     self.handle_resume().await;
@@ -1104,6 +1147,7 @@ impl WifiIface {
                     )
                 };
                 log::info!("{:?}; retrying in {:?}", self.state, wait);
+                let remaining = self.wait_remaining(wait);
                 // Pump events instead of sleeping blindly: the kernel
                 // delivers MLME notifications with considerable lag
                 // (AP deauth/disassoc and the reply to our own
@@ -1111,7 +1155,7 @@ impl WifiIface {
                 // them here, before the next attempt starts, is what
                 // keeps the reconnect flow from tripping over stale
                 // events.
-                let deadline = tokio::time::Instant::now() + wait;
+                let deadline = tokio::time::Instant::now() + remaining;
                 let mut resumed = false;
                 loop {
                     let remaining = deadline
@@ -1149,6 +1193,7 @@ impl WifiIface {
                                 // An event advanced the state machine
                                 // (e.g. a scheduled-scan result); honour
                                 // it instead of running the retry path.
+                                self.clear_wait_deadline();
                                 return Ok(());
                             }
                         }
@@ -1177,6 +1222,8 @@ impl WifiIface {
                                 .min(RETRY_BACKOFF_MAX_SEC);
                     }
                 }
+                // The retry wait is over; the next state arms its own.
+                self.clear_wait_deadline();
                 self.state = WifiState::Init;
             }
         }
@@ -1272,6 +1319,8 @@ impl WifiIface {
     /// `max_sched_scan_ssids` cap. Returns true when a scheduled scan
     /// is now running.
     pub(crate) async fn start_sched_scan(&mut self) -> Result<bool, WifiError> {
+        // A (re)started scheduled scan begins a fresh watchdog/chunk wait.
+        self.clear_wait_deadline();
         if !self.caps.sched_scan_supported {
             return Ok(false);
         }

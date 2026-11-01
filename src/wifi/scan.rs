@@ -410,6 +410,8 @@ impl WifiIface {
     pub(crate) async fn send_out_scan_request(
         &mut self,
     ) -> Result<(), WifiError> {
+        // A fresh scan starts a fresh completion timer.
+        self.clear_wait_deadline();
         // Like wpa_supplicant: probe hidden SSIDs within the driver's
         // per-scan cap and always keep one wildcard entry, so every scan
         // also finds all visible networks. The hidden list rotates across
@@ -504,8 +506,10 @@ impl WifiIface {
     // scan) are fed to the state machine so they are not lost.
     pub(crate) async fn wait_scan_finish(&mut self) {
         log::trace!("Waiting for scan to finish");
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(SCAN_COMPLETE_TIMEOUT_SECS);
+        let wait = self.wait_remaining(std::time::Duration::from_secs(
+            SCAN_COMPLETE_TIMEOUT_SECS,
+        ));
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             let remaining =
                 deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -531,6 +535,7 @@ impl WifiIface {
                                 } else {
                                     log::debug!("scan finished");
                                 }
+                                self.clear_wait_deadline();
                                 return;
                             }
                             other => {
@@ -542,6 +547,7 @@ impl WifiIface {
                                     // machine drive on instead of
                                     // waiting for results that no
                                     // longer matter.
+                                    self.clear_wait_deadline();
                                     return;
                                 }
                             }
@@ -557,6 +563,7 @@ impl WifiIface {
                 Err(_) => break, // event timeout; proceed to the results dump
             }
         }
+        self.clear_wait_deadline();
     }
 
     /// Dump the scan results and keep the strongest BSS matching any of
