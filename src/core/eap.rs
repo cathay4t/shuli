@@ -120,6 +120,13 @@ pub trait EapMethod: Send {
 
     /// The 64-octet MSK once the method completed, `None` before.
     fn msk(&self) -> Option<[u8; MSK_LEN]>;
+
+    /// Whether the method's TLS 1.3 protected success indication (RFC
+    /// 9190 section 2.5) has been received. Methods without one return
+    /// true.
+    fn success_indication_received(&self) -> bool {
+        true
+    }
 }
 
 /// What the caller should do after feeding a packet to
@@ -194,6 +201,15 @@ impl EapPeer {
                 return Ok(EapAction::Wait);
             }
             if packet.is_success() {
+                // RFC 9190: with TLS 1.3 an EAP-Success is only valid
+                // after the protected success indication.
+                if self
+                    .method
+                    .as_ref()
+                    .is_some_and(|method| !method.success_indication_received())
+                {
+                    return Ok(EapAction::Wait);
+                }
                 return Ok(EapAction::Success);
             }
             return Ok(EapAction::Failure);

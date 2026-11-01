@@ -11,7 +11,7 @@
 use std::{io::Cursor, sync::Arc};
 
 use rustls::{
-    ClientConfig, ClientConnection, RootCertStore,
+    ClientConfig, ClientConnection, ProtocolVersion, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
 };
 
@@ -198,6 +198,9 @@ pub struct EapTlsMethod {
     tx_total: usize,
     max_tls_fragment: usize,
     msk: Option<[u8; MSK_LEN]>,
+    /// TLS 1.3 protected success indication (application data 0x00)
+    /// received (RFC 9190 section 2.5).
+    protected_success: bool,
 }
 
 impl EapTlsMethod {
@@ -219,6 +222,7 @@ impl EapTlsMethod {
             tx_total: 0,
             max_tls_fragment: 1200,
             msk: None,
+            protected_success: false,
         })
     }
 
@@ -395,6 +399,27 @@ impl EapMethod for EapTlsMethod {
                 // multi-record flight read in one go would otherwise
                 // fail with "message buffer full".
                 conn.process_new_packets().map_err(tls_err)?;
+                // RFC 9190 section 2.5: TLS 1.3 sends a one-octet
+                // protected success indication as application data.
+                let mut plain = Vec::new();
+                let mut reader = conn.reader();
+                loop {
+                    let mut buf = [0u8; 64];
+                    match std::io::Read::read(&mut reader, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => plain.extend_from_slice(&buf[..n]),
+                        Err(e)
+                            if e.kind()
+                                == std::io::ErrorKind::WouldBlock =>
+                        {
+                            break;
+                        }
+                        Err(e) => return Err(tls_err(e)),
+                    }
+                }
+                if plain == [0] {
+                    self.protected_success = true;
+                }
             }
         }
 
@@ -425,5 +450,12 @@ impl EapMethod for EapTlsMethod {
 
     fn msk(&self) -> Option<[u8; MSK_LEN]> {
         self.msk
+    }
+
+    fn success_indication_received(&self) -> bool {
+        match self.conn.as_ref().and_then(|conn| conn.protocol_version()) {
+            Some(ProtocolVersion::TLSv1_3) => self.protected_success,
+            _ => true,
+        }
     }
 }

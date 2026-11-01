@@ -343,9 +343,32 @@ fn test_eap_peer_full_tls_exchange() {
         }
     }
 
-    // 3. EAP-Success authorizes the port. Its identifier matches the
-    // last Request (the EAP-TLS exchange above uses identifier 2).
+    // 3. TLS 1.3 protected success indication (RFC 9190 section 2.5):
+    // EAP-Success before it must be ignored.
     let success = EapPacket::build(CODE_SUCCESS, 2, None, b"");
+    assert_eq!(
+        peer.handle_packet(&EapPacket::parse(&success).unwrap())
+            .unwrap(),
+        EapAction::Wait
+    );
+    std::io::Write::write_all(&mut server.writer(), &[0])
+        .expect("write protected success");
+    server.write_tls(&mut server_tx).expect("server write tls");
+    if !server_tx.is_empty() {
+        let request = EapPacket::build(
+            CODE_REQUEST,
+            2,
+            Some(TYPE_TLS),
+            &build_tls_message(&server_tx),
+        );
+        let action = peer
+            .handle_packet(&EapPacket::parse(&request).unwrap())
+            .unwrap();
+        assert!(matches!(action, EapAction::Respond(_)));
+    }
+
+    // EAP-Success authorizes the port. Its identifier matches the last
+    // Request (the EAP-TLS exchange above uses identifier 2).
     let action = peer
         .handle_packet(&EapPacket::parse(&success).unwrap())
         .unwrap();
