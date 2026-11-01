@@ -33,21 +33,13 @@ impl WifiIface {
         &mut self,
         wait: std::time::Duration,
     ) -> std::time::Duration {
-        let now = std::time::Instant::now();
-        match self.wait_deadline {
-            Some((state, deadline)) if state == self.state => {
-                deadline.saturating_duration_since(now)
-            }
-            _ => {
-                self.wait_deadline = Some((self.state, now + wait));
-                wait
-            }
-        }
+        self.wait_deadline
+            .remaining(std::time::Instant::now(), self.state, wait)
     }
 
     /// Drop the current wait deadline so the next wait arms a fresh one.
     pub(crate) fn clear_wait_deadline(&mut self) {
-        self.wait_deadline = None;
+        self.wait_deadline.clear();
     }
 
     /// Pick the first configured network whose hints are complete
@@ -288,7 +280,7 @@ impl WifiIface {
             pmksa_cache: PmksaCache::default(),
             last_error: None,
             eap_tls_config: None,
-            wait_deadline: None,
+            wait_deadline: Default::default(),
         };
 
         // Receive WNM action frames (BTM Requests) for roaming.  FullMAC
@@ -1641,6 +1633,9 @@ impl WifiIface {
 
         self.core.config.networks = networks;
         self.scan.reset_rotation();
+        // The in-flight attempt is being abandoned; do not let its wait
+        // deadline survive into the next attempt.
+        self.clear_wait_deadline();
 
         if connected {
             log::info!(

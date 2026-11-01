@@ -669,24 +669,117 @@ pub(crate) struct WifiIface {
     /// until the configured EAP settings change.
     pub(crate) eap_tls_config: Option<(EapConfig, EapTlsConfig)>,
     /// Absolute deadline of the wait currently in flight, tagged with the
-    /// state that armed it.
+    /// state and duration that armed it.
     ///
     /// [`WifiClient::run`](crate::WifiClient::run) polls every interface
     /// with `select_all`, so one interface completing a state change
     /// drops the other interfaces' futures mid-wait. Keeping the deadline
     /// on the interface (rather than in a local of `_run`) lets a resumed
     /// wait use the remaining time instead of restarting the timer.
-    pub(crate) wait_deadline: Option<(WifiState, std::time::Instant)>,
+    pub(crate) wait_deadline: WaitDeadline,
+}
+
+/// The deadline of the wait a `run()` future is currently blocked on.
+///
+/// The deadline is only reused when the same state asks for the same
+/// duration again (i.e. the cancelled future was waiting on the same
+/// logical timer). A different wait in the same state - for example a
+/// resume shortening a retry backoff, or a SAE retransmit timer
+/// replacing the generic authentication timeout - arms a fresh one.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WaitDeadline(Option<WaitArm>);
+
+#[derive(Debug, Clone, Copy)]
+struct WaitArm {
+    state: WifiState,
+    duration: std::time::Duration,
+    deadline: std::time::Instant,
+}
+
+impl WaitDeadline {
+    /// Remaining time until the armed deadline, arming `wait` when this
+    /// is a different wait.
+    pub(crate) fn remaining(
+        &mut self,
+        now: std::time::Instant,
+        state: WifiState,
+        wait: std::time::Duration,
+    ) -> std::time::Duration {
+        if let Some(arm) = self.0
+            && arm.state == state
+            && arm.duration == wait
+        {
+            return arm.deadline.saturating_duration_since(now);
+        }
+        self.0 = Some(WaitArm {
+            state,
+            duration: wait,
+            deadline: now + wait,
+        });
+        wait
+    }
+
+    /// Drop the current deadline so the next wait arms a fresh one.
+    pub(crate) fn clear(&mut self) {
+        self.0 = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BssidIgnoreList, NetworkUpdate, ResumeAction, RoamEngine, WifiState,
-        bssid_ignore_timeout_secs, connection_is_live, network_update_action,
-        pmksa_stale_ssids, resume_action,
+        BssidIgnoreList, NetworkUpdate, ResumeAction, RoamEngine, WaitDeadline,
+        WifiState, bssid_ignore_timeout_secs, connection_is_live,
+        network_update_action, pmksa_stale_ssids, resume_action,
     };
     use crate::{EapConfig, NetworkConfig};
+
+    #[test]
+    fn wait_deadline_reuses_only_the_same_wait() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut deadline = WaitDeadline::default();
+        let backoff = Duration::from_secs(300);
+        assert_eq!(
+            deadline.remaining(start, WifiState::Failed, backoff),
+            backoff
+        );
+        // A cancelled and resumed identical wait keeps its remaining time.
+        assert_eq!(
+            deadline.remaining(
+                start + Duration::from_secs(2),
+                WifiState::Failed,
+                backoff
+            ),
+            Duration::from_secs(298)
+        );
+        // A resume fast-retry is a different wait: it must not inherit
+        // the long backoff.
+        let fast = Duration::from_millis(100);
+        assert_eq!(
+            deadline.remaining(start + Duration::from_secs(2), WifiState::Failed, fast),
+            fast
+        );
+        // Same duration, different state: fresh arm.
+        assert_eq!(
+            deadline.remaining(
+                start + Duration::from_secs(2),
+                WifiState::Authenticating,
+                fast
+            ),
+            fast
+        );
+        deadline.clear();
+        assert_eq!(
+            deadline.remaining(
+                start + Duration::from_secs(2),
+                WifiState::Authenticating,
+                fast
+            ),
+            fast
+        );
+    }
 
     fn network(ssid: &str) -> NetworkConfig {
         NetworkConfig::new(ssid)
