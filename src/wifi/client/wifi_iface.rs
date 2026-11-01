@@ -258,6 +258,7 @@ impl WifiIface {
             ft: None,
             pending_ft_msg1: None,
             stale_connect_failure: false,
+            ptk_rekey: false,
         };
         let last_resume = *resume_rx.borrow();
 

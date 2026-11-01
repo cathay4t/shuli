@@ -381,6 +381,10 @@ pub(crate) struct Link {
     /// already-handled response must not tear down the recovery attempt
     /// the fallback started.
     pub(crate) stale_connect_failure: bool,
+    /// The 4-way handshake in flight is an AP-initiated PTK rekey of the
+    /// established link, not a new authentication. Its Message 3 must not
+    /// refresh the PMKSA lifetime.
+    pub(crate) ptk_rekey: bool,
 }
 
 /// Per-attempt pre-association and key-derivation state. Reset at the
@@ -525,6 +529,7 @@ impl Link {
         self.ft = None;
         self.pending_ft_msg1 = None;
         self.stale_connect_failure = false;
+        self.ptk_rekey = false;
     }
 }
 
@@ -728,11 +733,28 @@ impl WaitDeadline {
 #[cfg(test)]
 mod tests {
     use super::{
-        BssidIgnoreList, NetworkUpdate, ResumeAction, RoamEngine, WaitDeadline,
-        WifiState, bssid_ignore_timeout_secs, connection_is_live,
+        BssidIgnoreList, Link, NetworkUpdate, ResumeAction, RoamEngine,
+        WaitDeadline, WifiState, bssid_ignore_timeout_secs, connection_is_live,
         network_update_action, pmksa_stale_ssids, resume_action,
     };
-    use crate::{EapConfig, NetworkConfig};
+    use crate::{BssInfo, EapConfig, NetworkConfig};
+
+    #[test]
+    fn reset_for_update_clears_the_ptk_rekey_marker() {
+        let mut link = Link {
+            network: network("A"),
+            bss_info: BssInfo::default(),
+            assoc_wpa_ie: Vec::new(),
+            fourway: None,
+            pmksa_in_use: None,
+            ft: None,
+            pending_ft_msg1: None,
+            stale_connect_failure: false,
+            ptk_rekey: true,
+        };
+        link.reset_for_update(network("B"));
+        assert!(!link.ptk_rekey);
+    }
 
     #[test]
     fn wait_deadline_reuses_only_the_same_wait() {

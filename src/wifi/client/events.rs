@@ -1421,6 +1421,9 @@ impl WifiIface {
                 return;
             }
 
+            // A Message 1 that finds an existing 4-way state is an
+            // AP-initiated PTK rekey of the live link.
+            self.link.ptk_rekey = self.link.fourway.is_some();
             if self.link.fourway.is_none() {
                 if self.link.bss_info.security.is_ft() {
                     // Initial association with an FT AKM: the 4-way
@@ -1894,9 +1897,14 @@ impl WifiIface {
                 }
             }
 
-            // the handshake proved the PMK - cache the PMKSA for the
+            // The handshake proved the PMK - cache the PMKSA for the
             // next reconnect/roam (and hand it to the driver's cache).
-            self.cache_pmksa().await;
+            // A PTK rekey of the live link must not extend its lifetime.
+            if self.link.ptk_rekey {
+                log::debug!("PTK rekey: keeping the existing PMKSA lifetime");
+            } else {
+                self.cache_pmksa().await;
+            }
 
             // FullMAC CONNECT requests carry NL80211_ATTR_CONTROL_PORT,
             // which keeps the data port closed until userspace authorizes

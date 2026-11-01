@@ -312,6 +312,7 @@ impl WifiIface {
     ) -> Result<(), WifiError> {
         self.auth.method = None;
         self.link.fourway = None;
+        self.link.ptk_rekey = false;
         // A new connection attempt starts a fresh SAE/PSK exchange, so the
         // previous attempt's FT key hierarchy (PMK-R0/R1, derived from the
         // old PMK) is invalid. Keeping it would let an early 4-way Message 1
