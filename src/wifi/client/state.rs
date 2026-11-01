@@ -204,6 +204,14 @@ pub(crate) fn connection_is_live(
 /// `kernel_associated` is `Some(true)` when the kernel still has a
 /// station entry, `Some(false)` when it does not, and `None` when the
 /// state could not be queried.
+/// Whether a kernel association/connect success applies to the current
+/// attempt. A result that arrives after the attempt was abandoned (e.g.
+/// a network update reset the state machine) must not be applied to the
+/// new link.
+pub(crate) fn association_result_applies(state: WifiState) -> bool {
+    state == WifiState::Authenticating
+}
+
 pub(crate) fn resume_action(
     state: WifiState,
     kernel_associated: Option<bool>,
@@ -754,6 +762,21 @@ mod tests {
         };
         link.reset_for_update(network("B"));
         assert!(!link.ptk_rekey);
+    }
+
+    #[test]
+    fn association_results_only_apply_while_authenticating() {
+        assert!(super::association_result_applies(
+            WifiState::Authenticating
+        ));
+        for state in [
+            WifiState::Init,
+            WifiState::Scanning,
+            WifiState::Failed,
+            WifiState::ConnectedWithOffloadRekey,
+        ] {
+            assert!(!super::association_result_applies(state), "{state:?}");
+        }
     }
 
     #[test]

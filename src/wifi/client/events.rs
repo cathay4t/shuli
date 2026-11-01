@@ -18,6 +18,7 @@ use super::{
     Nl80211Authenticate, Nl80211Event, Nl80211EventMsg, Nl80211Key,
     Nl80211KeyDefaultType, Nl80211RekeyOffload, OweAuth,
     RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError, WifiEvent,
+    association_result_applies,
     WifiIface, WifiState, fatal_disconnect_error, fmt_transition_disable,
     is_fatal_disconnect_reason, owe, wowlan_wakeup_requires_reconnect,
 };
@@ -548,6 +549,13 @@ impl WifiIface {
                     log::debug!("ASSOCIATE event ignored in FullMAC mode");
                     return;
                 }
+                if !association_result_applies(self.state) {
+                    log::debug!(
+                        "stale ASSOCIATE result in state {:?}; ignored",
+                        self.state
+                    );
+                    return;
+                }
                 let status = event.status;
                 let ies = event.ies;
                 if self.roam.ft_roam.is_some() {
@@ -606,6 +614,13 @@ impl WifiIface {
                     std::mem::take(&mut self.link.stale_connect_failure);
                 if self.caps.mlme == MlmeMode::FullMac {
                     if status == Ieee80211StatusCode::Success {
+                        if !association_result_applies(self.state) {
+                            log::debug!(
+                                "stale CONNECT result in state {:?}; ignored",
+                                self.state
+                            );
+                            return;
+                        }
                         // The driver may rewrite the association request
                         // IEs; use the actual RSNE in the 4-way Message 2.
                         if let Some(req_ie) = event.req_ie.as_deref()
