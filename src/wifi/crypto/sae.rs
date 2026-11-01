@@ -177,11 +177,26 @@ impl SaeAuth {
         self.hnp_fallback
     }
 
-    /// Generate our commit (scalar + element) using the given RNG.
+    /// Generate our commit (scalar + element) using the given RNG,
+    /// returning them as freshly allocated byte vectors. Production
+    /// callers that only need the commit bytes should use
+    /// [`generate_commit`](Self::generate_commit), which leaves the
+    /// values in `own_scalar_bytes`/`own_elem_bytes` without allocating.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_commit(
         &mut self,
         rng: &mut impl TryRng,
     ) -> Result<(Vec<u8>, Vec<u8>), WifiError> {
+        self.generate_commit(rng)?;
+        Ok((self.own_scalar_bytes.to_vec(), self.own_elem_bytes.to_vec()))
+    }
+
+    /// Generate our commit (scalar + element) using the given RNG and
+    /// store the serialized scalars for repeated use.
+    fn generate_commit(
+        &mut self,
+        rng: &mut impl TryRng,
+    ) -> Result<(), WifiError> {
         let mut rand = Scalar::try_random(&mut *rng).map_err(|e| {
             WifiError::new(ErrorKind::SaeFailed, format!("rng failure: {e}"))
         })?;
@@ -220,7 +235,7 @@ impl SaeAuth {
         self.own_scalar_bytes = scalar_bytes;
         self.own_elem_bytes = elem_bytes;
 
-        Ok((scalar_bytes.to_vec(), elem_bytes.to_vec()))
+        Ok(())
     }
 
     /// Process peer's commit (scalar + element). Derives KCK/PMK/PMKID and
@@ -440,14 +455,13 @@ impl SaeAuth {
     /// (success) for hunting-and-pecking, and the body is:
     ///   group(2 LE) || scalar(32) || element(64)
     pub(crate) fn build_init_auth_msg(&mut self) -> Vec<u8> {
-        let (scalar, element) = self
-            .build_commit(&mut getrandom::SysRng)
+        self.generate_commit(&mut getrandom::SysRng)
             .expect("OS random number generator failure");
         build_commit_auth_data(
             self.h2e,
             self.group_id(),
-            &scalar,
-            &element,
+            &self.own_scalar_bytes,
+            &self.own_elem_bytes,
             None,
             self.password_id.as_deref().map(str::as_bytes),
             self.akm_selector,
@@ -470,7 +484,7 @@ impl SaeAuth {
             ));
         }
         if self.own_scalar_bytes == [0u8; 32] {
-            self.build_commit(&mut getrandom::SysRng)?;
+            self.generate_commit(&mut getrandom::SysRng)?;
         }
         Ok(build_commit_auth_data(
             self.h2e,

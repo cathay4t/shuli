@@ -883,10 +883,10 @@ impl WifiIface {
                                         self.auth.sae_sync,
                                         SAE_SYNC_MAX
                                     );
-                                    self.send_sae_commit(
-                                        &self.auth.sae_commit_auth_data.clone(),
-                                    )
-                                    .await;
+                                    let auth_data = std::mem::take(
+                                        &mut self.auth.sae_commit_auth_data,
+                                    );
+                                    self.send_sae_commit(auth_data).await;
                                 } else {
                                     log::info!(
                                         "SAE confirm timed out - \
@@ -894,10 +894,10 @@ impl WifiIface {
                                         self.auth.sae_sync,
                                         SAE_SYNC_MAX
                                     );
-                                    self.send_sae_confirm(
-                                        self.auth.sae_confirm_auth_data.clone(),
-                                    )
-                                    .await;
+                                    let auth_data = std::mem::take(
+                                        &mut self.auth.sae_confirm_auth_data,
+                                    );
+                                    self.send_sae_confirm(auth_data).await;
                                 }
                                 // The retransmission latches
                                 // `WifiState::Failed` when the kernel rejects
