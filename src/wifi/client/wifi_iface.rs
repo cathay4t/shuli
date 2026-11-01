@@ -841,12 +841,15 @@ impl WifiIface {
                 loop {
                     let sae_pending =
                         self.auth.sae_commit_sent || self.auth.sae_confirm_sent;
-                    let wait_secs =
-                        if sae_pending && self.auth.sae_sync < SAE_SYNC_MAX {
-                            SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS
-                        } else {
-                            AUTH_EVENT_TIMEOUT_SECS
-                        };
+                    let wait_secs = if sae_pending {
+                        // Keep the retransmission cadence for the last
+                        // pending frame too, so exhausting Sync is detected
+                        // after one final t0 period instead of the generic
+                        // 15 s authentication timeout.
+                        SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS
+                    } else {
+                        AUTH_EVENT_TIMEOUT_SECS
+                    };
                     let timed = tokio::time::timeout(
                         std::time::Duration::from_secs(wait_secs),
                         self.core.event_receiver.next(),

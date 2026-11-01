@@ -110,10 +110,11 @@ const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const ROAM_SIGNAL_CHECK_SECS: u64 = 5;
 /// SAE retransmission period (seconds): 802.11-2020 §12.4.8.6.2 sets
 /// the t0 (retransmission) timer to `dot11RSNASAERetransPeriod`, whose
-/// MIB default is 2000 ms (iwd uses the same 2 s). While the SAE
-/// commit is in flight, a lost frame - or a rejection with a temporary
-/// status (see §12.4.8.6.4) - is answered with a retransmission after
-/// this period instead of the full `AUTH_EVENT_TIMEOUT_SECS` + rescan.
+/// MIB default is 2000 ms (iwd uses the same 2 s). While an SAE commit
+/// or confirm is in flight, a lost frame - or a rejection with a
+/// temporary status (see §12.4.8.6.4) - is answered with a
+/// retransmission after this period instead of the full
+/// `AUTH_EVENT_TIMEOUT_SECS` + rescan.
 const SAE_COMMIT_RETRANSMIT_TIMEOUT_SECS: u64 = 2;
 /// maximum SAE Sync counter (commit retransmissions), matching
 /// iwd's `SAE_SYNC_MAX` of 3.
