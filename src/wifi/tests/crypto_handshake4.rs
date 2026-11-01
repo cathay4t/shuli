@@ -288,7 +288,7 @@ fn test_group_rekey() {
     Ieee80211EapolKeyFrame::set_mic(&mut g1, &g1_mic);
 
     let parsed = Ieee80211EapolKeyFrame::parse(&g1).unwrap();
-    let msg2 = state.process_group_rekey(&parsed).unwrap();
+    let (msg2, _kdes) = state.process_group_rekey(&parsed).unwrap();
 
     assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
     assert_eq!(state.gtk_index(), 2);
@@ -299,6 +299,69 @@ fn test_group_rekey() {
         aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&msg2))
             .unwrap();
     assert_eq!(m2.key_mic, m2_mic);
+}
+
+#[test]
+fn test_group_rekey_returns_management_keys() {
+    let pmk = [0x11u8; 32];
+    let mut state = FourWayState::new_with_ap_ies(
+        &pmk,
+        MicAlg::AesCmac,
+        [0x03u8; 6],
+        [0x04u8; 6],
+        vec![],
+        vec![],
+        vec![],
+    );
+    state.anonce = Some([0x05u8; 32]);
+    state.ptk = Some(state.derive_ptk());
+    let kck = state.kck().unwrap();
+    let kek = state.kek().unwrap();
+
+    let gtk = [0x99u8; 16];
+    let igtk = [0x77u8; 16];
+    let bigtk = [0x66u8; 16];
+    let ipn = [1, 2, 3, 4, 5, 6];
+    let mut plain = vec![
+        0xDD,
+        (6 + gtk.len()) as u8,
+        0x00,
+        0x0F,
+        0xAC,
+        0x01,
+        0x02,
+        0x00,
+    ];
+    plain.extend_from_slice(&gtk);
+    plain.extend_from_slice(&build_mgmt_key_kde(9, 5, &ipn, &igtk));
+    plain.extend_from_slice(&build_mgmt_key_kde(14, 6, &ipn, &bigtk));
+    while !plain.len().is_multiple_of(8) {
+        plain.push(0);
+    }
+    let wrapped = aes_key_wrap(&kek, &plain).unwrap();
+    let key_info = 0x0100 | 0x0080 | 0x0200 | 0x1000;
+    let mut g1 = Ieee80211EapolKeyFrame::build(
+        key_info,
+        16,
+        5,
+        &[0u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        &wrapped,
+    );
+    let g1_mic =
+        aes_cmac(&kck, &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&g1))
+            .unwrap();
+    Ieee80211EapolKeyFrame::set_mic(&mut g1, &g1_mic);
+    let parsed = Ieee80211EapolKeyFrame::parse(&g1).unwrap();
+
+    let (_, kdes) = state.process_group_rekey(&parsed).unwrap();
+    assert_eq!(kdes.igtk.as_ref().unwrap().key, igtk.to_vec());
+    assert_eq!(kdes.igtk.as_ref().unwrap().key_index, 5);
+    assert_eq!(kdes.bigtk.as_ref().unwrap().key, bigtk.to_vec());
+    assert_eq!(kdes.bigtk.as_ref().unwrap().key_index, 6);
 }
 
 #[test]
@@ -367,7 +430,7 @@ fn test_ft_state_with_precomputed_ptk_processes_group_rekey() {
     Ieee80211EapolKeyFrame::set_mic(&mut g1, &g1_mic);
 
     let parsed = Ieee80211EapolKeyFrame::parse(&g1).unwrap();
-    let msg2 = state.process_group_rekey(&parsed).unwrap();
+    let (msg2, _kdes) = state.process_group_rekey(&parsed).unwrap();
 
     assert_eq!(state.gtk(), Some(new_gtk.as_slice()));
     assert_eq!(state.gtk_index(), 2);

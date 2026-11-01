@@ -1836,6 +1836,7 @@ impl WifiIface {
                             gtk_data.to_vec(),
                             *gtk_idx,
                         )
+                        .seq(parsed.key_rsc[..6].to_vec())
                         .build(),
                     )
                     .await
@@ -1961,7 +1962,7 @@ impl WifiIface {
             // Group key handshake: GTK rekey while connected.
             log::info!("group key handshake: rekey (Message 1)");
 
-            let msg2 = {
+            let (msg2, kdes) = {
                 let fw = match self.link.fourway.as_mut() {
                     Some(fw) => fw,
                     None => {
@@ -1972,7 +1973,7 @@ impl WifiIface {
                     }
                 };
                 match fw.process_group_rekey(&parsed) {
-                    Ok(msg2) => msg2,
+                    Ok(result) => result,
                     Err(e) => {
                         log::warn!("process_group_rekey failed: {e}");
                         return;
@@ -1989,20 +1990,19 @@ impl WifiIface {
             }
             log::info!("group key handshake: Message 2 sent");
 
-            let (gtk_data, gtk_idx) = match self.link.fourway.as_ref() {
-                Some(fw) => (fw.gtk().map(|g| g.to_vec()), fw.gtk_index()),
-                None => (None, 0),
-            };
-            if let Some(gtk_data) = gtk_data {
+            if let Some((gtk_idx, gtk_data)) = &kdes.gtk {
+                // Start the new GTK's replay window at the AP's RSC.
+                let seq = parsed.key_rsc[..6].to_vec();
                 if let Err(e) = self
                     .core
                     .nl
                     .new_key(
                         Nl80211Key::new_gtk(
                             self.core.nl.if_index,
-                            gtk_data,
-                            gtk_idx,
+                            gtk_data.to_vec(),
+                            *gtk_idx,
                         )
+                        .seq(seq)
                         .build(),
                     )
                     .await
@@ -2010,6 +2010,52 @@ impl WifiIface {
                     log::warn!("install rekeyed GTK failed: {e}");
                 } else {
                     log::info!("GTK[{gtk_idx}] rekeyed");
+                }
+            }
+
+            // A group rekey may also rotate the management keys.
+            if let Some(ref igtk) = kdes.igtk {
+                match self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_igtk(
+                            self.core.nl.if_index,
+                            igtk.key.clone(),
+                            igtk.key_index,
+                            igtk.ipn.to_vec(),
+                        )
+                        .cipher(self.link.bss_info.group_mgmt_cipher)
+                        .build(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        log::info!("IGTK[{}] rekeyed", igtk.key_index)
+                    }
+                    Err(e) => log::warn!("install rekeyed IGTK failed: {e}"),
+                }
+            }
+            if let Some(ref bigtk) = kdes.bigtk {
+                match self
+                    .core
+                    .nl
+                    .new_key(
+                        Nl80211Key::new_bigtk(
+                            self.core.nl.if_index,
+                            bigtk.key.clone(),
+                            bigtk.key_index,
+                            bigtk.ipn.to_vec(),
+                        )
+                        .cipher(self.link.bss_info.group_mgmt_cipher)
+                        .build(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        log::info!("BIGTK[{}] rekeyed", bigtk.key_index)
+                    }
+                    Err(e) => log::warn!("install rekeyed BIGTK failed: {e}"),
                 }
             }
 

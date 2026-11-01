@@ -330,10 +330,12 @@ impl FourWayState {
         })
     }
 
+    #[cfg(test)]
     pub fn gtk(&self) -> Option<&[u8]> {
         self.gtk.as_deref()
     }
 
+    #[cfg(test)]
     pub fn gtk_index(&self) -> u8 {
         self.gtk_index
     }
@@ -596,7 +598,7 @@ impl FourWayState {
     pub fn process_group_rekey(
         &mut self,
         frame: &Ieee80211EapolKeyFrame,
-    ) -> Result<Vec<u8>, WifiError> {
+    ) -> Result<(Vec<u8>, Ieee80211KeyDataKdes), WifiError> {
         // 802.11-2020 §12.7.7.1: replay counter must be strictly greater
         // than the last accepted value.
         if frame.replay_counter <= self.replay_counter {
@@ -654,14 +656,14 @@ impl FourWayState {
             crate::crypto::ocv::verify_oci(&plain, self.freq_mhz)?;
         }
         let kdes = parse_key_data_kdes(&plain);
-        let (idx, gtk) = kdes.gtk.ok_or_else(|| {
+        let (idx, gtk) = kdes.gtk.as_ref().ok_or_else(|| {
             WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "no GTK KDE in group rekey",
             )
         })?;
-        self.gtk_index = idx;
-        self.gtk = Some(gtk);
+        self.gtk_index = *idx;
+        self.gtk = Some(gtk.clone());
 
         // Build Group Message 2 (zeroed MIC) and compute its MIC.
         let mut msg2 = Ieee80211EapolKeyFrame::build_group_message_2(
@@ -675,7 +677,7 @@ impl FourWayState {
         )?;
         Ieee80211EapolKeyFrame::set_mic(&mut msg2, &mic);
 
-        Ok(msg2)
+        Ok((msg2, kdes))
     }
 }
 
