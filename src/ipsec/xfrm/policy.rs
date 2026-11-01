@@ -75,11 +75,11 @@ pub(crate) fn build(
         0
     };
 
-    let if_id = if spec.interface.is_some() && spec.mode == ChildMode::Tunnel {
-        spec.if_id
-    } else {
-        0
-    };
+    // The SA carries this if_id whenever it is non-zero (see
+    // state::build); the policy must match it or the kernel never binds
+    // the negotiated SA to the selector.  This matters for transport
+    // mode too, where there is no XFRM interface.
+    let if_id = spec.if_id;
 
     let info = UserPolicyInfo {
         selector,
@@ -193,5 +193,101 @@ fn common_prefix_len(start: &IpAddr, end: &IpAddr) -> u8 {
             }
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::Ipv4Addr, time::Duration};
+
+    use super::*;
+    use crate::config::{EncryptionAlgorithm, IpNet};
+
+    fn child() -> ChildSaHandle {
+        ChildSaHandle {
+            local_spi: 1,
+            remote_spi: 2,
+            encryption: EncryptionAlgorithm::AesGcm16_128,
+            integrity: None,
+            esn: false,
+            mode: ChildMode::Transport,
+            local_selectors: Vec::new(),
+            remote_selectors: Vec::new(),
+            outbound_key: zeroize::Zeroizing::new(Vec::new()),
+            outbound_integrity_key: None,
+            inbound_key: zeroize::Zeroizing::new(Vec::new()),
+            inbound_integrity_key: None,
+        }
+    }
+
+    fn spec(mode: ChildMode, if_id: u32) -> InstallSpec {
+        InstallSpec {
+            interface: None,
+            if_id,
+            reqid: 7,
+            local_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            remote_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            mode,
+            lifetime: Duration::from_secs(60),
+            priority: 100,
+            replay_window: 32,
+            mark: None,
+            mark_mask: 0,
+            forward: false,
+            nat_t: false,
+        }
+    }
+
+    #[test]
+    fn policy_if_id_matches_the_state_without_an_xfrm_interface() {
+        let local = TrafficSelector::host(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let remote = TrafficSelector::host(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 2,
+        )));
+        for mode in [ChildMode::Transport, ChildMode::Tunnel] {
+            let record =
+                build(Direction::Out, local, remote, &spec(mode, 42), &child())
+                    .unwrap();
+            assert_eq!(record.if_id, 42, "{mode:?}");
+            assert!(
+                record
+                    .message
+                    .nlas
+                    .iter()
+                    .any(|attr| matches!(attr, XfrmAttrs::IfId(42))),
+                "{mode:?}"
+            );
+        }
+
+        // A zero if_id stays absent, matching the state builder.
+        let record =
+            build(Direction::Out, local, remote, &spec(ChildMode::Transport, 0), &child())
+                .unwrap();
+        assert_eq!(record.if_id, 0);
+        assert!(
+            !record
+                .message
+                .nlas
+                .iter()
+                .any(|attr| matches!(attr, XfrmAttrs::IfId(_)))
+        );
+    }
+
+    #[test]
+    fn prefix_selectors_use_the_common_prefix() {
+        let net = |addr: Ipv4Addr, prefix: u8| {
+            TrafficSelector::net(IpNet::new(IpAddr::V4(addr), prefix).unwrap())
+        };
+        let spec = spec(ChildMode::Tunnel, 0);
+        let record = build(
+            Direction::Out,
+            net(Ipv4Addr::new(10, 0, 0, 0), 8),
+            net(Ipv4Addr::new(10, 20, 0, 0), 16),
+            &spec,
+            &child(),
+        )
+        .unwrap();
+        assert_eq!(record.selector.prefixlen_s, 8);
+        assert_eq!(record.selector.prefixlen_d, 16);
     }
 }
