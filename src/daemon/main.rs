@@ -208,8 +208,17 @@ async fn run_wifi_interfaces(
     // re-apply when a later connection lands on a different configured
     // network.
     let mut applied_ssid: HashMap<String, String> = HashMap::new();
+    // Interfaces currently associated, used to retry a failed IP setup.
+    let mut connected_ifaces: HashMap<String, String> = HashMap::new();
+    let mut ip_retry_at: Option<tokio::time::Instant> = None;
     let mut connected = false;
     loop {
+        let retry_due = async {
+            match ip_retry_at {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 // The sender dropped the channel or signalled shutdown.
@@ -235,6 +244,8 @@ async fn run_wifi_interfaces(
                                 continue;
                             };
                             let ssid = ssid.to_string();
+                            connected_ifaces
+                                .insert(iface_name.clone(), ssid.clone());
                             if applied_ssid
                                 .get(iface_name)
                                 .map(String::as_str)
@@ -286,24 +297,77 @@ async fn run_wifi_interfaces(
                                          SSID '{ssid}'; skipping IP config"
                                     ),
                                 }
+                                if applied_ssid.get(iface_name)
+                                    != Some(&ssid)
+                                {
+                                    ip_retry_at = Some(
+                                        tokio::time::Instant::now()
+                                            + std::time::Duration::from_secs(10),
+                                    );
+                                }
                             }
                         }
                         shuli_wifi::WifiState::Failed => {
+                            connected_ifaces.remove(iface_name);
                             log::warn!(
                                 "connection failed on {iface_name} - retrying"
                             );
                         }
                         shuli_wifi::WifiState::FailedAuthentication => {
+                            connected_ifaces.remove(iface_name);
                             log::warn!(
                                 "authentication failed on {iface_name} - \
                                  retrying in 10 minutes"
                             );
                         }
-                        _ => {}
+                        _ => {
+                            connected_ifaces.remove(iface_name);
+                        }
                     }
                     }
                     Err(e) => log::warn!("WIFI client error: {e}"),
                 }
+            }
+            _ = retry_due => {
+                let mut retry = false;
+                for (iface_name, ssid) in &connected_ifaces {
+                    if applied_ssid.get(iface_name) == Some(ssid) {
+                        continue;
+                    }
+                    let Some(entry) = groups
+                        .iter()
+                        .find(|(name, _)| name == iface_name)
+                        .and_then(|(_, entries)| {
+                            entries.iter().find(|entry| entry.ssid == *ssid)
+                        })
+                    else {
+                        continue;
+                    };
+                    match apply_network_config(
+                        iface_name,
+                        entry.dns.as_ref(),
+                        entry.ipv4.as_ref(),
+                        entry.ipv6.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            applied_ssid
+                                .insert(iface_name.clone(), ssid.clone());
+                            log::info!(
+                                "IP config applied on {iface_name} after                                  retry"
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("IP config retry failed: {e}");
+                            retry = true;
+                        }
+                    }
+                }
+                ip_retry_at = retry.then(|| {
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(10)
+                });
             }
         }
     }
@@ -464,17 +528,45 @@ async fn run_wired_interface(
                                 }
                             }
                             if !is_macsec {
-                                // The 802.1X port stays authorized;
-                                // hold until shutdown instead of
-                                // polling an already-Connected client.
-                                let _ = shutdown_rx.changed().await;
-                                if let Err(e) = client.shutdown().await {
-                                    log::warn!(
-                                        "wired shutdown {} failed: {e}",
-                                        entry.name
-                                    );
+                                // The 802.1X port stays authorized.
+                                // Retry a failed IP setup on an
+                                // interval, then hold until shutdown.
+                                loop {
+                                    tokio::select! {
+                                        _ = shutdown_rx.changed() => {
+                                            if let Err(e) =
+                                                client.shutdown().await
+                                            {
+                                                log::warn!(
+                                                    "wired shutdown {} \
+                                                     failed: {e}",
+                                                    entry.name
+                                                );
+                                            }
+                                            return Ok(connected);
+                                        }
+                                        _ = tokio::time::sleep(
+                                            std::time::Duration::from_secs(
+                                                10,
+                                            ),
+                                        ), if !connected => {
+                                            match apply_network_config(
+                                                &ip_iface,
+                                                entry.dns.as_ref(),
+                                                entry.ipv4.as_ref(),
+                                                entry.ipv6.as_ref(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => connected = true,
+                                                Err(e) => log::warn!(
+                                                    "IP config retry failed \
+                                                     on {ip_iface}: {e}"
+                                                ),
+                                            }
+                                        }
+                                    }
                                 }
-                                return Ok(connected);
                             }
                             // Keep driving MACsec/MKA (SAK rotation,
                             // liveness) after the first Connected.
