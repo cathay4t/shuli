@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     client::{ChildSaHandle, IpsecEvent, IpsecLease, IpsecState, error_event},
     config::{
-        AuthConfig, ChildProposal, IkeProposal, IpNet, IpsecConfig,
+        AuthConfig, ChildProposal, DhGroup, IkeProposal, IpNet, IpsecConfig,
         TrafficSelector, TrafficSelectorPair,
     },
     error::{IpsecError, IpsecErrorKind},
@@ -1489,8 +1489,11 @@ impl Runner {
             .ok_or_else(|| IpsecError::ike("CREATE_CHILD_SA without SA"))?;
         let (suite, proposal_number) =
             proposal::select_esp(&self.config.child.proposals.proposals, &sa)?;
+        // Use the SPI of the proposal that was actually selected; the
+        // peer may have offered several with different SPIs.
         let remote_spi = sa
-            .first()
+            .iter()
+            .find(|proposal| proposal.number == proposal_number)
             .and_then(|proposal| proposal.spi.get(..4))
             .map(|spi| u32::from_be_bytes(spi.try_into().unwrap()))
             .ok_or_else(|| IpsecError::ike("CREATE_CHILD_SA SA without SPI"))?;
@@ -1526,6 +1529,18 @@ impl Runner {
             ),
         }])];
         let shared = if let Some((group, peer_public)) = peer_ke {
+            if suite.dh == DhGroup::None {
+                return Err(IpsecError::new(
+                    IpsecErrorKind::Proposal,
+                    "CREATE_CHILD_SA sent KE but no DH transform was selected",
+                ));
+            }
+            if group != suite.dh.transform_id() {
+                return Err(IpsecError::new(
+                    IpsecErrorKind::Proposal,
+                    "CREATE_CHILD_SA KE group does not match the selected DH transform",
+                ));
+            }
             let private = DhKeyPair::generate(suite.dh)?;
             let public = private.public().to_vec();
             response.push(Payload::Ke {
@@ -1534,6 +1549,12 @@ impl Runner {
             });
             Some(private.agree(&peer_public)?)
         } else {
+            if suite.dh != DhGroup::None {
+                return Err(IpsecError::new(
+                    IpsecErrorKind::Proposal,
+                    "CREATE_CHILD_SA selected a DH transform but omitted KE",
+                ));
+            }
             None
         };
         response.push(Payload::Nonce(nonce_r.clone()));
