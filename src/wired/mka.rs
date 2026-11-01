@@ -708,6 +708,8 @@ struct Peer {
     live: bool,
     last_seen: Instant,
     rx_ready: bool,
+    /// An RX SA for the current SAK is installed for this peer's SCI.
+    rx_installed: bool,
 }
 
 /// One MKA participant for a wired port.
@@ -753,6 +755,15 @@ fn live_peer_scis(peers: &[Peer]) -> Vec<[u8; 8]> {
     peers
         .iter()
         .filter(|peer| peer.live && peer.sci != [0u8; 8])
+        .map(|peer| peer.sci)
+        .collect()
+}
+
+/// Live peers whose SCI does not have an RX SA for the current SAK yet.
+fn pending_rx_scis(peers: &[Peer]) -> Vec<[u8; 8]> {
+    peers
+        .iter()
+        .filter(|peer| peer.live && peer.sci != [0u8; 8] && !peer.rx_installed)
         .map(|peer| peer.sci)
         .collect()
 }
@@ -1022,6 +1033,7 @@ impl MkaSession {
                     live: false,
                     last_seen: now,
                     rx_ready: false,
+                    rx_installed: false,
                 });
                 self.peers.len() - 1
             }
@@ -1094,6 +1106,7 @@ impl MkaSession {
                     live: false,
                     last_seen: now,
                     rx_ready: false,
+                    rx_installed: false,
                 });
                 self.need_send = true;
             }
@@ -1203,6 +1216,11 @@ impl MkaSession {
                         false,
                     )
                     .await?;
+                    for peer in &mut self.peers {
+                        if peer.live && scis.contains(&peer.sci) {
+                            peer.rx_installed = true;
+                        }
+                    }
                 }
                 self.need_send = true;
                 log::info!(
@@ -1215,6 +1233,33 @@ impl MkaSession {
 
         if self.is_key_server {
             self.ensure_sak().await?;
+        }
+        // A peer can become live (or reveal its SCI) after the SAK was
+        // installed. Give it an RX SA for the current SAK now instead of
+        // waiting for the next rekey.
+        self.install_rx_sas_for_live_peers().await?;
+        Ok(())
+    }
+
+    /// Install the current SAK's RX SA for every live peer missing one.
+    async fn install_rx_sas_for_live_peers(&mut self) -> Result<(), WifiError> {
+        let (Some(ki), Some(sak)) = (self.lki, self.sak.clone()) else {
+            return Ok(());
+        };
+        let pending = pending_rx_scis(&self.peers);
+        if pending.is_empty() || self.macsec.is_none() {
+            return Ok(());
+        }
+        let an = self.lan;
+        if let Some(dev) = self.macsec.as_mut() {
+            for sci in &pending {
+                dev.install_rx_sa(sci, an, &ki, &sak).await?;
+            }
+        }
+        for peer in &mut self.peers {
+            if pending.contains(&peer.sci) {
+                peer.rx_installed = true;
+            }
         }
         Ok(())
     }
@@ -1413,6 +1458,7 @@ impl MkaSession {
         self.need_new_sak = false;
         for peer in &mut self.peers {
             peer.rx_ready = false;
+            peer.rx_installed = false;
         }
         self.dist_sak = Some(DistSak {
             an,
@@ -1425,8 +1471,13 @@ impl MkaSession {
         let peer_scis = live_peer_scis(&self.peers);
         if let Some(dev) = self.macsec.as_mut() {
             dev.install_tx_sa(an, &ki, &sak, false).await?;
-            for sci in peer_scis {
-                dev.install_rx_sa(&sci, an, &ki, &sak).await?;
+            for sci in &peer_scis {
+                dev.install_rx_sa(sci, an, &ki, &sak).await?;
+            }
+            for peer in &mut self.peers {
+                if peer.live && peer_scis.contains(&peer.sci) {
+                    peer.rx_installed = true;
+                }
             }
         }
         self.need_send = true;
@@ -1533,7 +1584,23 @@ mod tests {
             live: true,
             last_seen: Instant::now(),
             rx_ready: true,
+            rx_installed: false,
         }
+    }
+
+    #[test]
+    fn pending_rx_scis_lists_late_live_peers_only() {
+        let mut installed = live_peer(0x11, [0x11; 8]);
+        installed.rx_installed = true;
+        let mut pending = live_peer(0x22, [0x22; 8]);
+        pending.live = false;
+        let mut missing = live_peer(0x33, [0x33; 8]);
+        missing.rx_installed = false;
+        let mut done = live_peer(0x44, [0x44; 8]);
+        done.rx_installed = true;
+        let no_sci = live_peer(0x55, [0u8; 8]);
+        let peers = vec![installed, pending, missing, done, no_sci];
+        assert_eq!(pending_rx_scis(&peers), vec![[0x33; 8]]);
     }
 
     #[tokio::test]
