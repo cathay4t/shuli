@@ -930,9 +930,49 @@ impl WifiIface {
                                         self.auth.sae_sync,
                                         SAE_SYNC_MAX
                                     );
-                                    let auth_data =
-                                        self.auth.sae_confirm_auth_data.clone();
-                                    self.send_sae_confirm(auth_data).await;
+                                    // Rebuild the Confirm with an
+                                    // incremented Send-Confirm: an AP
+                                    // enforcing the replay check drops
+                                    // a resent identical value.
+                                    let rebuilt = match self
+                                        .auth
+                                        .method
+                                        .as_mut()
+                                    {
+                                        Some(AuthMethod::Sae(sae)) => {
+                                            sae.retransmit_confirm()
+                                        }
+                                        None => Err(WifiError::new(
+                                            ErrorKind::SaeFailed,
+                                            "no SAE state for confirm retransmit",
+                                        )),
+                                    };
+                                    match rebuilt {
+                                        Ok((send_confirm, hash)) => {
+                                            let mut auth_data =
+                                                Vec::with_capacity(6 + 32);
+                                            auth_data.extend_from_slice(
+                                                &2u16.to_le_bytes(),
+                                            );
+                                            auth_data.extend_from_slice(
+                                                &0u16.to_le_bytes(),
+                                            );
+                                            auth_data.extend_from_slice(
+                                                &send_confirm.to_le_bytes(),
+                                            );
+                                            auth_data.extend_from_slice(&hash);
+                                            self.send_sae_confirm(auth_data)
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "SAE confirm retransmit \
+                                                 failed: {e}"
+                                            );
+                                            self.fail_auth(e);
+                                            break;
+                                        }
+                                    }
                                 }
                                 // The retransmission latches
                                 // `WifiState::Failed` when the kernel rejects

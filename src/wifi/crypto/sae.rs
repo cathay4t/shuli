@@ -70,6 +70,11 @@ pub(crate) struct SaeAuth {
     pmk: Option<[u8; SAE_PMK_LEN]>,
     pmkid: Option<[u8; 16]>,
     confirmed: bool,
+    /// Our send-confirm value for the Confirm frame; incremented on
+    /// every retransmission (802.11-2020 §12.4.8.6.5).
+    send_confirm: u16,
+    /// Last send-confirm accepted from the peer.
+    peer_send_confirm: Option<u16>,
     /// PWE was derived with hash-to-element (true) or hunting-and-pecking
     /// (false); decides the commit's status code and the anti-clogging
     /// token framing.
@@ -148,6 +153,8 @@ impl SaeAuth {
             pmk: None,
             pmkid: None,
             confirmed: false,
+            send_confirm: 0,
+            peer_send_confirm: None,
             h2e,
             hnp_fallback,
             own_scalar_bytes: [0u8; 32],
@@ -363,15 +370,55 @@ impl SaeAuth {
 
         // Confirm = CN(KCK, send_confirm=1, own_scalar, own_elem,
         //              peer_scalar, peer_elem)
+        self.send_confirm = 1;
         let confirm = sae_confirm(
             &kck,
-            1,
+            self.send_confirm,
             &self.own_scalar_bytes,
             &self.own_elem_bytes,
             peer_scalar_bytes,
             peer_elem_bytes,
         );
         Ok(confirm)
+    }
+
+    /// Build the next Confirm hash after a retransmission timeout.
+    /// Returns the incremented Send-Confirm value and the new CN.
+    pub(crate) fn retransmit_confirm(
+        &mut self,
+    ) -> Result<(u16, Vec<u8>), WifiError> {
+        let kck = self.kck.ok_or_else(|| {
+            WifiError::new(ErrorKind::SaeFailed, "no KCK derived")
+        })?;
+        let peer_scalar = self.peer_scalar.ok_or_else(|| {
+            WifiError::new(ErrorKind::SaeFailed, "no peer commit processed")
+        })?;
+        let peer_elem = self.peer_elem.ok_or_else(|| {
+            WifiError::new(ErrorKind::SaeFailed, "no peer commit processed")
+        })?;
+        let next = self
+            .send_confirm
+            .checked_add(1)
+            .filter(|value| *value != 0xffff)
+            .ok_or_else(|| {
+                WifiError::new(
+                    ErrorKind::SaeFailed,
+                    "SAE Send-Confirm exhausted",
+                )
+            })?;
+        let peer_scalar_bytes = scalar_to_array(&peer_scalar);
+        let mut peer_elem_bytes = [0u8; 64];
+        point_to_x_y(&peer_elem, &mut peer_elem_bytes);
+        let confirm = sae_confirm(
+            &kck,
+            next,
+            &self.own_scalar_bytes,
+            &self.own_elem_bytes,
+            &peer_scalar_bytes,
+            &peer_elem_bytes,
+        );
+        self.send_confirm = next;
+        Ok((next, confirm))
     }
 
     /// Process peer's confirm message body: `send_confirm(2 LE) || CN(32)`.
@@ -400,6 +447,32 @@ impl SaeAuth {
         }
         let peer_send_confirm =
             u16::from_le_bytes([peer_confirm_body[0], peer_confirm_body[1]]);
+        // 802.11-2020 §12.4.8.6.5: reject the invalid 0xffff value and a
+        // replayed/duplicate Confirm.
+        if peer_send_confirm == 0xffff {
+            return Err(WifiError::new(
+                ErrorKind::SaeFailed,
+                "invalid SAE Send-Confirm 0xffff",
+            ));
+        }
+        if self
+            .peer_send_confirm
+            .is_some_and(|last| peer_send_confirm <= last)
+        {
+            // A retransmitted Confirm after we already completed is
+            // idempotent; anything else is a replay/rollback attempt.
+            if self.confirmed
+                && let Some(pmk) = self.pmk
+            {
+                return Ok(pmk);
+            }
+            return Err(WifiError::new(
+                ErrorKind::SaeFailed,
+                format!(
+                    "SAE Send-Confirm {peer_send_confirm} did not increase"
+                ),
+            ));
+        }
         let peer_hash = &peer_confirm_body[2..34];
 
         let peer_scalar_bytes = scalar_to_array(&peer_scalar);
@@ -431,6 +504,7 @@ impl SaeAuth {
         let pmk = self.pmk.ok_or_else(|| {
             WifiError::new(ErrorKind::SaeFailed, "no PMK derived")
         })?;
+        self.peer_send_confirm = Some(peer_send_confirm);
         self.confirmed = true;
         Ok(pmk)
     }

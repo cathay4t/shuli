@@ -431,6 +431,79 @@ fn test_full_sae_exchange() {
 }
 
 #[test]
+fn test_sae_confirm_retransmission_increments_send_confirm() {
+    let mut rng = getrandom::SysRng;
+    let (mac_sta, mac_ap) = test_macs();
+    let mut supp = SaeAuth::new(
+        "12345678",
+        "Test-WIFI",
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+    )
+    .unwrap();
+    let mut ap = SaeAuth::new(
+        "12345678",
+        "Test-WIFI",
+        mac_ap,
+        mac_sta,
+        true,
+        false,
+    )
+    .unwrap();
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
+    let first = supp.process_commit(&ap_scalar, &ap_elem).unwrap();
+    let _ = ap.process_commit(&supp_scalar, &supp_elem).unwrap();
+
+    let (sc1, hash1) = supp.retransmit_confirm().unwrap();
+    assert_eq!(sc1, 2);
+    assert_ne!(hash1, first, "retransmission must change the CN");
+    let (sc2, hash2) = supp.retransmit_confirm().unwrap();
+    assert_eq!(sc2, 3);
+    assert_ne!(hash2, hash1);
+}
+
+#[test]
+fn test_sae_confirm_rejects_invalid_or_replayed_send_confirm() {
+    let mut rng = getrandom::SysRng;
+    let (mac_sta, mac_ap) = test_macs();
+    let mut supp = SaeAuth::new(
+        "12345678",
+        "Test-WIFI",
+        mac_sta,
+        mac_ap,
+        true,
+        false,
+    )
+    .unwrap();
+    let mut ap = SaeAuth::new(
+        "12345678",
+        "Test-WIFI",
+        mac_ap,
+        mac_sta,
+        true,
+        false,
+    )
+    .unwrap();
+    let (supp_scalar, supp_elem) = supp.build_commit(&mut rng).unwrap();
+    let (ap_scalar, ap_elem) = ap.build_commit(&mut rng).unwrap();
+    let _ = supp.process_commit(&ap_scalar, &ap_elem).unwrap();
+    let ap_confirm = ap.process_commit(&supp_scalar, &supp_elem).unwrap();
+
+    let mut invalid = vec![0xff, 0xff];
+    invalid.extend_from_slice(&ap_confirm);
+    assert!(supp.process_confirm(&invalid).is_err());
+
+    let mut body = vec![1u8, 0u8];
+    body.extend_from_slice(&ap_confirm);
+    supp.process_confirm(&body).unwrap();
+    // A retransmitted Confirm after completion is harmless.
+    supp.process_confirm(&body).unwrap();
+}
+
+#[test]
 fn test_sae_different_passwords() {
     let mut rng = getrandom::SysRng;
     let (mac_sta, mac_ap) = test_macs();
