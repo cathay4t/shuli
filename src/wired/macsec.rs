@@ -41,6 +41,29 @@ fn sci_be(sci: &[u8; 8]) -> u64 {
     u64::from_be_bytes(*sci)
 }
 
+/// Drop the initial packet number from a TX SA after it reached the
+/// kernel.  `nl-macsec` re-applies the configured PN on every call, so
+/// keeping it would rewind the live SA (and the peer's replay window)
+/// whenever an unrelated SA is installed or activated.
+fn forget_tx_sa_pn(desired: &mut NlMacsecConfig, an: u8) {
+    if let Some(tx_sa) = desired.tx_sa.as_mut()
+        && let Some(sa) = tx_sa.iter_mut().find(|sa| sa.an == an)
+    {
+        sa.pn = None;
+    }
+}
+
+/// RX counterpart of [`forget_tx_sa_pn`].
+fn forget_rx_sa_pn(desired: &mut NlMacsecConfig, sci: u64, an: u8) {
+    if let Some(rx_sc) = desired.rx_sc.as_mut()
+        && let Some(sc) = rx_sc.iter_mut().find(|sc| sc.sci == sci)
+        && let Some(sa_list) = sc.sa_list.as_mut()
+        && let Some(sa) = sa_list.iter_mut().find(|sa| sa.an == an)
+    {
+        sa.pn = None;
+    }
+}
+
 /// A kernel MACsec interface with a handle for SA management.
 pub(crate) struct MacsecDevice {
     name: String,
@@ -211,6 +234,7 @@ impl MacsecDevice {
         sa.key = Some(sak.to_vec());
         tx_sa.push(sa);
         self.apply().await?;
+        forget_tx_sa_pn(&mut self.desired, an);
         if active {
             self.set_encoding_sa(an).await?;
         }
@@ -282,7 +306,9 @@ impl MacsecDevice {
         sa.key_id = key_id;
         sa.key = Some(sak.to_vec());
         sa_list.push(sa);
-        self.apply().await
+        self.apply().await?;
+        forget_rx_sa_pn(&mut self.desired, sci, an);
+        Ok(())
     }
 }
 
@@ -305,4 +331,37 @@ async fn wait_ifindex(name: &str) -> Result<u32, WifiError> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(macsec_err(format!("macsec device {name} did not appear")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_sa_packet_numbers_are_not_reapplied() {
+        let mut desired = NlMacsecConfig::new(3);
+        let mut tx_sa = MacsecSaConfig::new(1);
+        tx_sa.pn = Some(1);
+        let mut other_tx_sa = MacsecSaConfig::new(2);
+        other_tx_sa.pn = Some(7);
+        desired.tx_sa = Some(vec![tx_sa, other_tx_sa]);
+
+        forget_tx_sa_pn(&mut desired, 1);
+
+        let tx_sas = desired.tx_sa.as_ref().unwrap();
+        assert_eq!(tx_sas[0].pn, None);
+        assert_eq!(tx_sas[1].pn, Some(7));
+
+        let sci = 0x1122_3344_5566_7788;
+        let mut rx_sa = MacsecSaConfig::new(1);
+        rx_sa.pn = Some(1);
+        let mut rx_sc = MacsecRxScConfig::new(sci);
+        rx_sc.sa_list = Some(vec![rx_sa]);
+        desired.rx_sc = Some(vec![rx_sc]);
+
+        forget_rx_sa_pn(&mut desired, sci, 1);
+
+        let rx_scs = desired.rx_sc.as_ref().unwrap();
+        assert_eq!(rx_scs[0].sa_list.as_ref().unwrap()[0].pn, None);
+    }
 }
