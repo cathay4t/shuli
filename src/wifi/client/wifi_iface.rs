@@ -915,9 +915,13 @@ impl WifiIface {
                                         self.auth.sae_sync,
                                         SAE_SYNC_MAX
                                     );
-                                    let auth_data = std::mem::take(
-                                        &mut self.auth.sae_commit_auth_data,
-                                    );
+                                    // Clone instead of take: if this
+                                    // future is dropped while the
+                                    // netlink send is in flight, the
+                                    // buffer must survive for the next
+                                    // retransmission.
+                                    let auth_data =
+                                        self.auth.sae_commit_auth_data.clone();
                                     self.send_sae_commit(auth_data).await;
                                 } else {
                                     log::info!(
@@ -926,9 +930,8 @@ impl WifiIface {
                                         self.auth.sae_sync,
                                         SAE_SYNC_MAX
                                     );
-                                    let auth_data = std::mem::take(
-                                        &mut self.auth.sae_confirm_auth_data,
-                                    );
+                                    let auth_data =
+                                        self.auth.sae_confirm_auth_data.clone();
                                     self.send_sae_confirm(auth_data).await;
                                 }
                                 // The retransmission latches
