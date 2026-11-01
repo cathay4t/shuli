@@ -141,6 +141,18 @@ impl MacsecDevice {
         &self.name
     }
 
+    /// Remove the RX secure channel of a peer that left the CA.
+    pub(crate) async fn remove_rx_sc(
+        &mut self,
+        peer_sci: &[u8; 8],
+    ) -> Result<(), WifiError> {
+        let sci = sci_be(peer_sci);
+        if let Some(rx_scs) = self.desired.rx_sc.as_mut() {
+            rx_scs.retain(|sc| sc.sci != sci);
+        }
+        self.apply().await
+    }
+
     /// Remove every installed TX/RX SA, keeping the netdev.
     pub(crate) async fn clear_sas(&mut self) -> Result<(), WifiError> {
         self.desired.tx_sa = Some(Vec::new());

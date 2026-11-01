@@ -891,7 +891,12 @@ impl MkaSession {
 
     pub(crate) async fn run(&mut self) -> Result<bool, WifiError> {
         self.ensure_macsec().await?;
-        self.expire_peers();
+        let expired_scis = self.expire_peers();
+        if let Some(dev) = self.macsec.as_mut() {
+            for sci in &expired_scis {
+                dev.remove_rx_sc(sci).await?;
+            }
+        }
         self.drop_unsecure_sak().await?;
 
         let now = Instant::now();
@@ -1284,11 +1289,19 @@ impl MkaSession {
         self.need_new_sak = false;
     }
 
-    fn expire_peers(&mut self) {
+    /// Drop peers that stopped sending MKPDUs and return the SCIs whose
+    /// RX secure channels must be removed from the kernel.
+    fn expire_peers(&mut self) -> Vec<[u8; 8]> {
         let now = Instant::now();
         let before = self.peers.len();
+        let mut expired_scis = Vec::new();
         self.peers.retain(|p| {
-            now.duration_since(p.last_seen) < Duration::from_secs(MKA_LIFE_SECS)
+            let keep =
+                now.duration_since(p.last_seen) < Duration::from_secs(MKA_LIFE_SECS);
+            if !keep && p.sci != [0u8; 8] {
+                expired_scis.push(p.sci);
+            }
+            keep
         });
         if self.peers.len() != before {
             self.need_send = true;
@@ -1299,6 +1312,7 @@ impl MkaSession {
             }
             self.elect_key_server();
         }
+        expired_scis
     }
 
     fn has_live_peer(&self) -> bool {
@@ -1586,6 +1600,22 @@ mod tests {
             rx_ready: true,
             rx_installed: false,
         }
+    }
+
+    #[tokio::test]
+    async fn expire_peers_returns_the_scis_to_remove() {
+        let config = MacsecConfig::new(vec![0x11; 16], vec![0x22; 16]);
+        let mut session = MkaSession::new("lo", &config).unwrap();
+        let mut live = live_peer(0x11, [0x11; 8]);
+        live.last_seen = Instant::now()
+            .checked_sub(Duration::from_secs(MKA_LIFE_SECS + 1))
+            .unwrap();
+        let mut no_sci = live_peer(0x22, [0u8; 8]);
+        no_sci.last_seen = live.last_seen;
+        session.peers.push(live);
+        session.peers.push(no_sci);
+        assert_eq!(session.expire_peers(), vec![[0x11; 8]]);
+        assert!(session.peers.is_empty());
     }
 
     #[test]
