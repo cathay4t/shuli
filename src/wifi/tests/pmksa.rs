@@ -87,10 +87,11 @@ fn test_pmksa_akm_families() {
         [0x11; 16],
         SecurityType::Wpa2Psk,
     ));
-    // FT and non-FT variants share the PMK/PMKID derivation.
+    // FT uses PMKR0/PMKR1Name in the PMKID field and the FT protocol,
+    // so a non-FT PMKSA must not satisfy an FT association.
     assert!(
-        cache.lookup(SSID, BSSID, SecurityType::FtPsk).is_some(),
-        "FT-PSK must reuse the WPA2-PSK entry"
+        cache.lookup(SSID, BSSID, SecurityType::FtPsk).is_none(),
+        "FT-PSK must not reuse a WPA2-PSK PMKSA"
     );
     assert!(
         cache

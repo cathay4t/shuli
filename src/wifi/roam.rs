@@ -1027,8 +1027,11 @@ impl WifiIface {
         let Some(pmk) = self.auth.psk_pmk else {
             return;
         };
+        // OKC only applies to non-FT AKMs: an FT association needs
+        // PMKR0/PMKR1Name in the PMKID field and the FT protocol, so a
+        // plain PMKID here would just be rejected by the target AP.
         let (pmkid, mic_alg) = match target.security {
-            SecurityType::Wpa2Psk | SecurityType::FtPsk => (
+            SecurityType::Wpa2Psk => (
                 crate::crypto::kdf::pmkid_sha1(
                     &pmk,
                     &target.bssid,

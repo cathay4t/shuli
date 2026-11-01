@@ -87,21 +87,16 @@ impl PmksaEntry {
         }
     }
 
-    /// FT and non-FT variants of an AKM share the PMK and PMKID
-    /// derivation, so both match the same cache entry.
-    fn akm(&self) -> SecurityType {
-        self.security.base()
-    }
-
     fn matches(
         &self,
         ssid: &str,
         bssid: [u8; ETH_ALEN],
         security: SecurityType,
     ) -> bool {
-        self.ssid == ssid
-            && self.bssid == bssid
-            && self.akm() == security.base()
+        // FT AKMs put PMKR0/PMKR1Name in the PMKID field, not the
+        // non-FT PMKID, so an entry from a non-FT AKM must never match an
+        // FT association (and vice versa).
+        self.ssid == ssid && self.bssid == bssid && self.security == security
     }
 
     fn past_reauth_threshold(&self, now: Instant) -> bool {
