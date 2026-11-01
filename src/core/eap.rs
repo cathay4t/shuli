@@ -72,7 +72,12 @@ impl EapPacket {
             return None;
         }
         let (type_, body_start) = match code {
-            CODE_SUCCESS | CODE_FAILURE => (None, EAP_HDR_LEN),
+            CODE_SUCCESS | CODE_FAILURE => {
+                if length != EAP_HDR_LEN {
+                    return None;
+                }
+                (None, EAP_HDR_LEN)
+            }
             CODE_REQUEST | CODE_RESPONSE => {
                 if length < EAP_HDR_LEN + 1 {
                     return None;
@@ -140,6 +145,12 @@ pub struct EapPeer {
     identity: String,
     method: Option<Box<dyn EapMethod>>,
     supported_types: Vec<u8>,
+    /// The last Request and the Response we sent for it. RFC 3748
+    /// section 4.1 requires a retransmitted Request (same identifier and
+    /// body) to be answered by replaying that Response instead of
+    /// processing it again (which would duplicate EAP-TLS fragments).
+    last_request: Option<EapPacket>,
+    last_response: Option<Vec<u8>>,
 }
 
 impl EapPeer {
@@ -148,11 +159,17 @@ impl EapPeer {
             identity,
             method: None,
             supported_types: Vec::new(),
+            last_request: None,
+            last_response: None,
         }
     }
 
     /// Install the active EAP method (e.g. EAP-TLS).
     pub fn set_method(&mut self, method: Box<dyn EapMethod>) {
+        // Advertised in a Nak so the authenticator can pick a method we
+        // actually implement (RFC 3748 section 5.3).
+        self.supported_types.clear();
+        self.supported_types.push(method.method_type());
         self.method = Some(method);
     }
 
@@ -166,16 +183,32 @@ impl EapPeer {
         &mut self,
         packet: &EapPacket,
     ) -> Result<EapAction, WifiError> {
-        if packet.is_success() {
-            return Ok(EapAction::Success);
-        }
-        if packet.is_failure() {
+        if packet.is_success() || packet.is_failure() {
+            // RFC 3748 section 4.2: the identifier must match the last
+            // Request; a stale or reordered result is discarded.
+            if self
+                .last_request
+                .as_ref()
+                .is_some_and(|request| request.identifier != packet.identifier)
+            {
+                return Ok(EapAction::Wait);
+            }
+            if packet.is_success() {
+                return Ok(EapAction::Success);
+            }
             return Ok(EapAction::Failure);
         }
         if packet.code != CODE_REQUEST {
             // A Response from the authenticator is not part of the
             // supplicant flow; ignore it.
             return Ok(EapAction::Wait);
+        }
+
+        // Retransmitted Request: replay the cached Response.
+        if self.last_request.as_ref() == Some(packet)
+            && let Some(response) = &self.last_response
+        {
+            return Ok(EapAction::Respond(response.clone()));
         }
 
         let Some(type_) = packet.type_ else {
@@ -234,6 +267,8 @@ impl EapPeer {
                 )
             }
         };
+        self.last_request = Some(packet.clone());
+        self.last_response = Some(response.clone());
         Ok(EapAction::Respond(response))
     }
 }

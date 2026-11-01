@@ -209,3 +209,84 @@ fn test_peer_rejects_request_without_type() {
     let err = peer.handle_packet(&malformed);
     assert_eq!(err.unwrap_err().kind, ErrorKind::HandshakeFailed);
 }
+
+struct CountingMethod {
+    calls: usize,
+}
+
+impl EapMethod for CountingMethod {
+    fn method_type(&self) -> u8 {
+        TYPE_TLS
+    }
+
+    fn handle_request(
+        &mut self,
+        identifier: u8,
+        _body: &[u8],
+    ) -> Result<Vec<u8>, WifiError> {
+        self.calls += 1;
+        Ok(vec![identifier, self.calls as u8])
+    }
+
+    fn msk(&self) -> Option<[u8; MSK_LEN]> {
+        None
+    }
+}
+
+#[test]
+fn test_retransmitted_request_replays_the_cached_response() {
+    let mut peer = EapPeer::new("user".to_string());
+    peer.set_method(Box::new(CountingMethod { calls: 0 }));
+    let request =
+        EapPacket::build(CODE_REQUEST, 9, Some(TYPE_TLS), b"fragment");
+    let parsed = EapPacket::parse(&request).unwrap();
+
+    let first = peer.handle_packet(&parsed).unwrap();
+    let EapAction::Respond(first) = first else {
+        panic!("expected a response");
+    };
+    let second = peer.handle_packet(&parsed).unwrap();
+    assert_eq!(second, EapAction::Respond(first));
+}
+
+#[test]
+fn test_nak_lists_the_configured_method() {
+    let mut peer = EapPeer::new("user".to_string());
+    peer.set_method(Box::new(CountingMethod { calls: 0 }));
+    let request = EapPacket::build(CODE_REQUEST, 3, Some(55), b"");
+    let EapAction::Respond(response) =
+        peer.handle_packet(&EapPacket::parse(&request).unwrap()).unwrap()
+    else {
+        panic!("expected a Nak");
+    };
+    let nak = EapPacket::parse(&response).unwrap();
+    assert_eq!(nak.type_, Some(TYPE_NAK));
+    assert_eq!(nak.body, vec![TYPE_TLS]);
+}
+
+#[test]
+fn test_stale_eap_success_is_ignored() {
+    let mut peer = EapPeer::new("user".to_string());
+    peer.set_method(Box::new(CountingMethod { calls: 0 }));
+    let request = EapPacket::build(CODE_REQUEST, 4, Some(TYPE_TLS), b"");
+    let _ = peer.handle_packet(&EapPacket::parse(&request).unwrap());
+
+    let stale = EapPacket::build(CODE_SUCCESS, 5, None, b"");
+    assert_eq!(
+        peer.handle_packet(&EapPacket::parse(&stale).unwrap()).unwrap(),
+        EapAction::Wait
+    );
+
+    let current = EapPacket::build(CODE_SUCCESS, 4, None, b"");
+    assert_eq!(
+        peer.handle_packet(&EapPacket::parse(&current).unwrap())
+            .unwrap(),
+        EapAction::Success
+    );
+}
+
+#[test]
+fn test_success_with_trailing_data_is_malformed() {
+    // code, identifier, length=5, one extra octet
+    assert!(EapPacket::parse(&[CODE_SUCCESS, 1, 0, 5, 0]).is_none());
+}

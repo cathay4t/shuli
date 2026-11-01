@@ -343,8 +343,9 @@ fn test_eap_peer_full_tls_exchange() {
         }
     }
 
-    // 3. EAP-Success authorizes the port.
-    let success = EapPacket::build(CODE_SUCCESS, 3, None, b"");
+    // 3. EAP-Success authorizes the port. Its identifier matches the
+    // last Request (the EAP-TLS exchange above uses identifier 2).
+    let success = EapPacket::build(CODE_SUCCESS, 2, None, b"");
     let action = peer
         .handle_packet(&EapPacket::parse(&success).unwrap())
         .unwrap();
