@@ -261,6 +261,7 @@ impl WifiIface {
             bssid_ignore: BssidIgnoreList::default(),
             pmksa_cache: PmksaCache::default(),
             last_error: None,
+            eap_tls_config: None,
         };
 
         // Receive WNM action frames (BTM Requests) for roaming.  FullMAC

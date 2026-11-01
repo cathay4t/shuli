@@ -104,6 +104,82 @@ fn tls_err(e: impl std::fmt::Display) -> WifiError {
     WifiError::new(ErrorKind::HandshakeFailed, format!("EAP-TLS: {e}"))
 }
 
+/// Immutable EAP-TLS client configuration, parsed once from the
+/// certificate/key files.
+///
+/// Building a rustls [`ClientConfig`] reads and parses the CA, client
+/// certificate and private key, which is expensive enough that a client
+/// should not repeat it on every authentication attempt. The parsed
+/// configuration can create any number of [`EapTlsMethod`] instances
+/// (one per connection).
+#[derive(Clone)]
+pub struct EapTlsConfig {
+    config: Arc<ClientConfig>,
+    server_name: String,
+}
+
+impl EapTlsConfig {
+    /// Read the PEM files named by `config` and build the rustls client
+    /// configuration.
+    pub fn from_config(config: &EapConfig) -> Result<Self, WifiError> {
+        let read_pem = |path: &std::path::Path, what: &str| {
+            std::fs::read_to_string(path).map_err(|e| {
+                WifiError::new(
+                    ErrorKind::InvalidConfig,
+                    format!("read {what} {}: {e}", path.display()),
+                )
+            })
+        };
+        let ca_path = config.ca_cert.as_ref().ok_or_else(|| {
+            WifiError::new(ErrorKind::InvalidConfig, "EAP: ca_cert required")
+        })?;
+        let client_cert = config.client_cert.as_ref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: client_cert required",
+            )
+        })?;
+        let client_key = config.client_key.as_ref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: client_key required",
+            )
+        })?;
+        let server_name = config.server_name.as_deref().ok_or_else(|| {
+            WifiError::new(
+                ErrorKind::InvalidConfig,
+                "EAP-TLS: server_name required",
+            )
+        })?;
+
+        let ca = certs_from_pem(&read_pem(ca_path, "CA certificate")?)?;
+        let cert =
+            certs_from_pem(&read_pem(client_cert, "client certificate")?)?;
+        let key = key_from_pem(&read_pem(client_key, "client key")?)?;
+        let config = client_config(&ca, cert, key)?;
+        Self::new(config, server_name)
+    }
+
+    /// Build a reusable configuration from an already parsed rustls
+    /// `ClientConfig`.
+    pub fn new(
+        config: Arc<ClientConfig>,
+        server_name: &str,
+    ) -> Result<Self, WifiError> {
+        ServerName::try_from(server_name.to_string()).map_err(tls_err)?;
+        Ok(Self {
+            config,
+            server_name: server_name.to_string(),
+        })
+    }
+
+    /// Create a fresh method (TLS connection state) from this
+    /// configuration.
+    pub fn new_method(&self) -> Result<EapTlsMethod, WifiError> {
+        EapTlsMethod::new(self.config.clone(), &self.server_name)
+    }
+}
+
 /// The EAP-TLS method: drives a rustls client connection over EAP
 /// fragments and exports the RFC 9190 MSK.
 pub struct EapTlsMethod {
@@ -196,43 +272,12 @@ impl EapTlsMethod {
 
     /// Build the method from an [`EapConfig`] (certificate PEM files on
     /// disk).  Identity is handled by the [`EapPeer`](crate::eap::EapPeer).
+    ///
+    /// Prefer [`EapTlsConfig::from_config`] when the same configuration
+    /// is used for more than one connection: this convenience method
+    /// re-reads and re-parses the files on every call.
     pub fn from_config(config: &EapConfig) -> Result<Self, WifiError> {
-        let read_pem = |path: &std::path::Path, what: &str| {
-            std::fs::read_to_string(path).map_err(|e| {
-                WifiError::new(
-                    ErrorKind::InvalidConfig,
-                    format!("read {what} {}: {e}", path.display()),
-                )
-            })
-        };
-        let ca_path = config.ca_cert.as_ref().ok_or_else(|| {
-            WifiError::new(ErrorKind::InvalidConfig, "EAP: ca_cert required")
-        })?;
-        let client_cert = config.client_cert.as_ref().ok_or_else(|| {
-            WifiError::new(
-                ErrorKind::InvalidConfig,
-                "EAP-TLS: client_cert required",
-            )
-        })?;
-        let client_key = config.client_key.as_ref().ok_or_else(|| {
-            WifiError::new(
-                ErrorKind::InvalidConfig,
-                "EAP-TLS: client_key required",
-            )
-        })?;
-        let server_name = config.server_name.as_deref().ok_or_else(|| {
-            WifiError::new(
-                ErrorKind::InvalidConfig,
-                "EAP-TLS: server_name required",
-            )
-        })?;
-
-        let ca = certs_from_pem(&read_pem(ca_path, "CA certificate")?)?;
-        let cert =
-            certs_from_pem(&read_pem(client_cert, "client certificate")?)?;
-        let key = key_from_pem(&read_pem(client_key, "client key")?)?;
-        let config = client_config(&ca, cert, key)?;
-        Self::new(config, server_name)
+        EapTlsConfig::from_config(config)?.new_method()
     }
 }
 

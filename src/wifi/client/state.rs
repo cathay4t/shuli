@@ -8,8 +8,8 @@ use super::{
     WifiEventReceiver, WifiEventSender,
 };
 use crate::{
-    BssInfo, ETH_ALEN, NetworkConfig, ShuliNl80211Connection, WifiConfig,
-    WifiError,
+    BssInfo, ETH_ALEN, EapConfig, NetworkConfig, ShuliNl80211Connection,
+    WifiConfig, WifiError, eap_tls::EapTlsConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -655,6 +655,12 @@ pub(crate) struct WifiIface {
     /// change, surfaced once to the caller by `run()` (e.g. a
     /// wrong-password rejection). Cleared when reported.
     pub(crate) last_error: Option<WifiError>,
+    /// Parsed EAP-TLS configuration of the current network, keyed by the
+    /// `EapConfig` it was built from. Re-reading the certificate files
+    /// and rebuilding the rustls client configuration on every
+    /// authentication attempt is expensive; the parsed result is reused
+    /// until the configured EAP settings change.
+    pub(crate) eap_tls_config: Option<(EapConfig, EapTlsConfig)>,
 }
 
 #[cfg(test)]

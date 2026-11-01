@@ -15,7 +15,7 @@ mod tests;
 
 pub use self::{
     config::EapConfig,
-    eap_tls::EapTlsMethod,
+    eap_tls::{EapTlsConfig, EapTlsMethod},
     error::{ErrorKind, WifiError},
 };
 

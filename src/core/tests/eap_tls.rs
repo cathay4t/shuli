@@ -14,9 +14,9 @@ use crate::{
         EapPacket, EapPeer, TYPE_IDENTITY, TYPE_TLS,
     },
     eap_tls::{
-        EAP_TLS_FLAG_L, EAP_TLS_FLAG_M, EAP_TLS_FLAG_START, EapTlsMethod,
-        build_tls_message, cert_from_pem, certs_from_pem, client_config,
-        key_from_pem, parse_tls_message,
+        EAP_TLS_FLAG_L, EAP_TLS_FLAG_M, EAP_TLS_FLAG_START, EapTlsConfig,
+        EapTlsMethod, build_tls_message, cert_from_pem, certs_from_pem,
+        client_config, key_from_pem, parse_tls_message,
     },
 };
 
@@ -47,6 +47,33 @@ fn server_connection() -> ServerConnection {
     .with_single_cert(vec![cert], key)
     .expect("server config");
     ServerConnection::new(Arc::new(config)).expect("server connection")
+}
+
+/// The parsed configuration is reusable: one disk read / X.509 parse can
+/// create any number of method instances, and each starts with its own
+/// (unconnected) TLS state.
+#[test]
+fn test_eap_tls_config_is_reusable() {
+    let certs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/certs");
+    let config = crate::EapConfig {
+        identity: "user".to_string(),
+        ca_cert: Some(certs.join("ca.pem")),
+        client_cert: Some(certs.join("client.pem")),
+        client_key: Some(certs.join("client.key")),
+        server_name: Some(SERVER_NAME.to_string()),
+    };
+    let parsed = EapTlsConfig::from_config(&config).expect("parse EAP-TLS");
+    let first = parsed.new_method().expect("first method");
+    let second = parsed.new_method().expect("second method");
+    assert_eq!(first.method_type(), TYPE_TLS);
+    assert_eq!(second.method_type(), TYPE_TLS);
+    assert_eq!(first.msk(), None);
+    assert_eq!(second.msk(), None);
+
+    let mut missing = config.clone();
+    missing.ca_cert = None;
+    assert!(EapTlsConfig::from_config(&missing).is_err());
 }
 
 #[test]

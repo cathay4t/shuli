@@ -9,11 +9,11 @@
 //! passphrase) and EAP/802.1X plug in here without touching the client flow.
 
 use crate::{
-    ETH_ALEN, ErrorKind, WifiError, WifiIface,
+    ETH_ALEN, EapConfig, ErrorKind, WifiError, WifiIface,
     client::{ControlPortMode, MlmeMode},
     crypto::sae::SaeAuth,
     eap::EapPeer,
-    eap_tls::EapTlsMethod,
+    eap_tls::{EapTlsConfig, EapTlsMethod},
     scan::SecurityType,
 };
 
@@ -270,6 +270,34 @@ fn is_temporary_reject_status(status: u16) -> bool {
 }
 
 impl WifiIface {
+    /// Build an EAP-TLS method, reusing the parsed rustls client
+    /// configuration until the network's EAP settings change.
+    ///
+    /// Reading and parsing the CA, client certificate and private key is
+    /// expensive, and a reconnect loop would otherwise repeat it on
+    /// every attempt. The cached value is keyed by the full
+    /// [`EapConfig`], so an identity, path or server-name change rebuilds
+    /// it; a change to the *content* of an unchanged certificate file is
+    /// picked up on the next client start or network update.
+    fn eap_tls_method(
+        &mut self,
+        eap_cfg: &EapConfig,
+    ) -> Result<EapTlsMethod, WifiError> {
+        if !self
+            .eap_tls_config
+            .as_ref()
+            .is_some_and(|(cached, _)| cached == eap_cfg)
+        {
+            let parsed = EapTlsConfig::from_config(eap_cfg)?;
+            self.eap_tls_config = Some((eap_cfg.clone(), parsed));
+        }
+        self.eap_tls_config
+            .as_ref()
+            .expect("EAP-TLS config was just cached")
+            .1
+            .new_method()
+    }
+
     /// Start authentication with the selected BSS.
     ///
     /// PMKSA cache hit: send open-system AUTHENTICATE and
@@ -310,7 +338,7 @@ impl WifiIface {
             self.link.bss_info.security,
             SecurityType::Wpa2Ent | SecurityType::Wpa2EntSha256
         ) {
-            let eap_cfg = self.link.network.eap.as_ref().ok_or_else(|| {
+            let eap_cfg = self.link.network.eap.clone().ok_or_else(|| {
                 WifiError::new(
                     ErrorKind::InvalidConfig,
                     format!(
@@ -319,7 +347,7 @@ impl WifiIface {
                     ),
                 )
             })?;
-            let method = EapTlsMethod::from_config(eap_cfg)?;
+            let method = self.eap_tls_method(&eap_cfg)?;
             let mut peer = EapPeer::new(eap_cfg.identity.clone());
             peer.set_method(Box::new(method));
             self.auth.eap_peer = Some(peer);
