@@ -447,14 +447,10 @@ impl SaeAuth {
         }
         let peer_send_confirm =
             u16::from_le_bytes([peer_confirm_body[0], peer_confirm_body[1]]);
-        // 802.11-2020 §12.4.8.6.5: reject the invalid 0xffff value and a
-        // replayed/duplicate Confirm.
-        if peer_send_confirm == 0xffff {
-            return Err(WifiError::new(
-                ErrorKind::SaeFailed,
-                "invalid SAE Send-Confirm 0xffff",
-            ));
-        }
+        // 802.11-2020 §12.4.8.6.5: a Send-Confirm that does not increase
+        // is a replay/rollback attempt.  Note that hostapd uses the
+        // 0xffff sentinel when accepting a duplicated commit, and
+        // wpa_supplicant accepts it, so it is not rejected here.
         if self
             .peer_send_confirm
             .is_some_and(|last| peer_send_confirm <= last)
