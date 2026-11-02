@@ -7,12 +7,12 @@
 //! the shared secret.  Only ECC group 19 (NIST P-256) is supported
 //! (mandatory per RFC 8110 §4.3).
 
-use aws_lc_rs::digest;
 use p256::{
     PublicKey, SecretKey,
     ecdh::diffie_hellman,
     elliptic_curve::{Generate, sec1::ToSec1Point},
 };
+use sha2::{Digest, Sha256};
 use wl_nl80211::Ieee80211ElementBuffer;
 
 use crate::{ErrorKind, WifiError, crypto::kdf};
@@ -131,9 +131,9 @@ impl OweAuth {
             Vec::with_capacity(self.our_pubkey_raw.len() + ap_pubkey_raw.len());
         hash_data.extend_from_slice(&self.our_pubkey_raw);
         hash_data.extend_from_slice(ap_pubkey_raw);
-        let hash = digest::digest(&digest::SHA256, &hash_data);
+        let hash = Sha256::digest(&hash_data);
         let mut pmkid = [0u8; 16];
-        pmkid.copy_from_slice(&hash.as_ref()[..16]);
+        pmkid.copy_from_slice(&hash[..16]);
         self.pmkid = Some(pmkid);
 
         Ok(())

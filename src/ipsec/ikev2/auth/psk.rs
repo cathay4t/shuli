@@ -2,6 +2,8 @@
 
 //! RFC 7296 pre-shared-key authentication.
 
+use subtle::ConstantTimeEq;
+
 use crate::{config::PrfAlgorithm, error::IpsecError, ikev2::crypto};
 
 pub(crate) fn compute(psk: &[u8], prf: PrfAlgorithm, signed: &[u8]) -> Vec<u8> {
@@ -16,10 +18,7 @@ pub(crate) fn verify(
     auth: &[u8],
 ) -> Result<(), IpsecError> {
     let expected = compute(psk, prf, signed);
-    if expected.len() == auth.len()
-        && aws_lc_rs::constant_time::verify_slices_are_equal(&expected, auth)
-            .is_ok()
-    {
+    if expected.len() == auth.len() && bool::from(expected.ct_eq(auth)) {
         Ok(())
     } else {
         Err(IpsecError::authentication(

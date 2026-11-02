@@ -10,11 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aws_lc_rs::{
-    cmac,
-    key_wrap::{self, KeyWrap},
-    rand::{SecureRandom, SystemRandom},
-};
+use aes::{Aes128, Aes256};
+use aes_kw::{KwAes128, KwAes256};
+use cmac::{Cmac, KeyInit, Mac};
 use shuli_core::{ErrorKind, WifiError};
 use tokio::io::unix::AsyncFd;
 
@@ -115,14 +113,25 @@ fn mka_err(msg: impl Into<String>) -> WifiError {
     WifiError::new(ErrorKind::HandshakeFailed, msg)
 }
 
-fn cmac_key(key: &[u8]) -> Result<cmac::Key, WifiError> {
-    match key.len() {
-        16 => cmac::Key::new(cmac::AES_128, key)
-            .map_err(|e| mka_err(format!("AES-CMAC-128: {e}"))),
-        32 => cmac::Key::new(cmac::AES_256, key)
-            .map_err(|e| mka_err(format!("AES-CMAC-256: {e}"))),
-        n => Err(mka_err(format!("invalid CMAC key length {n}"))),
-    }
+fn cmac_aes(key: &[u8], msg: &[u8]) -> Result<[u8; 16], WifiError> {
+    let tag = match key.len() {
+        16 => {
+            let mut mac = <Cmac<Aes128> as KeyInit>::new_from_slice(key)
+                .map_err(|e| mka_err(format!("AES-CMAC-128: {e}")))?;
+            mac.update(msg);
+            mac.finalize().into_bytes()
+        }
+        32 => {
+            let mut mac = <Cmac<Aes256> as KeyInit>::new_from_slice(key)
+                .map_err(|e| mka_err(format!("AES-CMAC-256: {e}")))?;
+            mac.update(msg);
+            mac.finalize().into_bytes()
+        }
+        n => return Err(mka_err(format!("invalid CMAC key length {n}"))),
+    };
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&tag);
+    Ok(out)
 }
 
 /// IEEE 802.1X-2020 6.2.1 KDF (NIST SP 800-108 counter mode,
@@ -133,7 +142,6 @@ pub(crate) fn aes_kdf(
     context: &[u8],
     out: &mut [u8],
 ) -> Result<(), WifiError> {
-    let key = cmac_key(key)?;
     let length_bits = u16::try_from(out.len() * 8)
         .map_err(|_| mka_err("KDF output too long"))?;
     let mut offset = 0;
@@ -146,10 +154,10 @@ pub(crate) fn aes_kdf(
         msg.push(0);
         msg.extend_from_slice(context);
         msg.extend_from_slice(&length_bits.to_be_bytes());
-        let tag = cmac::sign(&key, &msg)
+        let tag = cmac_aes(key, &msg)
             .map_err(|e| mka_err(format!("KDF AES-CMAC: {e}")))?;
-        let take = (out.len() - offset).min(tag.as_ref().len());
-        out[offset..offset + take].copy_from_slice(&tag.as_ref()[..take]);
+        let take = (out.len() - offset).min(tag.len());
+        out[offset..offset + take].copy_from_slice(&tag[..take]);
         offset += take;
         counter = counter
             .checked_add(1)
@@ -233,18 +241,20 @@ pub(crate) fn wrap_key(
     kek: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, WifiError> {
-    let cipher = match kek.len() {
-        16 => &key_wrap::AES_128,
-        32 => &key_wrap::AES_256,
-        n => return Err(mka_err(format!("invalid KEK length {n}"))),
-    };
-    let kek = key_wrap::AesKek::new(cipher, kek)
-        .map_err(|e| mka_err(format!("AES key wrap: {e}")))?;
     let mut out = vec![0u8; plaintext.len() + 8];
-    let wrapped = kek
-        .wrap(plaintext, &mut out)
-        .map_err(|e| mka_err(format!("AES key wrap: {e}")))?;
-    Ok(wrapped.to_vec())
+    match kek.len() {
+        16 => {
+            let key: [u8; 16] = kek.try_into().expect("checked length");
+            KwAes128::new(&key.into()).wrap_key(plaintext, &mut out)
+        }
+        32 => {
+            let key: [u8; 32] = kek.try_into().expect("checked length");
+            KwAes256::new(&key.into()).wrap_key(plaintext, &mut out)
+        }
+        n => return Err(mka_err(format!("invalid KEK length {n}"))),
+    }
+    .map_err(|e| mka_err(format!("AES key wrap: {e}")))?;
+    Ok(out)
 }
 
 /// AES Key Unwrap (RFC 3394).
@@ -255,18 +265,20 @@ pub(crate) fn unwrap_key(
     if wrapped.len() < 16 || !wrapped.len().is_multiple_of(8) {
         return Err(mka_err("invalid wrapped key length"));
     }
-    let cipher = match kek.len() {
-        16 => &key_wrap::AES_128,
-        32 => &key_wrap::AES_256,
-        n => return Err(mka_err(format!("invalid KEK length {n}"))),
-    };
-    let kek = key_wrap::AesKek::new(cipher, kek)
-        .map_err(|e| mka_err(format!("AES key unwrap: {e}")))?;
     let mut out = vec![0u8; wrapped.len() - 8];
-    let plain = kek
-        .unwrap(wrapped, &mut out)
-        .map_err(|e| mka_err(format!("AES key unwrap: {e}")))?;
-    Ok(plain.to_vec())
+    match kek.len() {
+        16 => {
+            let key: [u8; 16] = kek.try_into().expect("checked length");
+            KwAes128::new(&key.into()).unwrap_key(wrapped, &mut out)
+        }
+        32 => {
+            let key: [u8; 32] = kek.try_into().expect("checked length");
+            KwAes256::new(&key.into()).unwrap_key(wrapped, &mut out)
+        }
+        n => return Err(mka_err(format!("invalid KEK length {n}"))),
+    }
+    .map_err(|e| mka_err(format!("AES key unwrap: {e}")))?;
+    Ok(out)
 }
 
 /// ICV over DA | SA | Ethertype | EAPOL PDU (without the ICV).
@@ -276,17 +288,12 @@ pub(crate) fn compute_icv(
     sa: &[u8; 6],
     eapol: &[u8],
 ) -> Result<[u8; ICV_LEN], WifiError> {
-    let key = cmac_key(ick)?;
     let mut msg = Vec::with_capacity(12 + 2 + eapol.len());
     msg.extend_from_slice(da);
     msg.extend_from_slice(sa);
     msg.extend_from_slice(&0x888eu16.to_be_bytes());
     msg.extend_from_slice(eapol);
-    let tag = cmac::sign(&key, &msg)
-        .map_err(|e| mka_err(format!("ICV AES-CMAC: {e}")))?;
-    let mut icv = [0u8; ICV_LEN];
-    icv.copy_from_slice(tag.as_ref());
-    Ok(icv)
+    cmac_aes(ick, &msg).map_err(|e| mka_err(format!("ICV AES-CMAC: {e}")))
 }
 
 fn verify_icv(
@@ -837,8 +844,7 @@ impl MkaSession {
         let kek = derive_kek(&config.cak, &config.ckn)?;
         let ick = derive_ick(&config.cak, &config.ckn)?;
         let mut mi = [0u8; MI_LEN];
-        SystemRandom::new()
-            .fill(&mut mi)
+        getrandom::fill(&mut mi)
             .map_err(|e| mka_err(format!("random MI: {e}")))?;
         let mut session = Self {
             iface_name: iface_name.to_string(),
@@ -1271,7 +1277,7 @@ impl MkaSession {
 
     fn reset_mi(&mut self) {
         let mut mi = [0u8; MI_LEN];
-        if SystemRandom::new().fill(&mut mi).is_err() {
+        if getrandom::fill(&mut mi).is_err() {
             mi = [0x5a; MI_LEN];
         }
         self.mi = mi;
@@ -1451,8 +1457,7 @@ impl MkaSession {
             }
         }
         let mut sak = vec![0u8; 16];
-        SystemRandom::new()
-            .fill(&mut sak)
+        getrandom::fill(&mut sak)
             .map_err(|e| mka_err(format!("random SAK: {e}")))?;
         let kn = self.next_kn;
         self.next_kn = self.next_kn.wrapping_add(1).max(1);

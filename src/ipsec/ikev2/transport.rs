@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 
 use crate::error::IpsecError;
@@ -205,7 +206,7 @@ pub fn nat_detection_hash(
     address: IpAddr,
     port: u16,
 ) -> Vec<u8> {
-    use aws_lc_rs::digest;
+    use ring::digest;
     let mut context = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
     context.update(&spi_i.to_be_bytes());
     context.update(&spi_r.to_be_bytes());
@@ -227,9 +228,5 @@ pub fn nat_detection_matches(
 ) -> bool {
     let expected = nat_detection_hash(spi_i, spi_r, address, port);
     expected.len() == notify_data.len()
-        && aws_lc_rs::constant_time::verify_slices_are_equal(
-            &expected,
-            notify_data,
-        )
-        .is_ok()
+        && bool::from(expected.ct_eq(notify_data))
 }

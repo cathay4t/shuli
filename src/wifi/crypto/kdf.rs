@@ -3,7 +3,13 @@
 // KDF/PRF functions as defined in IEEE 802.11-2020.
 // Used by SAE (key derivation, confirm) and 4-way handshake.
 
-use aws_lc_rs::hmac;
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
 
 /// IEEE 802.11 KDF-Hash-Length using HMAC-SHA256
 /// (sha256_prf_bits, 802.11-2020 §12.7.1.7.2).
@@ -13,20 +19,20 @@ use aws_lc_rs::hmac;
 /// Note: counter and length are 16-bit little-endian and there is NO 0x00
 /// separator between label and context.
 pub fn kdf(key: &[u8], label: &str, context: &[u8], length: usize) -> Vec<u8> {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
     let label_bytes = label.as_bytes();
     let len_bits = (length * 8) as u16;
     let mut result = Vec::with_capacity(length);
 
     let mut counter: u16 = 1;
     while result.len() < length {
-        let mut ctx = hmac::Context::with_key(&hmac_key);
-        ctx.update(&counter.to_le_bytes());
-        ctx.update(label_bytes);
-        ctx.update(context);
-        ctx.update(&len_bits.to_le_bytes());
-        let tag = ctx.sign();
-        result.extend_from_slice(tag.as_ref());
+        let mut mac = HmacSha256::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(&counter.to_le_bytes());
+        mac.update(label_bytes);
+        mac.update(context);
+        mac.update(&len_bits.to_le_bytes());
+        let tag = mac.finalize().into_bytes();
+        result.extend_from_slice(&tag);
         counter += 1;
     }
 
@@ -36,10 +42,12 @@ pub fn kdf(key: &[u8], label: &str, context: &[u8], length: usize) -> Vec<u8> {
 
 /// HKDF-Extract (RFC 5869): `PRK = HMAC-Hash(salt, ikm)`.
 pub fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, salt);
-    let tag = hmac::sign(&hmac_key, ikm);
+    let mut mac = HmacSha256::new_from_slice(salt)
+        .expect("HMAC accepts keys of any length");
+    mac.update(ikm);
+    let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
-    out.copy_from_slice(tag.as_ref());
+    out.copy_from_slice(&tag);
     out
 }
 
@@ -55,43 +63,39 @@ pub fn sae_confirm(
     scalar2: &[u8],
     element2: &[u8],
 ) -> Vec<u8> {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, kck);
-    let mut ctx = hmac::Context::with_key(&hmac_key);
-    ctx.update(&send_confirm.to_le_bytes());
-    ctx.update(scalar1);
-    ctx.update(element1);
-    ctx.update(scalar2);
-    ctx.update(element2);
-    ctx.sign().as_ref().to_vec()
+    let mut mac = HmacSha256::new_from_slice(kck)
+        .expect("HMAC accepts keys of any length");
+    mac.update(&send_confirm.to_le_bytes());
+    mac.update(scalar1);
+    mac.update(element1);
+    mac.update(scalar2);
+    mac.update(element2);
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// HKDF-Expand (RFC 5869) using HMAC-SHA256.
 /// Fills `okm` with OKM = HKDF-Expand(prk, info, okm.len()).
-pub fn hkdf_expand(prk: &[u8], info: &[u8], okm: &mut [u8]) {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
-    let mut prev = Vec::new();
-    let mut filled = 0;
-    let mut i: u8 = 1;
-    while filled < okm.len() {
-        let mut ctx = hmac::Context::with_key(&key);
-        ctx.update(&prev);
-        ctx.update(info);
-        ctx.update(&[i]);
-        prev = ctx.sign().as_ref().to_vec();
-        let to_copy = prev.len().min(okm.len() - filled);
-        okm[filled..filled + to_copy].copy_from_slice(&prev[..to_copy]);
-        filled += to_copy;
-        i += 1;
-    }
+///
+/// The PRK is typed as a 32-byte array because it is the output of
+/// [`hkdf_extract_sha256`] and RFC 5869 requires a PRK of at least the hash
+/// length for HKDF-Expand. This makes the length check a compile-time
+/// invariant instead of a runtime panic.
+pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) {
+    Hkdf::<Sha256>::from_prk(prk)
+        .expect("32-byte PRK is valid")
+        .expand(info, okm)
+        .expect("OKM length is at most 255 * hash output length");
 }
 
 /// HMAC-SHA256 MIC for OWE 4-way handshake:
 /// `Truncate-128(HMAC-SHA256(KCK, data))`.
 pub fn hmac_sha256_mic(kck: &[u8], data: &[u8]) -> [u8; 16] {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, kck);
-    let tag = hmac::sign(&hmac_key, data);
+    let mut mac = HmacSha256::new_from_slice(kck)
+        .expect("HMAC accepts keys of any length");
+    mac.update(data);
+    let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 16];
-    out.copy_from_slice(&tag.as_ref()[..16]);
+    out.copy_from_slice(&tag[..16]);
     out
 }
 
@@ -106,19 +110,19 @@ pub fn prf_sha1(
     context: &[u8],
     length: usize,
 ) -> Vec<u8> {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
     let label_bytes = label.as_bytes();
     let mut result = Vec::with_capacity(length);
 
     let mut counter: u8 = 0;
     while result.len() < length {
-        let mut ctx = hmac::Context::with_key(&hmac_key);
-        ctx.update(label_bytes);
-        ctx.update(&[0x00]);
-        ctx.update(context);
-        ctx.update(&[counter]);
-        let tag = ctx.sign();
-        result.extend_from_slice(tag.as_ref());
+        let mut mac = HmacSha1::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(label_bytes);
+        mac.update(&[0x00]);
+        mac.update(context);
+        mac.update(&[counter]);
+        let tag = mac.finalize().into_bytes();
+        result.extend_from_slice(&tag);
         counter += 1;
     }
 
@@ -129,21 +133,22 @@ pub fn prf_sha1(
 /// HMAC-SHA1 MIC for WPA2-PSK 4-way handshake:
 /// `Truncate-128(HMAC-SHA1(KCK, data))`.
 pub fn hmac_sha1_mic(kck: &[u8], data: &[u8]) -> [u8; 16] {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, kck);
-    let tag = hmac::sign(&hmac_key, data);
+    let mut mac =
+        HmacSha1::new_from_slice(kck).expect("HMAC accepts keys of any length");
+    mac.update(data);
+    let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 16];
-    out.copy_from_slice(&tag.as_ref()[..16]);
+    out.copy_from_slice(&tag[..16]);
     out
 }
 
 /// WPA2-PSK PMK derivation: PBKDF2(HMAC-SHA1, password, SSID, 4096, 256).
 pub fn pbkdf2_pmk(password: &str, ssid: &str) -> [u8; 32] {
     let mut pmk = [0u8; 32];
-    aws_lc_rs::pbkdf2::derive(
-        aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA1,
-        std::num::NonZeroU32::new(4096).unwrap(),
-        ssid.as_bytes(),
+    pbkdf2::pbkdf2_hmac::<Sha1>(
         password.as_bytes(),
+        ssid.as_bytes(),
+        4096,
         &mut pmk,
     );
     pmk

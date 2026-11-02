@@ -23,6 +23,7 @@ use p256::{
     },
     hash2curve::MapToCurve,
 };
+use subtle::ConstantTimeEq;
 
 use crate::{
     ErrorKind, WifiError,
@@ -486,11 +487,7 @@ impl SaeAuth {
             &self.own_elem_bytes,
         );
 
-        if aws_lc_rs::constant_time::verify_slices_are_equal(
-            &expected, peer_hash,
-        )
-        .is_err()
-        {
+        if !bool::from(expected.ct_eq(peer_hash)) {
             return Err(WifiError::new(
                 ErrorKind::WrongPassword,
                 "wrong password (SAE confirm mismatch)",

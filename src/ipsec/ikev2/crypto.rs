@@ -5,17 +5,17 @@
 //! All secret material is held in ordinary vectors only for the duration of
 //! a primitive call; callers wrap long-lived material in `zeroize` types.
 
-use aws_lc_rs::{
-    aead,
-    agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
-    cipher::{
-        AES_128, AES_256, DecryptingKey, DecryptionContext, EncryptingKey,
-        EncryptionContext, UnboundCipherKey,
-    },
-    hmac,
-    iv::{FixedLength, IV_LEN_128_BIT},
+use aes::{Aes128, Aes192, Aes256};
+use cbc::cipher::{
+    BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::NoPadding,
 };
 use num_bigint::BigUint;
+use ring::{
+    aead,
+    agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
+    hmac,
+};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -96,7 +96,7 @@ pub fn integrity(
     };
     let key = hmac::Key::new(algorithm, key);
     let tag = hmac::sign(&key, data);
-    let length = match algorithm.digest_algorithm().output_len {
+    let length = match algorithm.digest_algorithm().output_len() {
         20 => 12,
         _ => 16,
     };
@@ -111,10 +111,7 @@ pub fn verify_integrity(
     expected: &[u8],
 ) -> Result<(), IpsecError> {
     let actual = integrity(algorithm, key, data)?;
-    if actual.len() == expected.len()
-        && aws_lc_rs::constant_time::verify_slices_are_equal(&actual, expected)
-            .is_ok()
-    {
+    if actual.len() == expected.len() && bool::from(actual.ct_eq(expected)) {
         Ok(())
     } else {
         Err(IpsecError::authentication("IKE integrity check failed"))
@@ -219,17 +216,6 @@ fn decrypt_gcm(
     Ok(plaintext.to_vec())
 }
 
-fn cipher_algorithm(
-    algorithm: EncryptionAlgorithm,
-) -> &'static aws_lc_rs::cipher::Algorithm {
-    match algorithm {
-        EncryptionAlgorithm::AesCbc128 => &AES_128,
-        EncryptionAlgorithm::AesCbc192 => &aws_lc_rs::cipher::AES_192,
-        EncryptionAlgorithm::AesCbc256 => &AES_256,
-        _ => &AES_128,
-    }
-}
-
 fn encrypt_cbc(
     algorithm: EncryptionAlgorithm,
     key: &[u8],
@@ -245,16 +231,31 @@ fn encrypt_cbc(
         .try_into()
         .map_err(|_| IpsecError::internal("invalid AES-CBC IV length"))?;
     let mut output = plaintext.to_vec();
-    let unbound = UnboundCipherKey::new(cipher_algorithm(algorithm), key)
-        .map_err(|_| IpsecError::internal("invalid AES key"))?;
-    let cipher = EncryptingKey::cbc(unbound)
-        .map_err(|_| IpsecError::internal("AES-CBC init failed"))?;
-    cipher
-        .less_safe_encrypt(
-            &mut output,
-            EncryptionContext::Iv128(FixedLength::<IV_LEN_128_BIT>::from(iv)),
-        )
-        .map_err(|_| IpsecError::internal("AES-CBC encryption failed"))?;
+    match algorithm {
+        EncryptionAlgorithm::AesCbc128 => {
+            let key: [u8; 16] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Encryptor::<Aes128>::new(&key.into(), &iv.into())
+                .encrypt_padded::<NoPadding>(&mut output, plaintext.len())
+        }
+        EncryptionAlgorithm::AesCbc192 => {
+            let key: [u8; 24] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Encryptor::<Aes192>::new(&key.into(), &iv.into())
+                .encrypt_padded::<NoPadding>(&mut output, plaintext.len())
+        }
+        EncryptionAlgorithm::AesCbc256 => {
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+                .encrypt_padded::<NoPadding>(&mut output, plaintext.len())
+        }
+        _ => return Err(IpsecError::internal("not an AES-CBC algorithm")),
+    }
+    .map_err(|_| IpsecError::internal("AES-CBC encryption failed"))?;
     Ok(output)
 }
 
@@ -271,17 +272,32 @@ fn decrypt_cbc(
         .try_into()
         .map_err(|_| IpsecError::internal("invalid AES-CBC IV length"))?;
     let mut output = ciphertext.to_vec();
-    let unbound = UnboundCipherKey::new(cipher_algorithm(algorithm), key)
-        .map_err(|_| IpsecError::internal("invalid AES key"))?;
-    let cipher = DecryptingKey::cbc(unbound)
-        .map_err(|_| IpsecError::internal("AES-CBC init failed"))?;
-    let plaintext = cipher
-        .decrypt(
-            &mut output,
-            DecryptionContext::Iv128(FixedLength::<IV_LEN_128_BIT>::from(iv)),
-        )
-        .map_err(|_| IpsecError::authentication("AES-CBC decryption failed"))?;
-    Ok(plaintext.to_vec())
+    match algorithm {
+        EncryptionAlgorithm::AesCbc128 => {
+            let key: [u8; 16] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Decryptor::<Aes128>::new(&key.into(), &iv.into())
+                .decrypt_padded::<NoPadding>(&mut output)
+        }
+        EncryptionAlgorithm::AesCbc192 => {
+            let key: [u8; 24] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Decryptor::<Aes192>::new(&key.into(), &iv.into())
+                .decrypt_padded::<NoPadding>(&mut output)
+        }
+        EncryptionAlgorithm::AesCbc256 => {
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| IpsecError::internal("invalid AES key"))?;
+            cbc::Decryptor::<Aes256>::new(&key.into(), &iv.into())
+                .decrypt_padded::<NoPadding>(&mut output)
+        }
+        _ => return Err(IpsecError::internal("not an AES-CBC algorithm")),
+    }
+    .map_err(|_| IpsecError::authentication("AES-CBC decryption failed"))?;
+    Ok(output)
 }
 
 /// A Diffie-Hellman private/public key pair.
@@ -309,15 +325,13 @@ impl DhKeyPair {
             DhPrivate::Ephemeral(private) => {
                 let algorithm = agreement_algorithm(self.group)?;
                 let peer = UnparsedPublicKey::new(algorithm, peer_public);
-                let shared = agreement::agree_ephemeral(
-                    private,
-                    peer,
-                    aws_lc_rs::error::Unspecified,
-                    |secret| Ok(secret.to_vec()),
-                )
-                .map_err(|_| {
-                    IpsecError::ike("Diffie-Hellman key agreement failed")
-                })?;
+                let shared =
+                    agreement::agree_ephemeral(private, &peer, |secret| {
+                        secret.to_vec()
+                    })
+                    .map_err(|_| {
+                        IpsecError::ike("Diffie-Hellman key agreement failed")
+                    })?;
                 Ok(Zeroizing::new(shared))
             }
             DhPrivate::Modp(private) => {
@@ -343,7 +357,7 @@ impl DhKeyPair {
                 let algorithm = agreement_algorithm(group)?;
                 let private = EphemeralPrivateKey::generate(
                     algorithm,
-                    &aws_lc_rs::rand::SystemRandom::new(),
+                    &ring::rand::SystemRandom::new(),
                 )
                 .map_err(|_| {
                     IpsecError::internal("DH key generation failed")

@@ -24,7 +24,7 @@
 //!
 //! with XXKey = PMK for both FT-PSK and FT-SAE.
 
-use aws_lc_rs::digest;
+use sha2::{Digest, Sha256};
 use wl_nl80211::Ieee80211FtKeySubelem;
 
 use super::kdf::kdf;
@@ -83,10 +83,10 @@ pub(crate) fn derive_pmk_r0(
     let mut hash_input = Vec::with_capacity(6 + 16);
     hash_input.extend_from_slice(b"FT-R0N");
     hash_input.extend_from_slice(salt);
-    let hash = digest::digest(&digest::SHA256, &hash_input);
+    let hash = Sha256::digest(&hash_input);
 
     let mut name = [0u8; 16];
-    name.copy_from_slice(&hash.as_ref()[..16]);
+    name.copy_from_slice(&hash[..16]);
     PmkR0 { key, name }
 }
 
@@ -110,10 +110,10 @@ pub(crate) fn derive_pmk_r1(
     hash_input.extend_from_slice(&pmk_r0.name);
     hash_input.extend_from_slice(&r1kh_id);
     hash_input.extend_from_slice(&s1kh_id);
-    let hash = digest::digest(&digest::SHA256, &hash_input);
+    let hash = Sha256::digest(&hash_input);
 
     let mut name = [0u8; 16];
-    name.copy_from_slice(&hash.as_ref()[..16]);
+    name.copy_from_slice(&hash[..16]);
     PmkR1 { key, name }
 }
 

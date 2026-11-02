@@ -40,7 +40,17 @@ wl-nl80211 = "0.8.0"
 mozim = { version = "0.3.2", default-features = false, features = ["netlink"] }
 p256 = { version = "0.14", features = ["arithmetic", "hash2curve", "ecdh", "getrandom"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
-aws-lc-rs = "1"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+pbkdf2 = "0.13"
+cmac = "0.8"
+aes = "0.9"
+aes-kw = "0.3"
+cbc = "0.2"
+subtle = "2"
+ring = "0.17"
 libc = "0.2"
 nispor = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

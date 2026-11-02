@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use aws_lc_rs::key_wrap::{self, KeyWrap};
+use aes_kw::{KeyInit, KwAes128};
 use wl_nl80211::{
     Ieee80211EapolKeyFrame, Ieee80211KeyDataKdes, Ieee80211Oci, build_oci_kde,
     parse_oci_kde,
@@ -30,11 +30,8 @@ fn aes_key_wrap(
 ) -> Result<Vec<u8>, WifiError> {
     let out_len = plaintext.len() + 8;
     let mut out = vec![0u8; out_len];
-    let kek =
-        key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
-            WifiError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
-        })?;
-    kek.wrap(plaintext, &mut out).map_err(|e| {
+    let kek = KwAes128::new(&(*kek_bytes).into());
+    kek.wrap_key(plaintext, &mut out).map_err(|e| {
         WifiError::new(ErrorKind::HandshakeFailed, format!("key wrap: {e}"))
     })?;
     Ok(out)

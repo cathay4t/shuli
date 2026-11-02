@@ -11,7 +11,10 @@
 //! SAE uses KDF-Hash-Length + AES-CMAC MIC; OWE uses PRF + HMAC-SHA256
 //! MIC (RFC 8110 Table 2).
 
-use aws_lc_rs::{cmac, key_wrap, key_wrap::KeyWrap, rand::SecureRandom};
+use aes::Aes128;
+use aes_kw::KwAes128;
+use cmac::{Cmac, KeyInit, Mac};
+use subtle::ConstantTimeEq;
 use wl_nl80211::{
     Ieee80211EapolKeyFrame, Ieee80211KeyDataKdes, Ieee80211Oci, build_oci_kde,
     parse_key_data_kdes,
@@ -105,9 +108,7 @@ impl FourWayState {
         ap_rsnxe: Vec<u8>,
     ) -> Self {
         let mut snonce = [0u8; 32];
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut snonce)
-            .expect("RNG");
+        getrandom::fill(&mut snonce).expect("RNG");
         Self {
             pmk: *pmk,
             mac_sta,
@@ -150,9 +151,7 @@ impl FourWayState {
         ap_rsnxe: Vec<u8>,
     ) -> Self {
         let mut snonce = [0u8; 32];
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut snonce)
-            .expect("RNG");
+        getrandom::fill(&mut snonce).expect("RNG");
         Self {
             pmk: [0u8; 32],
             mac_sta,
@@ -372,9 +371,7 @@ impl FourWayState {
             ));
         }
         if !duplicate {
-            aws_lc_rs::rand::SystemRandom::new()
-                .fill(&mut self.snonce)
-                .expect("RNG");
+            getrandom::fill(&mut self.snonce).expect("RNG");
         }
         self.anonce = Some(*anonce);
         self.pending_replay_counter = Some(replay_counter);
@@ -458,12 +455,7 @@ impl FourWayState {
             &kck,
             &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
         )?;
-        if aws_lc_rs::constant_time::verify_slices_are_equal(
-            &expected,
-            &frame.key_mic,
-        )
-        .is_err()
-        {
+        if !bool::from(expected.ct_eq(&frame.key_mic)) {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "MIC mismatch",
@@ -620,12 +612,7 @@ impl FourWayState {
             &kck,
             &Ieee80211EapolKeyFrame::pdu_with_zeroed_mic(&frame.raw),
         )?;
-        if aws_lc_rs::constant_time::verify_slices_are_equal(
-            &expected,
-            &frame.key_mic,
-        )
-        .is_err()
-        {
+        if !bool::from(expected.ct_eq(&frame.key_mic)) {
             return Err(WifiError::new(
                 ErrorKind::HandshakeFailed,
                 "group rekey MIC mismatch",
@@ -687,14 +674,14 @@ pub(crate) fn aes_cmac(
     kck: &[u8; KCK_LEN],
     data: &[u8],
 ) -> Result<[u8; EAPOL_MIC_LEN], WifiError> {
-    let key = cmac::Key::new(cmac::AES_128, kck).map_err(|e| {
-        WifiError::new(ErrorKind::HandshakeFailed, e.to_string())
-    })?;
-    let tag = cmac::sign(&key, data).map_err(|e| {
-        WifiError::new(ErrorKind::HandshakeFailed, e.to_string())
-    })?;
+    let mut mac =
+        <Cmac<Aes128> as KeyInit>::new_from_slice(kck).map_err(|e| {
+            WifiError::new(ErrorKind::HandshakeFailed, e.to_string())
+        })?;
+    mac.update(data);
+    let tag = mac.finalize().into_bytes();
     let mut mic = [0u8; EAPOL_MIC_LEN];
-    mic.copy_from_slice(tag.as_ref());
+    mic.copy_from_slice(&tag);
     Ok(mic)
 }
 
@@ -711,14 +698,8 @@ pub(crate) fn aes_key_unwrap(
     }
     let out_len = wrapped.len() - 8;
     let mut out = vec![0u8; out_len];
-    let kek =
-        key_wrap::AesKek::new(&key_wrap::AES_128, kek_bytes).map_err(|e| {
-            WifiError::new(
-                ErrorKind::HandshakeFailed,
-                format!("key unwrap: {e}"),
-            )
-        })?;
-    kek.unwrap(wrapped, &mut out).map_err(|e| {
+    let kek = KwAes128::new(&(*kek_bytes).into());
+    kek.unwrap_key(wrapped, &mut out).map_err(|e| {
         WifiError::new(ErrorKind::HandshakeFailed, format!("key unwrap: {e}"))
     })?;
     Ok(out)

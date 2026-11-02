@@ -214,8 +214,10 @@ src/ipsec/
   `netlink-sys`.
 - Link management: `rtnetlink`, using `LinkXfrm` and `InfoXfrm::IfId`.
 - Async runtime and utilities: `tokio`, `futures`, `log`.
-- Crypto: `aws-lc-rs`, `getrandom`, `zeroize`, and `rustls` through
-  `shuli-core` for EAP-TLS.
+- Crypto: `ring` for signatures, ECDH, AEAD, and HMAC; RustCrypto
+  primitives (`aes`, `aes-kw`, `cbc`, `cmac`, `hmac`, `hkdf`, `pbkdf2`,
+  `sha1`, `sha2`, `subtle`) elsewhere; plus `getrandom`, `zeroize`, and
+  `rustls` through `shuli-core` for EAP-TLS.
 - X.509 parsing and verification: choose in milestone 0, preferably
   RustCrypto or rustls-webpki pieces rather than OpenSSL/NSS.
 - Serde support for public config/event types is optional behind a
@@ -885,10 +887,10 @@ The feasibility decisions are now recorded here:
 - **MOBIKE** and **EAP-TLS server/responder** are deferred.  The first
   release supports the EAP-TLS client only.
 - **X.509** parsing and path validation use `rustls-webpki`
-  (Apache-2.0-compatible); signatures, ECDH, AEAD, HMAC, and AES-CBC use
-  `aws-lc-rs`.
+  (Apache-2.0-compatible); signatures, ECDH, AEAD, and HMAC use `ring`;
+  AES-CBC and the AES key-wrap/CMAC helpers use RustCrypto.
 - **MODP-2048** is implemented with `num-bigint` constant-length modular
-  exponentiation; ECP-256, ECP-384, and X25519 use `aws-lc-rs`.
+  exponentiation; ECP-256, ECP-384, and X25519 use `ring`.
 - The XFRM layer talks to the kernel through `netlink-packet-xfrm` and
   `netlink-proto` directly; no `xfrmnetlink` high-level dependency is
   used.

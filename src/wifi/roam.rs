@@ -15,7 +15,6 @@
 //!  5. validate the response FTIE MIC and install PTK/GTK/IGTK/BIGTK from the
 //!     FTIE subelements - no 4-way handshake follows.
 
-use aws_lc_rs::rand::SecureRandom;
 use futures::StreamExt;
 use wl_nl80211::{
     ELEMENT_ID_FTIE, ELEMENT_ID_MDIE, ELEMENT_ID_RSN, ELEMENT_ID_RSN_EXT,
@@ -1079,9 +1078,7 @@ impl WifiIface {
         };
 
         let mut snonce = [0u8; 32];
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut snonce)
-            .expect("RNG");
+        getrandom::fill(&mut snonce).expect("RNG");
 
         // FT Authentication request IEs: RSNE with PMKR0Name as PMKID,
         // then MDIE and FTIE (SNonce + R0KH-ID). hostapd rejects the

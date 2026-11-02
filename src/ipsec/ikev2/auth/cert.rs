@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use aws_lc_rs::{
+use ring::{
     rand::SystemRandom,
     signature::{
         self, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
@@ -60,17 +60,18 @@ impl LocalAuth {
         }
         let key = parse_private_key(config.private_key.expose())?;
         let key = key.as_slice();
+        let rng = SystemRandom::new();
         let credentials = if let Ok(key) = RsaKeyPair::from_pkcs8(key) {
             LocalCredentials::Rsa(key)
         } else if let Ok(key) =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key)
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key, &rng)
         {
             LocalCredentials::Ecdsa {
                 key,
                 method: super::AUTH_ECDSA_P256_SHA256,
             }
         } else if let Ok(key) =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, key)
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, key, &rng)
         {
             LocalCredentials::Ecdsa {
                 key,
@@ -95,7 +96,7 @@ impl LocalAuth {
         let rng = SystemRandom::new();
         match &self.credentials {
             LocalCredentials::Rsa(key) => {
-                let mut signature = vec![0u8; key.public_modulus_len()];
+                let mut signature = vec![0u8; key.public().modulus_len()];
                 key.sign(
                     &signature::RSA_PKCS1_SHA256,
                     &rng,

@@ -28,7 +28,15 @@ netlink-proto.workspace = true
 netlink-sys.workspace = true
 p256.workspace = true
 getrandom.workspace = true
-aws-lc-rs.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+pbkdf2.workspace = true
+cmac.workspace = true
+aes.workspace = true
+aes-kw.workspace = true
+subtle.workspace = true
 libc.workspace = true
 serde.workspace = true
 
