@@ -30,12 +30,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 futures = "0.3"
 netlink-packet-core = "0.9"
 netlink-packet-generic = "0.5"
-genetlink = "0.3"
-netlink-proto = "0.13"
+genetlink = "0.3.1"
+netlink-proto = "0.14"
 netlink-sys = "0.9"
-rtnetlink = "0.23"
-nl-macsec = "0.2.1"
-wl-nl80211 = "0.8.0"
+rtnetlink = "0.24"
+nl-macsec = "0.2.2"
+wl-nl80211 = "0.9.0"
 #wl-nl80211 = { git = "https://github.com/rust-netlink/wl-nl80211.git" }
 mozim = { version = "0.3.2", default-features = false, features = ["netlink"] }
 p256 = { version = "0.14", features = ["arithmetic", "hash2curve", "ecdh", "getrandom"] }
@@ -52,5 +52,5 @@ cbc = "0.2"
 subtle = "2"
 ring = "0.17"
 libc = "0.2"
-nispor = "2"
+nispor = { git = "https://github.com/nispor/nispor.git", rev = "5e1b7426b849da1dd8b51b80f49591069cc19f81" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
