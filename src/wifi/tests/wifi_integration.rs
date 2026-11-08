@@ -27,13 +27,20 @@
 
 use std::sync::LazyLock;
 
+use genetlink::message::map_to_rawgenlmsg;
+use netlink_packet_core::NetlinkMessage;
+use netlink_packet_generic::GenlMessage;
 use tokio::sync::Mutex;
-use wl_nl80211::Ieee80211EapolKeyFrame;
+use wl_nl80211::{
+    Ieee80211EapolKeyFrame, Ieee80211ReasonCode, Nl80211Command,
+    Nl80211Message,
+};
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
     client::{
         ControlPortMode, FastReconnect, MlmeMode, RETRY_BACKOFF_INIT_SEC,
+        WifiEvent,
     },
     config::TestModeOverride,
 };
@@ -2304,6 +2311,119 @@ async fn wifi_client_wpa2_psk_pmksa_reconnect() {
             .psk_pmk
             .is_none(),
         "reconnect must use the cached PMKSA instead of re-deriving the PMK"
+    );
+    client.shutdown().await;
+}
+
+/// An AP disconnect that arrives after a successful association but
+/// before the 4-way handshake starts must abort the attempt and retry.
+/// Previously it was classified as a stale event (the state machine is
+/// still `Authenticating` for the whole SAE + association + handshake
+/// flow), so the client waited for a handshake that could never arrive.
+#[tokio::test]
+async fn wifi_client_ap_disconnect_after_association_retries() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_ap_disconnect_after_association_retries: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::provision();
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let iface = client.ifaces.values_mut().next().unwrap();
+    iface.state = WifiState::Authenticating;
+    iface.link.assoc_done = true;
+    iface
+        .handle_ap_disconnect(
+            Some(Ieee80211ReasonCode::PrevAuthNotValid),
+            Some(true),
+        )
+        .await;
+    assert_eq!(iface.state, WifiState::Failed);
+    assert_eq!(iface.fast_reconnect, Some(FastReconnect::ScanNow));
+    client.shutdown().await;
+}
+
+/// A stalled 4-way handshake must still time out when a PNO session
+/// armed before the link was lost keeps delivering scan results. Those
+/// events are not authentication progress and must not re-arm the
+/// authentication timeout, otherwise the attempt hangs forever (the
+/// original report needed `systemctl restart nipart`).
+#[tokio::test]
+async fn wifi_client_stalled_handshake_times_out_despite_pno_results() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_stalled_handshake_times_out_despite_pno_results: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::provision();
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+
+    // Reproduce the vulnerable window: the association succeeded, and
+    // the client is waiting for a 4-way handshake the AP will never
+    // start.
+    let event_tx = {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        iface.state = WifiState::Authenticating;
+        iface.link.assoc_done = true;
+        iface.event_tx.clone()
+    };
+
+    // Deliver a PNO result every 2 s, like the scheduled scan that was
+    // armed before the link was lost. Without the fix these keep
+    // re-arming the 15 s authentication timeout, so the attempt never
+    // fails within the test window.
+    let injector = tokio::spawn(async move {
+        for _ in 0..10 {
+            let msg = map_to_rawgenlmsg(NetlinkMessage::from(
+                GenlMessage::from_payload(Nl80211Message {
+                    cmd: Nl80211Command::SchedScanResults,
+                    attributes: Vec::new(),
+                }),
+            ));
+            if event_tx.unbounded_send(WifiEvent::Kernel(msg)).is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        client.run(),
+    )
+    .await
+    .expect("a stalled handshake must time out instead of hanging")
+    .expect("run");
+    injector.abort();
+    assert!(
+        matches!(
+            state.state,
+            WifiState::Failed | WifiState::FailedAuthentication
+        ),
+        "stalled attempt must fail, got {:?}",
+        state.state
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "stalled attempt took {:?}",
+        started.elapsed()
     );
     client.shutdown().await;
 }

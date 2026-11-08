@@ -372,6 +372,12 @@ pub(crate) struct Link {
     /// request IEs, so the value is refreshed from
     /// `NL80211_ATTR_REQ_IE` when the CONNECT result arrives.
     pub(crate) assoc_wpa_ie: Vec<u8>,
+    /// Whether the current attempt received a successful association (or
+    /// FullMAC CONNECT) response and is now waiting for the 4-way
+    /// handshake. A disconnect in that window means the handshake can
+    /// never complete, so it must abort the attempt instead of being
+    /// treated as a stale event from the previous link.
+    pub(crate) assoc_done: bool,
     /// 4-way handshake state (shared by all auth methods).
     pub(crate) fourway: Option<FourWayState>,
     /// The PMKSA entry of the connection attempt in flight, when the
@@ -532,6 +538,7 @@ impl Link {
         self.network = network;
         self.bss_info = BssInfo::default();
         self.assoc_wpa_ie.clear();
+        self.assoc_done = false;
         self.fourway = None;
         self.pmksa_in_use = None;
         self.ft = None;
@@ -753,6 +760,7 @@ mod tests {
             network: network("A"),
             bss_info: BssInfo::default(),
             assoc_wpa_ie: Vec::new(),
+            assoc_done: false,
             fourway: None,
             pmksa_in_use: None,
             ft: None,

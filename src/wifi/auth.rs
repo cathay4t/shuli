@@ -311,6 +311,7 @@ impl WifiIface {
         &mut self,
     ) -> Result<(), WifiError> {
         self.auth.method = None;
+        self.link.assoc_done = false;
         self.link.fourway = None;
         self.link.ptk_rekey = false;
         // A new connection attempt starts a fresh SAE/PSK exchange, so the

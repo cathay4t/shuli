@@ -253,6 +253,7 @@ impl WifiIface {
             network,
             bss_info: BssInfo::default(),
             assoc_wpa_ie: Vec::new(),
+            assoc_done: false,
             fourway: None,
             pmksa_in_use: None,
             ft: None,
@@ -517,7 +518,9 @@ impl WifiIface {
             )
             .await
             {
-                Ok(Some(event)) => self.handle_wifi_event(event).await,
+                Ok(Some(event)) => {
+                    self.handle_wifi_event(event).await;
+                }
                 Ok(None) | Err(_) => break,
             }
         }
@@ -886,8 +889,15 @@ impl WifiIface {
                     .await;
                     match timed {
                         Ok(Some(event)) => {
-                            self.handle_wifi_event(event).await;
-                            self.clear_wait_deadline();
+                            let auth_progress =
+                                self.handle_wifi_event(event).await;
+                            // Only authentication progress restarts the
+                            // timeout. Unrelated events (notably PNO scan
+                            // results from before the link was lost) must
+                            // not postpone a stalled handshake forever.
+                            if auth_progress {
+                                self.clear_wait_deadline();
+                            }
                             break;
                         }
                         Ok(None) => {
@@ -1121,7 +1131,9 @@ impl WifiIface {
                     return Ok(());
                 }
                 match next {
-                    Ok(Some(event)) => self.handle_wifi_event(event).await,
+                    Ok(Some(event)) => {
+                        self.handle_wifi_event(event).await;
+                    }
                     Ok(None) => {
                         return Err(WifiError::new(
                             ErrorKind::Nl80211,

@@ -87,6 +87,36 @@ fn classify_fast_reconnect(
     }
 }
 
+/// Whether the link was lost after a successful association/connect
+/// response but before the 4-way handshake could complete. In that
+/// window the AP can never start the handshake on the current kernel
+/// association, so the disconnect must abort the attempt rather than be
+/// mistaken for a delayed event of the previous connection.
+fn association_lost_before_handshake(
+    state: WifiState,
+    assoc_done: bool,
+) -> bool {
+    state == WifiState::Authenticating && assoc_done
+}
+
+/// Whether handling `event` is authentication progress and should re-arm
+/// the authentication timeout.
+///
+/// Scan notifications do not count: a PNO session armed before the link
+/// was lost keeps delivering `SCHED_SCAN_RESULTS` every few seconds, and
+/// resetting the timeout on those would mask a stalled handshake forever.
+fn is_authentication_progress(event: &Nl80211Event) -> bool {
+    matches!(
+        event,
+        Nl80211Event::Authenticated(_)
+            | Nl80211Event::Associated(_)
+            | Nl80211Event::ConnectResult(_)
+            | Nl80211Event::Frame(Ieee80211Frame::Auth(_))
+            | Nl80211Event::ControlPortFrame(_)
+            | Nl80211Event::PortAuthorized
+    )
+}
+
 /// Whether an AP-originated deauth/disassoc that arrived while a
 /// PMKID-based association is in flight is the AP refusing the cached
 /// PMKSA.
@@ -205,15 +235,29 @@ impl WifiIface {
     }
 
     /// Dispatch one item from the interface event queue.
-    pub(crate) async fn handle_wifi_event(&mut self, event: WifiEvent) {
+    ///
+    /// Returns whether the event is authentication progress (an
+    /// authentication/association/handshake event) and should therefore
+    /// re-arm the per-attempt authentication timeout. Unrelated events -
+    /// notably the `SCHED_SCAN_RESULTS` notifications of a PNO session
+    /// that was armed before the link was lost - must not keep resetting
+    /// that timeout, or a stalled handshake would never time out.
+    pub(crate) async fn handle_wifi_event(&mut self, event: WifiEvent) -> bool {
         match event {
             WifiEvent::Kernel(raw_msg) => {
                 let info = self.disconnect_info(&raw_msg);
                 if let Some(event) = Nl80211Event::parse(raw_msg) {
+                    let auth_progress = is_authentication_progress(&event);
                     self.handle_client_event(event, info).await;
+                    auth_progress
+                } else {
+                    false
                 }
             }
-            WifiEvent::Eapol(frame) => self.handle_raw_eapol(frame).await,
+            WifiEvent::Eapol(frame) => {
+                self.handle_raw_eapol(frame).await;
+                true
+            }
         }
     }
 
@@ -731,7 +775,7 @@ impl WifiIface {
                     WifiState::ConnectedWithoutOffloadRekey
                         | WifiState::ConnectedWithOffloadRekey
                 ) || (self.state == WifiState::Authenticating
-                    && self.is_psk_4way_in_progress())
+                    && (self.is_psk_4way_in_progress() || self.link.assoc_done))
                     || (self.state == WifiState::Scanning
                         && self.roam.pre_roam_state.is_some())
                 {
@@ -848,6 +892,9 @@ impl WifiIface {
         &mut self,
         ies: Option<&[u8]>,
     ) {
+        // From here on the attempt is committed to this association: a
+        // disconnect now means the 4-way handshake can never complete.
+        self.link.assoc_done = true;
         if self.link.bss_info.security == SecurityType::Open {
             log::info!("ASSOCIATED - open network, connection established");
             self.fast_reconnect = None;
@@ -1024,6 +1071,22 @@ impl WifiIface {
                  back to full authentication"
             );
             self.pmksa_fallback().await;
+        } else if association_lost_before_handshake(
+            self.state,
+            self.link.assoc_done,
+        ) {
+            // The AP tore down the association after its success response
+            // but before the 4-way handshake completed. No handshake
+            // message will arrive for this kernel association, so waiting
+            // for the authentication timeout only delays the recovery -
+            // and unrelated events (e.g. PNO results) could postpone it
+            // forever. Treat it as transient, like wpa_supplicant's
+            // `wpa_supplicant_event_disassoc_finish()`, and reconnect.
+            log::warn!(
+                "AP disconnected after association before the 4-way handshake \
+                 (reason={reason:?}); reconnecting"
+            );
+            self.mark_link_lost(FastReconnect::ScanNow).await;
         } else {
             log::debug!(
                 "stale AP disconnect (reason={reason:?}) in state {:?}; \
@@ -1039,6 +1102,7 @@ impl WifiIface {
         // The connection is gone: disarm a pending one-shot
         // post-connect scan so the next connection arms a fresh one.
         self.disarm_post_connect_scan();
+        self.link.assoc_done = false;
         // For a socket-owned connection the kernel keeps its connection
         // state (wdev->connected) until userspace cleans up, and rejects
         // the next ASSOCIATE with -EALREADY otherwise. wpa_supplicant
@@ -2442,6 +2506,42 @@ mod tests {
             false,
             true,
             Some(true)
+        ));
+    }
+
+    #[test]
+    fn scan_events_do_not_rearm_the_authentication_timeout() {
+        assert!(!is_authentication_progress(&Nl80211Event::ScanStart));
+        assert!(!is_authentication_progress(&Nl80211Event::NewScanResults));
+        assert!(!is_authentication_progress(&Nl80211Event::Unknown(
+            Nl80211Command::SchedScanResults
+        )));
+        assert!(!is_authentication_progress(&Nl80211Event::Unknown(
+            Nl80211Command::DelStation
+        )));
+        // Authentication/4-way progress must still restart the timer.
+        assert!(is_authentication_progress(&Nl80211Event::PortAuthorized));
+    }
+
+    #[test]
+    fn association_loss_before_handshake_aborts_the_attempt() {
+        assert!(association_lost_before_handshake(
+            WifiState::Authenticating,
+            true
+        ));
+        // Before the association response the event may be a delayed
+        // teardown of the previous link, so it stays ignored.
+        assert!(!association_lost_before_handshake(
+            WifiState::Authenticating,
+            false
+        ));
+        assert!(!association_lost_before_handshake(
+            WifiState::ConnectedWithoutOffloadRekey,
+            true
+        ));
+        assert!(!association_lost_before_handshake(
+            WifiState::Scanning,
+            true
         ));
     }
 
