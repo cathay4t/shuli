@@ -260,6 +260,7 @@ impl WifiIface {
             pending_ft_msg1: None,
             stale_connect_failure: false,
             ptk_rekey: false,
+            pending_fourway: None,
         };
         let last_resume = *resume_rx.borrow();
 
@@ -534,6 +535,7 @@ impl WifiIface {
     pub(crate) fn fail_auth(&mut self, error: WifiError) {
         self.last_error = Some(error);
         self.fast_reconnect = None;
+        self.link.pending_fourway = None;
         self.state = WifiState::FailedAuthentication;
     }
 
@@ -868,6 +870,16 @@ impl WifiIface {
                 // lost: re-send the same commit (SAE Sync counter, max 3)
                 // instead of failing over to a full rescan cycle.
                 loop {
+                    // A previous `run()` may have been dropped after the
+                    // 4-way Message 3 was accepted. Finish the connection
+                    // now instead of waiting for the authentication
+                    // timeout and blacklisting a healthy AP.
+                    if self.link.pending_fourway.is_some() {
+                        self.finish_fourway().await;
+                        if self.state != WifiState::Authenticating {
+                            break;
+                        }
+                    }
                     let sae_pending =
                         self.auth.sae_commit_sent || self.auth.sae_confirm_sent;
                     let wait_secs = if sae_pending {

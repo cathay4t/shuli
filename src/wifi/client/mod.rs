@@ -132,11 +132,11 @@ mod wiphy;
 pub(crate) use control_port::ControlPort;
 pub use state::WifiState;
 pub(crate) use state::{
-    AuthSession, BssidIgnoreList, ControlPortMode, FastReconnect, IfaceCore,
-    Link, MlmeMode, NetworkUpdate, ResumeAction, RoamEngine, ScanEngine,
-    WifiIface, WiphyCaps, WowlanState, association_result_applies,
-    connection_is_live, network_update_action, pmksa_stale_ssids,
-    resume_action,
+    AuthSession, BssidIgnoreList, ControlPortMode, FastReconnect,
+    FourWayCompletion, IfaceCore, Link, MlmeMode, NetworkUpdate, ResumeAction,
+    RoamEngine, ScanEngine, WifiIface, WiphyCaps, WowlanState,
+    association_result_applies, connection_is_live, network_update_action,
+    pmksa_stale_ssids, resume_action,
 };
 pub use wifi_client::{WifiClient, WifiIfaceState};
 #[cfg(test)]

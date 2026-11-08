@@ -399,6 +399,56 @@ pub(crate) struct Link {
     /// established link, not a new authentication. Its Message 3 must not
     /// refresh the PMKSA lifetime.
     pub(crate) ptk_rekey: bool,
+    /// Remaining work of a 4-way handshake whose Message 3 was accepted
+    /// but whose completion was interrupted by a dropped `run()` future.
+    pub(crate) pending_fourway: Option<FourWayCompletion>,
+}
+
+/// Work left after a 4-way Message 3 was accepted and Message 4 was
+/// built, but before the connection was finalized.
+///
+/// Callers are allowed to drop [`WifiIface::run`](super::WifiIface::run)
+/// at any await (a daemon that multiplexes requests with `select!` does
+/// exactly that). Storing the remaining work on the interface lets the
+/// next `run()` call finish the connection instead of waiting for the
+/// authentication timeout and blacklisting a healthy AP.
+///
+/// The steps run in order and each step flips its `*_done` flag only
+/// after it succeeded, so a cancellation resumes at the interrupted
+/// step.
+#[derive(Debug, Clone)]
+pub(crate) struct FourWayCompletion {
+    /// The Message 4 PDU to transmit. Re-sent when a cancellation
+    /// happened before `msg4_sent`.
+    pub(crate) msg4: Vec<u8>,
+    /// Message 3 KDEs (GTK, IGTK, BIGTK) that still need installing.
+    pub(crate) kdes: wl_nl80211::Ieee80211KeyDataKdes,
+    /// GTK receive sequence counter from Message 3.
+    pub(crate) key_rsc: Vec<u8>,
+    /// Extended Key ID selected by the AP, when negotiated.
+    pub(crate) ext_key_id: Option<u8>,
+    /// The 4-way is an AP-initiated PTK rekey: keep the PMKSA lifetime.
+    pub(crate) ptk_rekey: bool,
+    /// Extended-Key-ID RX-only PTK phase finished (before Message 4).
+    pub(crate) ptk_rx_done: bool,
+    /// Message 4 transmitted.
+    pub(crate) msg4_sent: bool,
+    /// PTK installed/activated.
+    pub(crate) ptk_done: bool,
+    /// GTK installed.
+    pub(crate) gtk_done: bool,
+    /// IGTK installation attempted (non-fatal).
+    pub(crate) igtk_done: bool,
+    /// BIGTK installation attempted (non-fatal).
+    pub(crate) bigtk_done: bool,
+    /// PMKSA cached.
+    pub(crate) pmksa_done: bool,
+    /// FullMAC station authorization attempted.
+    pub(crate) authorize_done: bool,
+    /// GTK rekey offload attempted; `offloaded` is its result.
+    pub(crate) offload_done: bool,
+    /// Whether the rekey offload attempt succeeded.
+    pub(crate) offloaded: bool,
 }
 
 /// Per-attempt pre-association and key-derivation state. Reset at the
@@ -545,6 +595,7 @@ impl Link {
         self.pending_ft_msg1 = None;
         self.stale_connect_failure = false;
         self.ptk_rekey = false;
+        self.pending_fourway = None;
     }
 }
 
@@ -767,6 +818,7 @@ mod tests {
             pending_ft_msg1: None,
             stale_connect_failure: false,
             ptk_rekey: true,
+            pending_fourway: None,
         };
         link.reset_for_update(network("B"));
         assert!(!link.ptk_rekey);

@@ -14,7 +14,8 @@ use wl_nl80211::{
 
 use super::{
     AuthAction, AuthMethod, EapAction, EapPacket, ErrorKind, FastReconnect,
-    Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg, MlmeMode,
+    FourWayCompletion, Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg,
+    MlmeMode,
     Nl80211Authenticate, Nl80211Event, Nl80211EventMsg, Nl80211Key,
     Nl80211KeyDefaultType, Nl80211RekeyOffload, OweAuth,
     RETRY_BACKOFF_INIT_SEC, SAE_SYNC_MAX, SecurityType, WifiError, WifiEvent,
@@ -115,6 +116,19 @@ fn is_authentication_progress(event: &Nl80211Event) -> bool {
             | Nl80211Event::ControlPortFrame(_)
             | Nl80211Event::PortAuthorized
     )
+}
+
+/// Whether a key installation failed only because the kernel already
+/// holds that key.
+///
+/// [`WifiIface::finish_fourway`] may retry a step whose await was
+/// cancelled after the kernel had already applied the request; treating
+/// `-EALREADY` / `-EEXIST` as success keeps the completion idempotent.
+fn key_already_installed(e: &WifiError) -> bool {
+    e.msg.contains("already in progress")
+        || e.msg.contains("File exists")
+        || e.msg.contains("-EALREADY")
+        || e.msg.contains("-EEXIST")
 }
 
 /// Whether an AP-originated deauth/disassoc that arrived while a
@@ -1103,6 +1117,7 @@ impl WifiIface {
         // post-connect scan so the next connection arms a fresh one.
         self.disarm_post_connect_scan();
         self.link.assoc_done = false;
+        self.link.pending_fourway = None;
         // For a socket-owned connection the kernel keeps its connection
         // state (wdev->connected) until userspace cleans up, and rejects
         // the next ASSOCIATE with -EALREADY otherwise. wpa_supplicant
@@ -1455,6 +1470,242 @@ impl WifiIface {
         }
     }
 
+    /// Finish a 4-way handshake whose Message 3 was accepted.
+    ///
+    /// Resumable by design: every step records its progress in
+    /// [`FourWayCompletion`] before its first await, so a `run()` future
+    /// dropped mid-way (a daemon multiplexing requests with `select!`
+    /// does that) continues here on the next call instead of sitting out
+    /// the authentication timeout and blacklisting a healthy AP.
+    pub(crate) async fn finish_fourway(&mut self) {
+        let Some(mut pending) = self.link.pending_fourway.take() else {
+            return;
+        };
+        let bssid = self.link.bss_info.bssid;
+
+        // Extended Key ID installs the PTK RX-only before Message 4 so
+        // frames protected with the new key id can be decrypted.
+        if let Some(key_id) = pending.ext_key_id
+            && !pending.ptk_rx_done
+        {
+            if let Some(tk) =
+                self.link.fourway.as_ref().and_then(|fw| fw.tk())
+            {
+                let attrs = Nl80211Key::new_ptk(
+                    self.core.nl.if_index,
+                    bssid,
+                    tk.to_vec(),
+                )
+                .key_index(key_id)
+                .build();
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.new_key(attrs).await {
+                    Ok(()) => {}
+                    Err(e) if key_already_installed(&e) => {}
+                    Err(e) => {
+                        log::warn!("install PTK (RX) failed: {e}");
+                        self.link.pending_fourway = None;
+                        self.state = WifiState::Failed;
+                        return;
+                    }
+                }
+                log::info!("PTK installed for RX (key id {key_id})");
+            }
+            pending.ptk_rx_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        if !pending.msg4_sent {
+            self.link.pending_fourway = Some(pending.clone());
+            if let Err(e) =
+                self.send_control_port_frame(bssid, &pending.msg4).await
+            {
+                log::warn!("send msg4 failed: {e}");
+                self.link.pending_fourway = None;
+                self.state = WifiState::Failed;
+                return;
+            }
+            pending.msg4_sent = true;
+            log::info!("4-way: Message 4 sent");
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        if !pending.ptk_done {
+            if let Some(tk) =
+                self.link.fourway.as_ref().and_then(|fw| fw.tk())
+            {
+                let mut builder = Nl80211Key::new_ptk(
+                    self.core.nl.if_index,
+                    bssid,
+                    tk.to_vec(),
+                );
+                if let Some(key_id) = pending.ext_key_id {
+                    // Activate the RX-installed key as the default
+                    // unicast TX key.
+                    builder = builder
+                        .key_index(key_id)
+                        .default_types(vec![
+                            Nl80211KeyDefaultType::Unicast,
+                        ]);
+                }
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.new_key(builder.build()).await {
+                    Ok(()) => {
+                        if let Some(key_id) = pending.ext_key_id {
+                            log::info!(
+                                "PTK activated (key id {key_id})"
+                            );
+                        } else {
+                            log::info!("PTK installed");
+                        }
+                    }
+                    Err(e) if key_already_installed(&e) => {}
+                    Err(e) => {
+                        log::warn!("install PTK failed: {e}");
+                        self.link.pending_fourway = None;
+                        self.state = WifiState::Failed;
+                        return;
+                    }
+                }
+            }
+            pending.ptk_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        if !pending.gtk_done {
+            if let Some((gtk_idx, gtk_data)) = &pending.kdes.gtk {
+                let attrs = Nl80211Key::new_gtk(
+                    self.core.nl.if_index,
+                    gtk_data.to_vec(),
+                    *gtk_idx,
+                )
+                .seq(pending.key_rsc.clone())
+                .build();
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.new_key(attrs).await {
+                    Ok(()) => log::info!("GTK[{gtk_idx}] installed"),
+                    Err(e) if key_already_installed(&e) => {}
+                    Err(e) => {
+                        log::warn!("install GTK failed: {e}");
+                        self.link.pending_fourway = None;
+                        self.state = WifiState::Failed;
+                        return;
+                    }
+                }
+            }
+            pending.gtk_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        // Without the IGTK, mac80211 drops every protected management
+        // frame (SA Query, BTM, channel switch announcements) the AP
+        // sends. Failures are logged but not fatal.
+        if !pending.igtk_done {
+            if let Some(ref igtk) = pending.kdes.igtk {
+                let attrs = Nl80211Key::new_igtk(
+                    self.core.nl.if_index,
+                    igtk.key.clone(),
+                    igtk.key_index,
+                    igtk.ipn.to_vec(),
+                )
+                .cipher(self.link.bss_info.group_mgmt_cipher)
+                .build();
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.new_key(attrs).await {
+                    Ok(()) => log::info!(
+                        "IGTK[{}] installed",
+                        igtk.key_index
+                    ),
+                    Err(e) => log::warn!("install IGTK failed: {e}"),
+                }
+            }
+            pending.igtk_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+        if !pending.bigtk_done {
+            if let Some(ref bigtk) = pending.kdes.bigtk {
+                let attrs = Nl80211Key::new_bigtk(
+                    self.core.nl.if_index,
+                    bigtk.key.clone(),
+                    bigtk.key_index,
+                    bigtk.ipn.to_vec(),
+                )
+                .cipher(self.link.bss_info.group_mgmt_cipher)
+                .build();
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.new_key(attrs).await {
+                    Ok(()) => log::info!(
+                        "BIGTK[{}] installed",
+                        bigtk.key_index
+                    ),
+                    Err(e) => log::warn!("install BIGTK failed: {e}"),
+                }
+            }
+            pending.bigtk_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        // The handshake proved the PMK - cache the PMKSA for the next
+        // reconnect/roam. A PTK rekey of the live link must not extend
+        // its lifetime.
+        if !pending.pmksa_done {
+            if pending.ptk_rekey {
+                log::debug!("PTK rekey: keeping the existing PMKSA lifetime");
+            } else {
+                self.link.pending_fourway = Some(pending.clone());
+                self.cache_pmksa().await;
+            }
+            pending.pmksa_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        // FullMAC CONNECT requests carry NL80211_ATTR_CONTROL_PORT,
+        // which keeps the data port closed until userspace authorizes
+        // the station after the 4-way handshake.
+        if !pending.authorize_done {
+            if self.caps.mlme == MlmeMode::FullMac {
+                self.link.pending_fourway = Some(pending.clone());
+                match self.core.nl.set_station_authorized(bssid).await {
+                    Ok(()) => log::info!(
+                        "station authorized for the data path"
+                    ),
+                    Err(e) => log::warn!(
+                        "authorizing the station after the 4-way \
+                         handshake failed: {e}"
+                    ),
+                }
+            }
+            pending.authorize_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        // Try to offload GTK rekey to the driver/firmware. Falls back to
+        // userspace rekey when unsupported (e.g. mac80211_hwsim returns
+        // -EOPNOTSUPP).
+        if !pending.offload_done {
+            self.link.pending_fourway = Some(pending.clone());
+            pending.offloaded = self.try_offload_rekey().await;
+            pending.offload_done = true;
+            self.link.pending_fourway = Some(pending.clone());
+        }
+
+        if pending.offloaded {
+            log::info!("keys installed - connection established");
+            self.state = WifiState::ConnectedWithOffloadRekey;
+        } else {
+            log::info!(
+                "keys installed - connection established (userspace rekey)"
+            );
+            self.state = WifiState::ConnectedWithoutOffloadRekey;
+        }
+        self.fast_reconnect = None;
+        self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
+        self.link.pending_fourway = None;
+        // (wpa_supplicant model): arm WoWLAN triggers when the connection
+        // lands and leave them armed.
+        self.arm_wowlan_if_enabled().await;
+    }
+
     /// Handle an EAPOL-Key frame (4-way handshake / group rekey).
     pub(crate) async fn handle_control_port_frame(&mut self, frame: &[u8]) {
         // 802.1X EAP frames (EAPOL type 0) arrive on the
@@ -1788,6 +2039,17 @@ impl WifiIface {
         } else if parsed.has_mic() && parsed.is_secure() && parsed.is_pairwise()
         {
             // 4-way handshake Message 3 (GTK + MIC).
+            if self.link.pending_fourway.is_some() {
+                // The AP retransmitted Message 3 while the previous
+                // copy is still being completed (the completion can be
+                // resumed across a dropped `run()` future): the work is
+                // already recorded, do not restart it.
+                log::debug!(
+                    "4-way Message 3 retransmitted while completing the \
+                     handshake; ignored"
+                );
+                return;
+            }
             log::info!("4-way handshake: Message 3");
 
             let (msg4, kdes) = {
@@ -1844,195 +2106,31 @@ impl WifiIface {
                 );
             }
 
-            // with Extended Key ID the pairwise key is
-            // installed in two phases - RX-only before Message 4 (so
-            // frames protected with the new key id decrypt), then
-            // activated (TX) after Message 4.
             let ext_key_id =
                 self.link.fourway.as_ref().and_then(|fw| fw.key_id());
-            if let Some(key_id) = ext_key_id
-                && let Some(tk) =
-                    self.link.fourway.as_ref().and_then(|fw| fw.tk())
-            {
-                let attrs = Nl80211Key::new_ptk(
-                    self.core.nl.if_index,
-                    self.link.bss_info.bssid,
-                    tk.to_vec(),
-                )
-                .key_index(key_id)
-                .build();
-                if let Err(e) = self.core.nl.new_key(attrs).await {
-                    log::warn!("install PTK (RX) failed: {e}");
-                    self.state = WifiState::Failed;
-                    return;
-                }
-                log::info!("PTK installed for RX (key id {key_id})");
-            }
-
-            if let Err(e) = self
-                .send_control_port_frame(self.link.bss_info.bssid, &msg4)
-                .await
-            {
-                log::warn!("send msg4 failed: {e}");
-                self.state = WifiState::Failed;
-                return;
-            }
-            log::info!("4-way: Message 4 sent");
-
-            if let Some(tk) = self.link.fourway.as_ref().and_then(|fw| fw.tk())
-            {
-                let mut builder = Nl80211Key::new_ptk(
-                    self.core.nl.if_index,
-                    self.link.bss_info.bssid,
-                    tk.to_vec(),
-                );
-                if let Some(key_id) = ext_key_id {
-                    // Activate the RX-installed key as the default
-                    // unicast TX key.
-                    builder = builder
-                        .key_index(key_id)
-                        .default_types(vec![Nl80211KeyDefaultType::Unicast]);
-                }
-                if let Err(e) = self.core.nl.new_key(builder.build()).await {
-                    log::warn!("install PTK failed: {e}");
-                    self.state = WifiState::Failed;
-                    return;
-                }
-                if let Some(key_id) = ext_key_id {
-                    log::info!("PTK activated (key id {key_id})");
-                } else {
-                    log::info!("PTK installed");
-                }
-            }
-
-            if let Some((gtk_idx, gtk_data)) = &kdes.gtk {
-                if let Err(e) = self
-                    .core
-                    .nl
-                    .new_key(
-                        Nl80211Key::new_gtk(
-                            self.core.nl.if_index,
-                            gtk_data.to_vec(),
-                            *gtk_idx,
-                        )
-                        .seq(parsed.key_rsc[..6].to_vec())
-                        .build(),
-                    )
-                    .await
-                {
-                    log::warn!("install GTK failed: {e}");
-                    self.state = WifiState::Failed;
-                    return;
-                }
-                log::info!("GTK[{gtk_idx}] installed");
-            }
-
-            // install the IGTK (and BIGTK when the AP delivers one)
-            // from the Message 3 KDEs. Without the IGTK, mac80211 drops
-            // every protected management frame (SA Query, BTM, channel
-            // switch announcements) the AP sends. Failures are logged but
-            // not fatal: the data path works without them.
-            if let Some(ref igtk) = kdes.igtk {
-                match self
-                    .core
-                    .nl
-                    .new_key(
-                        Nl80211Key::new_igtk(
-                            self.core.nl.if_index,
-                            igtk.key.clone(),
-                            igtk.key_index,
-                            igtk.ipn.to_vec(),
-                        )
-                        .cipher(self.link.bss_info.group_mgmt_cipher)
-                        .build(),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        log::info!("IGTK[{}] installed", igtk.key_index)
-                    }
-                    Err(e) => log::warn!("install IGTK failed: {e}"),
-                }
-            }
-            if let Some(ref bigtk) = kdes.bigtk {
-                match self
-                    .core
-                    .nl
-                    .new_key(
-                        Nl80211Key::new_bigtk(
-                            self.core.nl.if_index,
-                            bigtk.key.clone(),
-                            bigtk.key_index,
-                            bigtk.ipn.to_vec(),
-                        )
-                        .cipher(self.link.bss_info.group_mgmt_cipher)
-                        .build(),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        log::info!("BIGTK[{}] installed", bigtk.key_index)
-                    }
-                    Err(e) => log::warn!("install BIGTK failed: {e}"),
-                }
-            }
-
-            // The handshake proved the PMK - cache the PMKSA for the
-            // next reconnect/roam (and hand it to the driver's cache).
-            // A PTK rekey of the live link must not extend its lifetime.
-            if self.link.ptk_rekey {
-                log::debug!("PTK rekey: keeping the existing PMKSA lifetime");
-            } else {
-                self.cache_pmksa().await;
-            }
-
-            // FullMAC CONNECT requests carry NL80211_ATTR_CONTROL_PORT,
-            // which keeps the data port closed until userspace authorizes
-            // the station after the 4-way handshake.
-            if self.caps.mlme == MlmeMode::FullMac {
-                match self
-                    .core
-                    .nl
-                    .set_station_authorized(self.link.bss_info.bssid)
-                    .await
-                {
-                    Ok(()) => {
-                        log::info!("station authorized for the data path");
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "authorizing the station after the 4-way \
-                             handshake failed: {e}"
-                        );
-                    }
-                }
-            }
-
-            // Try to offload GTK rekey to the driver/firmware.
-            // Falls back to userspace rekey when unsupported
-            // (e.g. mac80211_hwsim returns -EOPNOTSUPP).
-            let offloaded = self.try_offload_rekey().await;
-
-            if offloaded {
-                log::info!("keys installed - connection established");
-                self.fast_reconnect = None;
-                self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
-                self.state = WifiState::ConnectedWithOffloadRekey;
-            } else {
-                log::info!(
-                    "keys installed - connection established (userspace rekey)"
-                );
-                self.fast_reconnect = None;
-                self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
-                self.state = WifiState::ConnectedWithoutOffloadRekey;
-            }
-            // (wpa_supplicant model): arm WoWLAN triggers when the
-            // connection lands and leave them armed. The kernel only
-            // uses them while the host is suspended; the wake handler
-            // clears them after a WoWLAN wake and this arms again on
-            // the next reconnect (or immediately when the wake kept the
-            // connection).
-            self.arm_wowlan_if_enabled().await;
+            // Record everything the completion needs before the first
+            // await: a caller may drop this `run()` future at any await
+            // (nipart multiplexes requests with `select!`), and the
+            // Message 3 event has already been consumed. `finish_fourway`
+            // then resumes from the interrupted step on the next call.
+            self.link.pending_fourway = Some(FourWayCompletion {
+                msg4,
+                kdes,
+                key_rsc: parsed.key_rsc[..6].to_vec(),
+                ext_key_id,
+                ptk_rekey: self.link.ptk_rekey,
+                ptk_rx_done: false,
+                msg4_sent: false,
+                ptk_done: false,
+                gtk_done: false,
+                igtk_done: false,
+                bigtk_done: false,
+                pmksa_done: false,
+                authorize_done: false,
+                offload_done: false,
+                offloaded: false,
+            });
+            self.finish_fourway().await;
         } else if parsed.has_mic()
             && parsed.is_secure()
             && parsed.has_ack()
