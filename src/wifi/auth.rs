@@ -322,7 +322,7 @@ impl WifiIface {
         self.link.ft = None;
         self.auth.psk_pmk = None;
         self.link.pmksa_in_use = None;
-        self.link.pending_ft_msg1 = None;
+        self.link.pending_msg1 = None;
         self.roam.ft_roam = None;
         self.auth.sae_commit_sent = false;
         self.auth.sae_sync = 0;

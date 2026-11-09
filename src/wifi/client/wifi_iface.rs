@@ -257,7 +257,7 @@ impl WifiIface {
             fourway: None,
             pmksa_in_use: None,
             ft: None,
-            pending_ft_msg1: None,
+            pending_msg1: None,
             pending_connect_failures: 0,
             ptk_rekey: false,
             pending_fourway: None,

@@ -385,9 +385,12 @@ pub(crate) struct Link {
     pub(crate) pmksa_in_use: Option<PmksaEntry>,
     /// FT key context of the current connection (802.11r roaming).
     pub(crate) ft: Option<crate::roam::FtContext>,
-    /// A 4-way Message 1 that arrived before the FT context could be
-    /// built from the association response event (the two can race).
-    pub(crate) pending_ft_msg1: Option<Vec<u8>>,
+    /// A 4-way Message 1 that arrived before the association-success
+    /// event (or, for FT, before the FT context was built from it). The
+    /// two race: the AP sends Message 1 right after the association
+    /// response, while the nl80211 control port still rejects frames with
+    /// `-ENOTCONN` until the connection result has been processed.
+    pub(crate) pending_msg1: Option<Vec<u8>>,
     /// Number of association-response failures that were already handled
     /// by continuing the attempt (PMKSA fallback or a transient status
     /// retry). The kernel reports every association response twice - the
@@ -595,7 +598,7 @@ impl Link {
         self.fourway = None;
         self.pmksa_in_use = None;
         self.ft = None;
-        self.pending_ft_msg1 = None;
+        self.pending_msg1 = None;
         self.pending_connect_failures = 0;
         self.ptk_rekey = false;
         self.pending_fourway = None;
@@ -826,7 +829,7 @@ mod tests {
             fourway: None,
             pmksa_in_use: None,
             ft: None,
-            pending_ft_msg1: None,
+            pending_msg1: None,
             pending_connect_failures: 0,
             ptk_rekey: true,
             pending_fourway: None,

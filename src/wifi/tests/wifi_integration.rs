@@ -2070,6 +2070,89 @@ async fn wifi_client_sae_pmksa_reconnect() {
     client.shutdown().await;
 }
 
+/// Repro for the early-Message-1 race: the AP sends 4-way Message 1
+/// immediately after its (re)association response, but the nl80211
+/// control port still rejects EAPOL with -ENOTCONN until cfg80211 has
+/// processed that response. Answering the Message 1 eagerly failed the
+/// attempt and, on a PMKID reconnect, dropped a valid PMKSA. It must be
+/// buffered until the association-success event.
+#[tokio::test]
+async fn wifi_client_early_msg1_is_buffered_until_association() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_early_msg1_is_buffered_until_association: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    // Start a fresh attempt without an association: the kernel is not
+    // connected, so a Message 2 sent now returns -ENOTCONN.
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        iface.core.nl.disconnect().await.expect("disconnect");
+        iface.send_out_auth_request().await.expect("start auth");
+        iface.state = WifiState::Authenticating;
+        assert!(!iface.link.assoc_done);
+    }
+
+    // The AP's Message 1 races ahead of the association-success event.
+    let msg1 = Ieee80211EapolKeyFrame::build(
+        0x0088, // ACK | Pairwise, KDV 0 (AKM-defined for SAE)
+        16,
+        1,
+        &[0x55u8; 32],
+        &[0u8; 16],
+        &[0u8; 8],
+        &[0u8; 8],
+        &[0u8; 16],
+        b"",
+    );
+    client
+        .ifaces
+        .values_mut()
+        .next()
+        .unwrap()
+        .handle_event(
+            wl_nl80211::Nl80211Event::ControlPortFrame(
+                wl_nl80211::Ieee80211EapolFrame::parse(&msg1),
+            ),
+            Default::default(),
+        )
+        .await;
+
+    let iface = client.ifaces.values_mut().next().unwrap();
+    assert_eq!(
+        iface.state,
+        WifiState::Authenticating,
+        "an early Message 1 must not fail the attempt"
+    );
+    assert!(
+        iface.link.pending_msg1.is_some(),
+        "the early Message 1 must be buffered"
+    );
+    assert!(
+        iface.link.fourway.is_none(),
+        "no 4-way state may be built before the association result"
+    );
+    client.shutdown().await;
+}
+
 /// A PMKID the AP no longer knows must not blacklist the BSS or repeat
 /// the same cached-PMKID attempt: the client drops the stale entry and
 /// reconnects with full SAE right away. hostapd answers the PMKID
@@ -3306,7 +3389,7 @@ async fn wifi_client_ft_sae_reconnect_buffers_early_msg1() {
             .next()
             .unwrap()
             .link
-            .pending_ft_msg1
+            .pending_msg1
             .is_some(),
         "early Message 1 must be buffered until the new FT context exists"
     );

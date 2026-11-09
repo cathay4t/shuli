@@ -1060,11 +1060,6 @@ impl WifiIface {
                 self.state = WifiState::Failed;
             } else {
                 log::info!("ASSOCIATED (FT) - waiting for 4-way handshake");
-                // A Message 1 may have raced ahead of this association
-                // event; feed it now.
-                if let Some(frame) = self.link.pending_ft_msg1.take() {
-                    self.handle_control_port_frame(&frame).await;
-                }
             }
         } else if self.link.pmksa_in_use.is_some() {
             log::info!(
@@ -1073,6 +1068,16 @@ impl WifiIface {
             );
         } else {
             log::info!("ASSOCIATED - waiting for 4-way handshake");
+        }
+
+        // Answer a Message 1 that raced ahead of this event only now:
+        // the association result has reached userspace (so the nl80211
+        // control port is connected) and any FT/OWE context is ready.
+        if self.state == WifiState::Authenticating
+            && let Some(frame) = self.link.pending_msg1.take()
+        {
+            log::debug!("processing the buffered 4-way Message 1");
+            self.handle_control_port_frame(&frame).await;
         }
     }
 
@@ -1865,16 +1870,20 @@ impl WifiIface {
             // 4-way handshake Message 1 (ANonce).
             log::info!("4-way handshake: Message 1 (ANonce)");
 
-            // With an FT AKM the PTK comes from the FT key hierarchy,
-            // whose parameters (R0KH-ID / R1KH-ID) only become known
-            // through the association response event - which can race
-            // behind this first EAPOL frame. Buffer the frame until the
-            // FT context exists.
-            if self.link.bss_info.security.is_ft() && self.link.ft.is_none() {
+            // The AP sends Message 1 as soon as it has sent the
+            // association response, but the nl80211 control port rejects
+            // EAPOL with -ENOTCONN until cfg80211 has processed that
+            // response. An FT PTK also needs the FT context built from
+            // the response. Buffer the frame until the
+            // association-success event has run.
+            if !self.link.assoc_done
+                || (self.link.bss_info.security.is_ft()
+                    && self.link.ft.is_none())
+            {
                 log::debug!(
-                    "buffered 4-way Message 1 until the FT context exists"
+                    "buffered 4-way Message 1 until association completes"
                 );
-                self.link.pending_ft_msg1 = Some(frame.to_vec());
+                self.link.pending_msg1 = Some(frame.to_vec());
                 return;
             }
 
