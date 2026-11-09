@@ -157,6 +157,21 @@ fn association_lost_before_handshake(
     state == WifiState::Authenticating && assoc_done
 }
 
+/// Whether a Message 1 that found an existing 4-way state belongs to an
+/// AP-initiated PTK rekey of the live link.
+///
+/// An existing state alone is not enough: a Message 1 retransmitted
+/// after our Message 2 failed to reach the AP (e.g. the control port was
+/// momentarily disconnected) also finds the state of the *unfinished*
+/// handshake. The installed PTK is the invariant that distinguishes a
+/// live link from such a retransmission. Treating the recovery as a
+/// rekey would skip [`WifiIface::cache_pmksa`] and leave the
+/// successfully proved PMK out of the cache, forcing the next reconnect
+/// through full SAE again.
+fn is_ptk_rekey(fourway: Option<&FourWayState>) -> bool {
+    fourway.is_some_and(|fw| fw.ptk_is_installed())
+}
+
 /// Whether handling `event` is authentication progress and should re-arm
 /// the authentication timeout.
 ///
@@ -1863,9 +1878,12 @@ impl WifiIface {
                 return;
             }
 
-            // A Message 1 that finds an existing 4-way state is an
-            // AP-initiated PTK rekey of the live link.
-            self.link.ptk_rekey = self.link.fourway.is_some();
+            // A Message 1 that finds a 4-way state with an installed PTK
+            // is an AP-initiated PTK rekey. The same shape without a PTK
+            // is a retransmitted Message 1 of the unfinished handshake
+            // whose Message 2 we failed to send; the completed handshake
+            // must still cache the PMKSA.
+            self.link.ptk_rekey = is_ptk_rekey(self.link.fourway.as_ref());
             if self.link.fourway.is_none() {
                 if self.link.bss_info.security.is_ft() {
                     // Initial association with an FT AKM: the 4-way
@@ -2821,6 +2839,32 @@ mod tests {
             WifiState::Scanning,
             true
         ));
+    }
+
+    #[test]
+    fn only_an_installed_ptk_makes_message_1_a_rekey() {
+        let mut fw = FourWayState::new_with_ap_ies(
+            &[0u8; 32],
+            MicAlg::AesCmac,
+            [0x03; 6],
+            [0x04; 6],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!is_ptk_rekey(None));
+        // A Message 2 send failure leaves this unfinished state behind;
+        // the retransmitted Message 1 must still cache the PMKSA.
+        assert!(
+            !is_ptk_rekey(Some(&fw)),
+            "an unfinished handshake is not a live-link rekey"
+        );
+        // Once Message 3 installed the PTK, the same state is a rekey.
+        fw.set_ptk([0x33; 48]);
+        assert!(
+            is_ptk_rekey(Some(&fw)),
+            "an installed PTK means a live-link rekey"
+        );
     }
 
     #[test]

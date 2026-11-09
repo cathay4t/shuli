@@ -321,6 +321,14 @@ impl FourWayState {
         self.tptk = None;
     }
 
+    /// Whether a PTK is already installed from a completed handshake (or
+    /// an FT roam). A Message 1 that arrives while this is true is an
+    /// AP-initiated PTK rekey of the live link; while it is false, the
+    /// same Message 1 is a retransmission of the unfinished handshake.
+    pub(crate) fn ptk_is_installed(&self) -> bool {
+        self.ptk.is_some()
+    }
+
     pub fn tk(&self) -> Option<[u8; TK_LEN]> {
         self.ptk.map(|p| {
             let mut k = [0u8; TK_LEN];

@@ -398,7 +398,8 @@ pub(crate) struct Link {
     /// the retry has already started.
     pub(crate) pending_connect_failures: u8,
     /// The 4-way handshake in flight is an AP-initiated PTK rekey of the
-    /// established link, not a new authentication. Its Message 3 must not
+    /// established link (the existing 4-way state already has an
+    /// installed PTK), not a new authentication. Its Message 3 must not
     /// refresh the PMKSA lifetime.
     pub(crate) ptk_rekey: bool,
     /// Remaining work of a 4-way handshake whose Message 3 was accepted
