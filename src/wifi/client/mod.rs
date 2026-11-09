@@ -104,6 +104,14 @@ const RETRY_AUTH_SEC: u64 = 120;
 /// Max time to wait for the next authentication event (SAE frame, association
 /// result, 4-way handshake message) before giving up and retrying.
 const AUTH_EVENT_TIMEOUT_SECS: u64 = 15;
+/// Fallback wait before retrying the same BSS after the AP rejected the
+/// association temporarily (status 30, "SA Query in progress") without a
+/// usable association comeback interval. Covers hostapd's default
+/// `assoc_sa_query_max_timeout` of 1000 TU (~1.024 s).
+pub(crate) const ASSOC_COMEBACK_FALLBACK_MS: u64 = 1200;
+/// Maximum consecutive same-BSS retries after a temporary association
+/// rejection before falling back to the normal BSS ignore/scan path.
+pub(crate) const ASSOC_COMEBACK_MAX_RETRIES: u8 = 3;
 /// Interval (seconds) at which the connected state polls the AP's signal
 /// when the driver has no kernel connection quality monitor (CQM) support:
 /// the fallback to the CQM event-driven roam trigger.

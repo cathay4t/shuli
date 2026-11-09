@@ -258,7 +258,7 @@ impl WifiIface {
             pmksa_in_use: None,
             ft: None,
             pending_ft_msg1: None,
-            stale_connect_failure: false,
+            pending_connect_failures: 0,
             ptk_rekey: false,
             pending_fourway: None,
         };
@@ -277,6 +277,8 @@ impl WifiIface {
             wowlan: WowlanState::default(),
             state: WifiState::Init,
             fast_reconnect: None,
+            assoc_comeback_delay: None,
+            assoc_comeback_retries: 0,
             resume_rx,
             last_resume,
             bssid_ignore: BssidIgnoreList::default(),
@@ -383,6 +385,8 @@ impl WifiIface {
                     // use the normal retry backoff.
                     self.bssid_ignore.clear();
                     self.scan.startup_fast_retry = false;
+                    self.assoc_comeback_retries = 0;
+                    self.assoc_comeback_delay = None;
                     // Connect fast first, optimize slightly later: when
                     // the BSS supports managed roaming, arm the one-shot
                     // best-BSS scan.
@@ -390,6 +394,7 @@ impl WifiIface {
                 }
                 if prev_state == WifiState::Authenticating
                     && self.state == WifiState::Failed
+                    && self.assoc_comeback_delay.is_none()
                     && self.retry_with_next_bss().await?
                 {
                     // Another BSS of the same ESS is available: try it
@@ -422,6 +427,11 @@ impl WifiIface {
     pub(crate) async fn retry_with_next_bss(
         &mut self,
     ) -> Result<bool, WifiError> {
+        // The same-BSS retries are exhausted (or this is a hard
+        // failure): the next episode starts with a fresh transient
+        // retry budget.
+        self.assoc_comeback_retries = 0;
+        self.assoc_comeback_delay = None;
         let failed_bssid = self.link.bss_info.bssid;
         if failed_bssid == [0; ETH_ALEN] {
             return Ok(false);
@@ -535,6 +545,8 @@ impl WifiIface {
     pub(crate) fn fail_auth(&mut self, error: WifiError) {
         self.last_error = Some(error);
         self.fast_reconnect = None;
+        self.assoc_comeback_delay = None;
+        self.assoc_comeback_retries = 0;
         self.link.pending_fourway = None;
         self.state = WifiState::FailedAuthentication;
     }
@@ -584,6 +596,9 @@ impl WifiIface {
                             // lands in a scan instead of the
                             // scan-retry backoff.
                             self.fast_reconnect = Some(FastReconnect::ScanNow);
+                            // This attempt was armed after a transient
+                            // association rejection; the wait is over.
+                            self.assoc_comeback_delay = None;
                             self.send_out_auth_request().await?;
                             self.state = WifiState::Authenticating;
                             return Ok(());
@@ -593,6 +608,7 @@ impl WifiIface {
                                 "fast reconnect: scanning immediately for an \
                                  alternative BSS or SSID"
                             );
+                            self.assoc_comeback_delay = None;
                             self.scan.hint_scan = false;
                             self.send_out_scan_request().await?;
                             self.state = WifiState::Scanning;
@@ -600,9 +616,14 @@ impl WifiIface {
                         }
                         // No usable last BSS: fall through to the
                         // normal hinted/scan path.
-                        FastReconnect::SameBss => {}
+                        FastReconnect::SameBss => {
+                            self.assoc_comeback_delay = None;
+                        }
                     }
                 }
+                // A transient-retry wait only makes sense together with
+                // the same-BSS fast path; never leak it into a scan.
+                self.assoc_comeback_delay = None;
                 if self.scan.hint_scan
                     && let Some((network, bss_info)) = self.scan_free_target()
                 {
@@ -1195,7 +1216,13 @@ impl WifiIface {
                 if startup_retry {
                     self.scan.startup_fast_retry = false;
                 }
-                let wait = if fast.is_some() {
+                let wait = if self.state == WifiState::Failed
+                    && let Some(delay) = self.assoc_comeback_delay
+                {
+                    // The AP asked us to come back after this SA Query
+                    // interval; retry the same BSS then.
+                    delay
+                } else if fast.is_some() {
                     std::time::Duration::from_millis(FAST_RECONNECT_DELAY_MS)
                 } else if self.state == WifiState::FailedAuthentication {
                     std::time::Duration::from_secs(RETRY_AUTH_SEC)
@@ -1352,6 +1379,8 @@ impl WifiIface {
                         "resume: retrying WIFI on {}",
                         self.core.config.iface_name
                     );
+                    self.assoc_comeback_delay = None;
+                    self.assoc_comeback_retries = 0;
                     self.fast_reconnect = Some(FastReconnect::ScanNow);
                 }
                 _ => {
@@ -1738,6 +1767,8 @@ impl WifiIface {
         self.roam.reset();
         self.bssid_ignore.clear();
         self.fast_reconnect = None;
+        self.assoc_comeback_delay = None;
+        self.assoc_comeback_retries = 0;
         self.scan.scan_retry_interval = RETRY_BACKOFF_INIT_SEC;
         self.state = WifiState::Init;
         log::info!(

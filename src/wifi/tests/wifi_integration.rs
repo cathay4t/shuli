@@ -32,15 +32,15 @@ use netlink_packet_core::NetlinkMessage;
 use netlink_packet_generic::GenlMessage;
 use tokio::sync::Mutex;
 use wl_nl80211::{
-    Ieee80211EapolKeyFrame, Ieee80211ReasonCode, Nl80211Command,
-    Nl80211Message,
+    Ieee80211EapolKeyFrame, Ieee80211ReasonCode, Ieee80211StatusCode,
+    Nl80211Attr, Nl80211Command, Nl80211Message,
 };
 
 use crate::{
     ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
     client::{
-        ControlPortMode, FastReconnect, MlmeMode, RETRY_BACKOFF_INIT_SEC,
-        WifiEvent,
+        ASSOC_COMEBACK_FALLBACK_MS, ControlPortMode, FastReconnect, MlmeMode,
+        RETRY_BACKOFF_INIT_SEC, WifiEvent,
     },
     config::TestModeOverride,
 };
@@ -2425,6 +2425,134 @@ async fn wifi_client_stalled_handshake_times_out_despite_pno_results() {
         "stalled attempt took {:?}",
         started.elapsed()
     );
+    client.shutdown().await;
+}
+
+/// A temporary association rejection (status 30) must retry the same
+/// BSS after the AP's SA Query comeback interval instead of blacklisting
+/// the healthy AP and waiting out a full scan. This is the rejection
+/// mac80211 reports to userspace when it cannot use the AP's comeback
+/// element itself (the report's second AssocResp had no usable one).
+#[tokio::test]
+async fn wifi_client_transient_assoc_reject_retries_same_bss() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_transient_assoc_reject_retries_same_bss: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    let (event_tx, bssid) = {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        iface.state = WifiState::Authenticating;
+        iface.link.assoc_done = false;
+        (iface.event_tx.clone(), iface.link.bss_info.bssid)
+    };
+
+    // A Timeout Interval element of a non-comeback type: present, but
+    // unusable as an association comeback interval (this is how the
+    // rejection reaches userspace).
+    let mut ies = vec![56, 5, 1];
+    ies.extend_from_slice(&1000u32.to_le_bytes());
+
+    // The kernel reports the same association response twice: the
+    // ASSOCIATE event and the trailing CONNECT result.
+    let associate = map_to_rawgenlmsg(NetlinkMessage::from(
+        GenlMessage::from_payload(Nl80211Message {
+            cmd: Nl80211Command::Associate,
+            attributes: vec![
+                Nl80211Attr::StatusCode(
+                    Ieee80211StatusCode::AssocRejectedTemporarily,
+                ),
+                Nl80211Attr::Ie(ies.clone()),
+            ],
+        }),
+    ));
+    event_tx
+        .unbounded_send(WifiEvent::Kernel(associate))
+        .expect("inject ASSOCIATE");
+    let connect = map_to_rawgenlmsg(NetlinkMessage::from(
+        GenlMessage::from_payload(Nl80211Message {
+            cmd: Nl80211Command::Connect,
+            attributes: vec![
+                Nl80211Attr::StatusCode(
+                    Ieee80211StatusCode::AssocRejectedTemporarily,
+                ),
+                Nl80211Attr::RespIe(ies),
+            ],
+        }),
+    ));
+    event_tx
+        .unbounded_send(WifiEvent::Kernel(connect))
+        .expect("inject CONNECT");
+
+    // The ASSOCIATE result arms a same-BSS retry; it must not blacklist
+    // the BSS or start a scan.
+    let failed = client.run().await.expect("associate rejection");
+    assert_eq!(failed.state, WifiState::Failed);
+    {
+        let iface = client.ifaces.values_mut().next().unwrap();
+        assert_eq!(iface.fast_reconnect, Some(FastReconnect::SameBss));
+        assert_eq!(
+            iface.assoc_comeback_delay,
+            Some(std::time::Duration::from_millis(ASSOC_COMEBACK_FALLBACK_MS))
+        );
+        assert_eq!(iface.assoc_comeback_retries, 1);
+        assert!(
+            !iface.bssid_ignore.is_ignored(&bssid),
+            "a temporary rejection must not blacklist the BSS"
+        );
+        assert!(!iface.scan.retry_scan);
+    }
+
+    // The duplicate CONNECT failure is consumed by the comeback wait
+    // without scheduling a second retry; then the client moves on to
+    // the same-BSS fast reconnect.
+    let started = std::time::Instant::now();
+    let next = client.run().await.expect("comeback wait");
+    assert_eq!(next.state, WifiState::Init);
+    assert!(
+        started.elapsed()
+            >= std::time::Duration::from_millis(
+                ASSOC_COMEBACK_FALLBACK_MS - 200
+            ),
+        "comeback wait ended too early: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "comeback wait took {:?}",
+        started.elapsed()
+    );
+    let iface = client.ifaces.values_mut().next().unwrap();
+    assert_eq!(
+        iface.assoc_comeback_retries, 1,
+        "the duplicate CONNECT failure must not schedule another retry"
+    );
+    assert_eq!(iface.link.pending_connect_failures, 0);
+    assert!(!iface.bssid_ignore.is_ignored(&bssid));
+
+    // The wait leads straight into the same-BSS retry, not a scan.
+    let retry = client.run().await.expect("same-BSS retry");
+    assert_eq!(retry.state, WifiState::Authenticating);
+    let iface = client.ifaces.values_mut().next().unwrap();
+    assert_eq!(iface.link.bss_info.bssid, bssid);
     client.shutdown().await;
 }
 

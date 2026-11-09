@@ -388,13 +388,15 @@ pub(crate) struct Link {
     /// A 4-way Message 1 that arrived before the FT context could be
     /// built from the association response event (the two can race).
     pub(crate) pending_ft_msg1: Option<Vec<u8>>,
-    /// Set when an association-response failure was already handled by
-    /// continuing the attempt (PMKSA fallback). The kernel reports every
-    /// association response twice - the `ASSOCIATE` event and the
-    /// trailing `CONNECT` result - so the CONNECT failure of that
-    /// already-handled response must not tear down the recovery attempt
-    /// the fallback started.
-    pub(crate) stale_connect_failure: bool,
+    /// Number of association-response failures that were already handled
+    /// by continuing the attempt (PMKSA fallback or a transient status
+    /// retry). The kernel reports every association response twice - the
+    /// `ASSOCIATE` event and the trailing `CONNECT` result - so the
+    /// CONNECT failure of an already-handled response must not tear down
+    /// the recovery attempt it started. A counter (rather than a bool)
+    /// keeps the suppression correct when a late duplicate arrives after
+    /// the retry has already started.
+    pub(crate) pending_connect_failures: u8,
     /// The 4-way handshake in flight is an AP-initiated PTK rekey of the
     /// established link, not a new authentication. Its Message 3 must not
     /// refresh the PMKSA lifetime.
@@ -593,7 +595,7 @@ impl Link {
         self.pmksa_in_use = None;
         self.ft = None;
         self.pending_ft_msg1 = None;
-        self.stale_connect_failure = false;
+        self.pending_connect_failures = 0;
         self.ptk_rekey = false;
         self.pending_fourway = None;
     }
@@ -718,6 +720,14 @@ pub(crate) struct WifiIface {
     /// re-authenticates to the BSS that was just lost (wpa_supplicant
     /// parity, see [`FastReconnect`]).
     pub(crate) fast_reconnect: Option<FastReconnect>,
+    /// Wait before retrying the same BSS after a temporary association
+    /// rejection (status 30). `Some` while the `Failed` state is waiting
+    /// out the AP's association comeback interval; consumed by the
+    /// same-BSS fast reconnect in `Init`.
+    pub(crate) assoc_comeback_delay: Option<std::time::Duration>,
+    /// Consecutive same-BSS retries after temporary association
+    /// rejections; bounded by `ASSOC_COMEBACK_MAX_RETRIES`.
+    pub(crate) assoc_comeback_retries: u8,
     /// System-resume notification generation receiver. The value is
     /// changed by [`crate::WifiClient::notify_resume`].
     pub(crate) resume_rx: tokio::sync::watch::Receiver<u64>,
@@ -816,7 +826,7 @@ mod tests {
             pmksa_in_use: None,
             ft: None,
             pending_ft_msg1: None,
-            stale_connect_failure: false,
+            pending_connect_failures: 0,
             ptk_rekey: true,
             pending_fourway: None,
         };

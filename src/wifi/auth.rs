@@ -257,7 +257,7 @@ fn process_sae_frame(
 /// Statuses an AP uses to refuse authentication/association
 /// temporarily; the client should retry after a short backoff instead
 /// of treating them as fatal credential failures.
-fn is_temporary_reject_status(status: u16) -> bool {
+pub(crate) fn is_temporary_reject_status(status: u16) -> bool {
     matches!(
         status,
         17  // AP unable to handle additional STAs
@@ -332,7 +332,10 @@ impl WifiIface {
         self.auth.sae_hnp_attempted = false;
         self.auth.eap_peer = None;
         self.auth.eap_pmk = None;
-        self.link.stale_connect_failure = false;
+        // Do not clear `pending_connect_failures`: a duplicate CONNECT
+        // failure of the previous association response may still be in
+        // flight and must stay suppressed even though this attempt has
+        // already started.
         self.link.assoc_wpa_ie.clear();
 
         // WPA2-Enterprise runs EAP over the control port

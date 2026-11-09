@@ -13,7 +13,8 @@ use wl_nl80211::{
 };
 
 use super::{
-    AuthAction, AuthMethod, EapAction, EapPacket, ErrorKind, FastReconnect,
+    ASSOC_COMEBACK_FALLBACK_MS, ASSOC_COMEBACK_MAX_RETRIES, AuthAction,
+    AuthMethod, EapAction, EapPacket, ErrorKind, FastReconnect,
     FourWayCompletion, Ieee80211ReasonCode, Ieee80211StatusCode, MicAlg,
     MlmeMode,
     Nl80211Authenticate, Nl80211Event, Nl80211EventMsg, Nl80211Key,
@@ -24,7 +25,8 @@ use super::{
     is_fatal_disconnect_reason, owe, wowlan_wakeup_requires_reconnect,
 };
 use crate::{
-    ETH_ALEN, crypto::handshake4::FourWayState, nl80211::extract_rsn_from_ies,
+    ETH_ALEN, auth::is_temporary_reject_status,
+    crypto::handshake4::FourWayState, nl80211::extract_rsn_from_ies,
 };
 
 /// `NL80211_ATTR_DISCONNECTED_BY_AP`: present on a `NL80211_CMD_DISCONNECT`
@@ -86,6 +88,61 @@ fn classify_fast_reconnect(
     } else {
         FastReconnect::ScanNow
     }
+}
+
+/// The association comeback interval carried by the Timeout Interval
+/// element of a (Re)Association Response (802.11-2020 §9.4.2.55).
+///
+/// Returns `None` when the element is absent, malformed, of a different
+/// timeout type, or longer than the 60 000 TU bound wpa_supplicant
+/// applies to this unprotected value.
+fn assoc_comeback_delay(ies: Option<&[u8]>) -> Option<std::time::Duration> {
+    const TIMEOUT_INTERVAL_EID: u8 = 56;
+    const ASSOC_COMEBACK_TYPE: u8 = 3;
+    const MAX_TIMEOUT_TU: u32 = 60_000;
+
+    let mut pos = 0;
+    let ies = ies?;
+    while pos + 2 <= ies.len() {
+        let eid = ies[pos];
+        let len = ies[pos + 1] as usize;
+        let body_start = pos + 2;
+        let body_end = body_start + len;
+        if body_end > ies.len() {
+            break;
+        }
+        let body = &ies[body_start..body_end];
+        if eid == TIMEOUT_INTERVAL_EID && body.len() >= 5 {
+            let timeout_type = body[0];
+            let timeout_tu =
+                u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+            if timeout_type == ASSOC_COMEBACK_TYPE
+                && timeout_tu <= MAX_TIMEOUT_TU
+            {
+                return Some(std::time::Duration::from_micros(
+                    u64::from(timeout_tu) * 1024,
+                ));
+            }
+        }
+        pos = body_end;
+    }
+    None
+}
+
+/// Wait before retrying a BSS that temporarily rejected the association
+/// (status 30 and the other transient statuses). Uses the AP's comeback
+/// interval when it is usable, otherwise a short fallback long enough
+/// for hostapd's default SA Query timeout.
+fn assoc_transient_retry_delay(
+    status: Ieee80211StatusCode,
+    ies: Option<&[u8]>,
+) -> std::time::Duration {
+    if status == Ieee80211StatusCode::AssocRejectedTemporarily
+        && let Some(delay) = assoc_comeback_delay(ies)
+    {
+        return delay;
+    }
+    std::time::Duration::from_millis(ASSOC_COMEBACK_FALLBACK_MS)
 }
 
 /// Whether the link was lost after a successful association/connect
@@ -168,6 +225,36 @@ fn pmksa_rejected_by_deauth(
 }
 
 impl WifiIface {
+    /// Handle an association rejection. Transient statuses retry the
+    /// same BSS instead of blacklisting it: an MFP SA Query answer
+    /// (status 30) is not a failure of the AP or the credentials.
+    /// Returns true when a same-BSS retry was scheduled.
+    fn schedule_transient_assoc_retry(
+        &mut self,
+        status: Ieee80211StatusCode,
+        ies: Option<&[u8]>,
+    ) -> bool {
+        if !is_temporary_reject_status(u16::from(status))
+            || self.assoc_comeback_retries >= ASSOC_COMEBACK_MAX_RETRIES
+        {
+            return false;
+        }
+        let delay = assoc_transient_retry_delay(status, ies);
+        self.assoc_comeback_retries += 1;
+        self.assoc_comeback_delay = Some(delay);
+        self.fast_reconnect = Some(FastReconnect::SameBss);
+        self.state = WifiState::Failed;
+        log::warn!(
+            "ASSOCIATE temporarily rejected by BSS {:02x?} (status={status}); \
+             retrying the same BSS in {:?} (attempt {}/{})",
+            self.link.bss_info.bssid,
+            delay,
+            self.assoc_comeback_retries,
+            ASSOC_COMEBACK_MAX_RETRIES
+        );
+        true
+    }
+
     /// Extract [`DisconnectInfo`] from a raw event before
     /// [`Nl80211Event::parse`] consumes it.
     ///
@@ -655,7 +742,15 @@ impl WifiIface {
                     // - this `ASSOCIATE` event and the trailing `CONNECT`
                     // result: suppress the latter so it cannot tear down
                     // the full-authentication attempt started above.
-                    self.link.stale_connect_failure = true;
+                    self.link.pending_connect_failures =
+                        self.link.pending_connect_failures.saturating_add(1);
+                } else if self
+                    .schedule_transient_assoc_retry(status, ies.as_deref())
+                {
+                    // Suppress the trailing CONNECT duplicate of this
+                    // response so it cannot tear down the retry.
+                    self.link.pending_connect_failures =
+                        self.link.pending_connect_failures.saturating_add(1);
                 } else {
                     log::warn!("ASSOCIATE failed: status={status}");
                     self.state = WifiState::Failed;
@@ -666,10 +761,15 @@ impl WifiIface {
                 let status = event.status;
                 // The kernel sends a CONNECT result for every association
                 // response, right after the `ASSOCIATE` event (and for an
-                // association timeout, without one). Consume the stale
-                // marker here so it can never leak into a later attempt.
-                let stale =
-                    std::mem::take(&mut self.link.stale_connect_failure);
+                // association timeout, without one). Consume one pending
+                // duplicate marker here so it can never leak into a later
+                // attempt.
+                let stale = if self.link.pending_connect_failures > 0 {
+                    self.link.pending_connect_failures -= 1;
+                    true
+                } else {
+                    false
+                };
                 if self.caps.mlme == MlmeMode::FullMac {
                     if status == Ieee80211StatusCode::Success {
                         if !association_result_applies(self.state) {
@@ -710,6 +810,13 @@ impl WifiIface {
                              authentication"
                         );
                         self.pmksa_fallback().await;
+                    } else if self.schedule_transient_assoc_retry(
+                        status,
+                        event.resp_ie.as_deref(),
+                    ) {
+                        // A same-BSS retry is scheduled; this is a
+                        // firmware/driver denial, so no duplicate
+                        // CONNECT result follows.
                     } else {
                         log::warn!("CONNECT failed: status={status}");
                         self.state = WifiState::Failed;
@@ -727,6 +834,11 @@ impl WifiIface {
                         "stale CONNECT failure (status={status}) for an \
                          already-handled association response; ignored"
                     );
+                } else if self.schedule_transient_assoc_retry(
+                    status,
+                    event.resp_ie.as_deref(),
+                ) {
+                    // A same-BSS retry is scheduled.
                 } else {
                     log::warn!("CONNECT failed: status={status}");
                     self.state = WifiState::Failed;
@@ -2391,6 +2503,74 @@ fn could_be_psk_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeout_interval_ie(kind: u8, tu: u32) -> Vec<u8> {
+        let mut ie = vec![56, 5, kind];
+        ie.extend_from_slice(&tu.to_le_bytes());
+        ie
+    }
+
+    #[test]
+    fn assoc_comeback_parses_the_timeout_interval_element() {
+        let ies = [
+            // A vendor IE before the one we care about.
+            &[221, 3, 1, 2, 3][..],
+            &timeout_interval_ie(3, 1000),
+        ]
+        .concat();
+        assert_eq!(
+            assoc_comeback_delay(Some(&ies)),
+            Some(std::time::Duration::from_millis(1024))
+        );
+    }
+
+    #[test]
+    fn assoc_comeback_ignores_other_timeout_types_and_malformed_ies() {
+        // Type 1 is the reassociation deadline, not the association
+        // comeback interval.
+        assert_eq!(
+            assoc_comeback_delay(Some(&timeout_interval_ie(1, 1000))),
+            None
+        );
+        // Truncated element.
+        assert_eq!(assoc_comeback_delay(Some(&[56, 5, 3, 0])), None);
+        // Truncated length runs off the end.
+        assert_eq!(assoc_comeback_delay(Some(&[56, 9, 3, 0, 0, 0])), None);
+        // wpa_supplicant ignores unusually long unprotected intervals.
+        assert_eq!(
+            assoc_comeback_delay(Some(&timeout_interval_ie(3, 60_001))),
+            None
+        );
+        assert_eq!(assoc_comeback_delay(None), None);
+    }
+
+    #[test]
+    fn transient_assoc_reject_uses_comeback_or_a_short_fallback() {
+        assert_eq!(
+            assoc_transient_retry_delay(
+                Ieee80211StatusCode::AssocRejectedTemporarily,
+                Some(&timeout_interval_ie(3, 1000))
+            ),
+            std::time::Duration::from_millis(1024)
+        );
+        // No usable comeback element: wait long enough for hostapd's
+        // default 1000 TU SA Query timeout.
+        assert_eq!(
+            assoc_transient_retry_delay(
+                Ieee80211StatusCode::AssocRejectedTemporarily,
+                None
+            ),
+            std::time::Duration::from_millis(ASSOC_COMEBACK_FALLBACK_MS)
+        );
+        // Other transient statuses do not carry a comeback interval.
+        assert_eq!(
+            assoc_transient_retry_delay(
+                Ieee80211StatusCode::ApUnableToHandleNewSta,
+                Some(&timeout_interval_ie(3, 1000))
+            ),
+            std::time::Duration::from_millis(ASSOC_COMEBACK_FALLBACK_MS)
+        );
+    }
 
     /// wpa_supplicant's `disconnect_reason_recoverable()`: only the
     /// AP-generated reasons 4/6/7 take the same-BSS fast path.
