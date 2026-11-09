@@ -44,6 +44,7 @@ entirely in Rust.
 * `shuli-wired` - wired 802.1X/EAP and MACsec/MKA client.
 * `shuli-ipsec` - native IKEv2 engine and `XfrmManager` (usable by nipart).
 * `shulid` - the daemon.
+* `tools/` - developer/debugging tools.
 
 ## Using the daemon for simple WiFi configuration
 
@@ -149,6 +150,14 @@ sudo systemctl enable --now shulid
 
 `shulid` must run with root privileges (`CAP_NET_ADMIN` and `CAP_NET_RAW`)
 to start WIFI and DHCP, writes IPv6 sysctls, and updates `/etc/resolv.conf`.
+
+## Capturing WiFi debug data
+
+`tools/monitor_wifi.sh` captures nl80211 netlink packets, nipart/shuli
+events, kernel messages, `iw event`, and periodic link/station snapshots.
+It requires root or passwordless sudo and writes to
+`~/tmp/wifi_debug/<timestamp>/` (override with `WIFI_DEBUG_DIR`). Stop it
+with Ctrl-C. See the script header for the other environment variables.
 
 ## Using the `shuli` crate
 
