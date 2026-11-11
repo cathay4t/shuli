@@ -471,6 +471,17 @@ impl WifiIface {
                     log::debug!("AUTHENTICATE event ignored in FullMAC mode");
                     return;
                 }
+                // cfg80211 reports a kernel-side MLME timeout with
+                // NL80211_ATTR_TIMED_OUT instead of a status/frame. It is
+                // a transient failure, not an authentication success.
+                if event.timed_out {
+                    log::warn!("authentication timed out (kernel MLME)");
+                    if self.roam.ft_roam.is_some() {
+                        self.roam.ft_roam = None;
+                    }
+                    self.state = WifiState::Failed;
+                    return;
+                }
                 let status = event.status;
                 let frame = event.frame;
                 if self.roam.ft_roam.is_some() {
@@ -714,6 +725,21 @@ impl WifiIface {
                         "stale ASSOCIATE result in state {:?}; ignored",
                         self.state
                     );
+                    return;
+                }
+                // cfg80211 reports a kernel-side MLME timeout with
+                // NL80211_ATTR_TIMED_OUT instead of an association
+                // response. Never mistake it for a successful
+                // association and wait for a 4-way handshake that can
+                // never start.
+                if event.timed_out {
+                    log::warn!("association timed out (kernel MLME)");
+                    self.link.assoc_done = false;
+                    // A previous status-30 comeback no longer applies:
+                    // the retry already ran and the AP did not answer.
+                    self.assoc_comeback_delay = None;
+                    self.assoc_comeback_retries = 0;
+                    self.state = WifiState::Failed;
                     return;
                 }
                 let status = event.status;
