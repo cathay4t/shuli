@@ -770,6 +770,17 @@ impl WifiIface {
                     }
                 } else if status == Ieee80211StatusCode::Success {
                     self.handle_association_success(ies.as_deref()).await;
+                } else if self
+                    .schedule_transient_assoc_retry(status, ies.as_deref())
+                {
+                    // A temporary rejection (e.g. status 30 while the AP
+                    // runs its MFP SA Query) is not caused by the cached
+                    // PMKID: keep the PMKSA and retry the same BSS after
+                    // the comeback interval. Suppress the trailing CONNECT
+                    // duplicate of this response so it cannot tear down the
+                    // retry.
+                    self.link.pending_connect_failures =
+                        self.link.pending_connect_failures.saturating_add(1);
                 } else if self.link.pmksa_in_use.is_some() {
                     // The AP rejected the association with the cached
                     // PMKID (no matching PMKSA on the AP side): fall back
@@ -783,13 +794,6 @@ impl WifiIface {
                     // - this `ASSOCIATE` event and the trailing `CONNECT`
                     // result: suppress the latter so it cannot tear down
                     // the full-authentication attempt started above.
-                    self.link.pending_connect_failures =
-                        self.link.pending_connect_failures.saturating_add(1);
-                } else if self
-                    .schedule_transient_assoc_retry(status, ies.as_deref())
-                {
-                    // Suppress the trailing CONNECT duplicate of this
-                    // response so it cannot tear down the retry.
                     self.link.pending_connect_failures =
                         self.link.pending_connect_failures.saturating_add(1);
                 } else {
@@ -844,6 +848,14 @@ impl WifiIface {
                         log::debug!(
                             "stale CONNECT failure (status={status}) ignored"
                         );
+                    } else if self.schedule_transient_assoc_retry(
+                        status,
+                        event.resp_ie.as_deref(),
+                    ) {
+                        // A temporary rejection is not a stale PMKSA:
+                        // keep it and retry the same BSS. This is a
+                        // firmware/driver denial, so no duplicate CONNECT
+                        // result follows.
                     } else if self.link.pmksa_in_use.is_some() {
                         log::warn!(
                             "CONNECT with cached PMKID failed: \
@@ -851,13 +863,6 @@ impl WifiIface {
                              authentication"
                         );
                         self.pmksa_fallback().await;
-                    } else if self.schedule_transient_assoc_retry(
-                        status,
-                        event.resp_ie.as_deref(),
-                    ) {
-                        // A same-BSS retry is scheduled; this is a
-                        // firmware/driver denial, so no duplicate
-                        // CONNECT result follows.
                     } else {
                         log::warn!("CONNECT failed: status={status}");
                         self.state = WifiState::Failed;

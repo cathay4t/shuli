@@ -37,12 +37,14 @@ use wl_nl80211::{
 };
 
 use crate::{
-    ErrorKind, WifiClient, WifiConfig, WifiIfaceState, WifiState,
+    ErrorKind, SecurityType, WifiClient, WifiConfig, WifiIfaceState, WifiState,
     client::{
         ASSOC_COMEBACK_FALLBACK_MS, ControlPortMode, FastReconnect, MlmeMode,
         RETRY_BACKOFF_INIT_SEC, WifiEvent,
     },
     config::TestModeOverride,
+    crypto::handshake4::MicAlg,
+    pmksa::PmksaEntry,
 };
 
 static WIFI_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -2636,6 +2638,87 @@ async fn wifi_client_transient_assoc_reject_retries_same_bss() {
     assert_eq!(retry.state, WifiState::Authenticating);
     let iface = client.ifaces.values_mut().next().unwrap();
     assert_eq!(iface.link.bss_info.bssid, bssid);
+    client.shutdown().await;
+}
+
+/// A temporary association rejection (status 30) while a cached PMKID is
+/// in use is the AP's MFP SA Query, not a stale PMKSA. Dropping the PMKID
+/// and running a full SAE exchange raced the still-live SA Query and ended
+/// in a kernel-association timeout, which blacklisted the healthy AP.
+#[tokio::test]
+async fn wifi_client_transient_assoc_reject_keeps_the_pmksa() {
+    init_logger();
+    if !is_root() {
+        eprintln!(
+            "skipping wifi_client_transient_assoc_reject_keeps_the_pmksa: \
+             test binary not running as root (`.cargo/config.toml` runs tests \
+             via `sudo`, so plain `cargo test` is root)"
+        );
+        return;
+    }
+    let _guard = WIFI_LOCK.lock().await;
+    let _env = WifiTestEnv::setup(SAE_HOSTAPD_CONF);
+
+    let mut config = WifiConfig::new(TEST_NIC);
+    config.add_network("Test-WIFI", Some("12345678"));
+    let mut client = WifiClient::init(vec![config]).await.expect("init");
+    let state = run_until_connected(&mut client, 20).await.expect("connect");
+    assert!(matches!(
+        state,
+        WifiState::ConnectedWithoutOffloadRekey
+            | WifiState::ConnectedWithOffloadRekey
+    ));
+    drain_pending_events(&mut client).await;
+
+    // The kernel reports the same association response twice: the
+    // ASSOCIATE event and the trailing CONNECT result.
+    let associate = map_to_rawgenlmsg(NetlinkMessage::from(
+        GenlMessage::from_payload(Nl80211Message {
+            cmd: Nl80211Command::Associate,
+            attributes: vec![Nl80211Attr::StatusCode(
+                Ieee80211StatusCode::AssocRejectedTemporarily,
+            )],
+        }),
+    ));
+    let connect = map_to_rawgenlmsg(NetlinkMessage::from(
+        GenlMessage::from_payload(Nl80211Message {
+            cmd: Nl80211Command::Connect,
+            attributes: vec![Nl80211Attr::StatusCode(
+                Ieee80211StatusCode::AssocRejectedTemporarily,
+            )],
+        }),
+    ));
+
+    let iface = client.ifaces.values_mut().next().unwrap();
+    assert_eq!(iface.link.bss_info.security, SecurityType::Sae);
+    iface.state = WifiState::Authenticating;
+    iface.link.assoc_done = false;
+    iface.link.pmksa_in_use = Some(PmksaEntry::new(
+        iface.link.network.ssid.clone(),
+        iface.link.bss_info.bssid,
+        iface.link.bss_info.security,
+        [0x11; 16],
+        [0x22; 32],
+        MicAlg::AesCmac,
+    ));
+    let bssid = iface.link.bss_info.bssid;
+
+    iface.handle_wifi_event(WifiEvent::Kernel(associate)).await;
+    iface.handle_wifi_event(WifiEvent::Kernel(connect)).await;
+
+    assert_eq!(iface.state, WifiState::Failed);
+    assert!(
+        iface.link.pmksa_in_use.is_some(),
+        "status 30 must not be treated as a stale PMKSA"
+    );
+    assert_eq!(iface.fast_reconnect, Some(FastReconnect::SameBss));
+    assert_eq!(
+        iface.assoc_comeback_delay,
+        Some(std::time::Duration::from_millis(ASSOC_COMEBACK_FALLBACK_MS))
+    );
+    assert_eq!(iface.assoc_comeback_retries, 1);
+    assert!(!iface.bssid_ignore.is_ignored(&bssid));
+    assert_eq!(iface.link.pending_connect_failures, 0);
     client.shutdown().await;
 }
 
